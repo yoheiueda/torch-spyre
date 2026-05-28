@@ -118,7 +118,7 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
-def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
+def check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
     """Raise Unsupported for stick expressions may be valid but are not yet supported."""
     is_supported_mod = (
         isinstance(stick_expr, sympy.Mod)
@@ -127,14 +127,25 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     )
     is_bare_var = stick_expr.is_symbol
     is_zero = stick_expr == sympy.S.Zero
-    if not (is_supported_mod or is_bare_var or is_zero):
+
+    has_offset = False
+    constant_part = None
+    if isinstance(stick_expr, sympy.Add) and len(stick_expr.free_symbols) == 1:
+        sym = next(iter(stick_expr.free_symbols))
+        constant_part = stick_expr.subs(sym, 0)
+        if not constant_part.free_symbols and constant_part != sympy.S.Zero:
+            has_offset = True
+
+    if not (is_supported_mod or is_bare_var or is_zero or has_offset):
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
             f"Mod(var, {elems_per_stick}), a bare variable, or 0"
         )
 
 
-def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Expr]:
+def device_coordinates(
+    stl: SpyreTensorLayout, dep: MemoryDep, check_stick_expr: bool = True
+) -> list[sympy.Expr]:
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
     index = concretize_index(dep.index, set(dep.ranges.keys()))
@@ -144,7 +155,8 @@ def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Exp
         dep.ranges,
         index,
     )
-    _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    if check_stick_expr:
+        check_stick_expr_supported(coords[-1], stl.elems_per_stick())
     return coords
 
 

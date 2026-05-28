@@ -164,9 +164,10 @@ def _is_range_subset(expr: sympy.Expr, coord: sympy.Expr, v: sympy.Symbol) -> bo
     Return True if the set of values expr can produce (as v varies) is a subset
     of the values coord can produce.
 
-    Handles two cases:
+    Handles three cases:
     - coord == v: coord is unbounded, so any expr in v is a subset.
     - coord == Mod(v, b) and expr == Mod(v, a) with a <= b: [0,a-1] ⊆ [0,b-1].
+    - coord == v + c (linear offset): handles expressions with constant offsets.
     """
     if coord == v:
         return True
@@ -179,6 +180,16 @@ def _is_range_subset(expr: sympy.Expr, coord: sympy.Expr, v: sympy.Symbol) -> bo
         coord_mod = coord.args[1]
         expr_mod = expr.args[1]
         return bool(sympy.Le(expr_mod, coord_mod))
+    # Handle linear offsets: coord == v + c where c is a constant
+    if (
+        isinstance(coord, sympy.Add)
+        and len(coord.free_symbols) == 1
+        and coord.subs(v, 0).free_symbols == set()
+    ):
+        # coord is of form v + c where c is a constant
+        # We just need expr to also contain only v, which it does since we're passed expr with exactly one free_symbol
+        if expr.free_symbols == {v}:
+            return True
     return False
 
 
