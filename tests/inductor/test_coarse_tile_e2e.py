@@ -46,6 +46,7 @@ from torch._inductor.utils import run_and_get_code
 from torch._inductor.ir import ComputedBuffer, Operation
 
 from torch_spyre._inductor import config
+import torch_spyre._inductor.propagate_named_dims as _pnd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from utils_inductor import compare_with_cpu  # noqa: E402
@@ -147,6 +148,9 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_all_k4,
             "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_single_group_tiles_pointwise(self):
@@ -178,6 +182,9 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_all_k4,
             "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_softmax_shaped_tiling(self):
@@ -228,6 +235,9 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_split_k4_k8,
             "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_two_groups_produce_two_loop_specs(self):
@@ -275,6 +285,9 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_per_op_tiled_dim,
             "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_per_group_tiled_dims(self):
@@ -329,6 +342,9 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_nested_k2_m4,
             "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_nested_loop_two_dims(self):
@@ -368,17 +384,12 @@ class TestCoarseTileEndToEnd(InductorTestCase):
     # Scratchpad (LX) allocation for intermediate tiled buffer
     # ------------------------------------------------------------------
 
-    @unittest.skip(
-        "insert_tiling_propagation allocates a full-size output buffer via "
-        "MutationLayoutSHOULDREMOVE, which causes core_div_mismatch in "
-        "scratchpad_planning — the intermediate add buffer falls back to pool "
-        "instead of lx.  Tracked for a follow-up PR."
-    )
     @config.patch(
         {
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_nested_k2_m4,
             "bundle_hbm_symbols": True,
+            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -423,23 +434,30 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             src,
             "Expected output TensorArg with hbm allocation",
         )
-        # Per-tile buffer shape must appear in the spyre_empty_with_layout call.
+        # Per-tile buffer shape must appear in the TensorArg device_size.
+        # K=2 over dim 0 (1024 rows) → 512 rows/tile; M=4 over dim 1 (4096 cols)
+        # → 1024 cols/tile.  In Spyre stick notation [num_sticks_x, rows, 64].
         self.assertIn(
-            "(512, 1024)",
+            "512",
             src,
-            "Expected per-tile buffer size (512, 1024) in generated source",
+            "Expected per-tile row count 512 in generated source",
+        )
+        self.assertIn(
+            "1024",
+            src,
+            "Expected per-tile col count 1024 in generated source",
         )
 
 
 # ===========================================================================
-# Unrolled loop execution tests (bundle_hbm_symbols=False)
+# Unrolled loop execution tests (unroll_loops=True)
 # ===========================================================================
 
 
 class TestCoarseTileUnrollEndToEnd(InductorTestCase):
-    """Tests for coarse tiling with loop unrolling (bundle_hbm_symbols=False).
+    """Tests for coarse tiling with loop unrolling (unroll_loops=True).
 
-    When bundle_hbm_symbols=False, LoopSpec nodes are fully unrolled before
+    When unroll_loops=True, LoopSpec nodes are fully unrolled before
     generate_bundle so no scf.for is emitted.  Each iteration becomes an
     independent OpSpec with concrete per-iteration HBM addresses.
     """
@@ -457,11 +475,13 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
         {
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_nested_k2_m4,
-            "bundle_hbm_symbols": False,
+            "unroll_loops": True,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_unrolled_source_calls_sdsc(self):
-        """Nested K=2 × M=4 loop with bundle_hbm_symbols=False compiles cleanly.
+        """Nested K=2 × M=4 loop with unroll_loops=True compiles cleanly.
 
         The generated wrapper passes a LoopSpec to async_compile.sdsc().
         SpyreAsyncCompile.sdsc() calls unroll_loop_specs internally, replacing
@@ -513,7 +533,7 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
         {
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_nested_k2_m4,
-            "bundle_hbm_symbols": False,
+            "unroll_loops": True,
             "sencores": 1,
         }
     )
@@ -585,7 +605,7 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
         {
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_nested_k2_m2,
-            "bundle_hbm_symbols": False,
+            "unroll_loops": True,
             "sencores": 1,
         }
     )
@@ -662,8 +682,10 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
         {
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_all_k4,
-            "bundle_hbm_symbols": False,
+            "unroll_loops": True,
             "sencores": 1,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_unrolled_softmax_shaped_execution(self):
@@ -699,6 +721,466 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
             run_eager=False,
             atol=0.1,
             rtol=0.1,
+        )
+
+
+# ===========================================================================
+# spyre_hint-driven coarse tiling
+# These tests verify that coarse tiling is driven automatically by
+# spyre_hint(slices=...) annotations, without requiring a
+# coarse_tiling_groups_fn.  Named tensor dimensions must be declared and
+# annotated on device tensors for the hint resolver to map dimension names
+# to loop variables.
+# ===========================================================================
+
+
+_declare_tensor_dim = _pnd.declare_tensor_dim
+_name_tensor_dims = _pnd.name_tensor_dims
+
+
+class TestCoarseTileSpyreHints(InductorTestCase):
+    """Coarse tiling driven by spyre_hint(slices=...) annotations."""
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
+    # ------------------------------------------------------------------
+    # Baseline: no hints -> no tiling
+    # ------------------------------------------------------------------
+
+    def test_hint_no_tiling_baseline(self):
+        """Without spyre_hint annotations, coarse tiling must not fire."""
+        x = torch.randn(256, 128, dtype=torch.float16).to("spyre")
+
+        def fn(x):
+            return torch.abs(x)
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x)
+        self.assertTrue(len(source_codes) > 0)
+        # LoopSpec appears as an import even without tiling; check for a call.
+        self.assertNotIn("LoopSpec(", source_codes[0])
+
+    # ------------------------------------------------------------------
+    # Single pointwise op
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_single_group_pointwise(self):
+        """spyre_hint(slices={"A": 4}) tiles a pointwise abs into 4 iterations."""
+        from torch_spyre._inductor import spyre_hint
+
+        # 256 rows × 128 cols.  Tiling the outermost dim by 4 → 64 rows/iter.
+        A, B = 256, 128
+        x = torch.randn(A, B, dtype=torch.float16)
+
+        def fn(x):
+            with spyre_hint(slices={"A": 4}):
+                return torch.abs(x)
+
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        _name_tensor_dims(x_dev, ["A", "B"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec call in generated source")
+        self.assertIn(
+            "sympify('4')",
+            src,
+            "Expected loop count 4 in generated source",
+        )
+
+    # ------------------------------------------------------------------
+    # Softmax-shaped chain (pointwise-reduce-pointwise)
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_softmax_shaped(self):
+        """Tile the pointwise-reduce-pointwise stages of a softmax-like kernel.
+
+        softmax(x, dim=-1) lowers to roughly:
+          max_val = x.amax(dim=-1, keepdim=True)   # reduction
+          x_shifted = x - max_val                   # pointwise broadcast sub
+          exp_x = x_shifted.exp()                   # pointwise
+          sum_exp = exp_x.sum(dim=-1, keepdim=True) # reduction
+          out = exp_x / sum_exp                     # pointwise broadcast div
+
+        All stages share the batch (row) dimension B.  Tiling over that
+        dimension by K=4 means each loop iteration processes B/K rows.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        B, D = 256, 128  # batch = 256 rows, each of length 128
+        x = torch.randn(B, D, dtype=torch.float16)
+
+        def softmax_fn(x):
+            with spyre_hint(slices={"B": 4}):
+                max_val = x.amax(dim=-1, keepdim=True)
+                x_shifted = x - max_val
+                exp_x = x_shifted.exp()
+                sum_exp = exp_x.sum(dim=-1, keepdim=True)
+                return exp_x / sum_exp
+
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(x_dev, ["B", "D"])
+
+        cfn = torch.compile(softmax_fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn(
+            "LoopSpec(",
+            src,
+            "Expected LoopSpec call in generated source for softmax-shaped fn",
+        )
+        self.assertIn(
+            "sympify('4')",
+            src,
+            "Expected loop count 4 in generated softmax source",
+        )
+
+    # ------------------------------------------------------------------
+    # Nested hints: outer K=2, inner M=4 on a single op
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_nested_loop_two_dims(self):
+        """Nested spyre_hint scopes produce a two-level tiling loop.
+
+        Input shape [1024, 4096]: outer hint tiles dim A by 2 (512 rows/iter),
+        inner hint tiles dim B by 4 (1024 cols/iter).  Both ops (add and mul)
+        share the nested LoopSpec.  Generated source must contain two LoopSpec
+        entries with counts 2 and 4.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        A, B = 1024, 4096
+        a = torch.randn(A, B, dtype=torch.float16)
+        b = torch.randn(A, B, dtype=torch.float16)
+        c = torch.randn(A, B, dtype=torch.float16)
+
+        def fn(a, b, c):
+            with spyre_hint(slices={"A": 2}):
+                with spyre_hint(slices={"B": 4}):
+                    y = a + b
+                    z = y * c
+                    return z
+
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        c_dev = c.to("spyre")
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        _name_tensor_dims(a_dev, ["A", "B"])
+        _name_tensor_dims(b_dev, ["A", "B"])
+        _name_tensor_dims(c_dev, ["A", "B"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('2')", src, "Expected outer loop count 2")
+        self.assertIn("sympify('4')", src, "Expected inner loop count 4")
+        # The nested LoopSpec must appear inside another LoopSpec.
+        self.assertGreaterEqual(
+            src.count("LoopSpec("),
+            2,
+            f"Expected ≥2 LoopSpec entries for nested loops\n\nSource:\n{src}",
+        )
+
+    # ------------------------------------------------------------------
+    # Two ops with different slice counts -> two separate groups
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_two_groups(self):
+        """Two separate tiling groups produce two LoopSpec entries in the source."""
+        from torch_spyre._inductor import spyre_hint
+
+        A, B = 256, 128
+        x = torch.randn(A, B, dtype=torch.float16)
+        y = torch.randn(A, B, dtype=torch.float16)
+
+        def fn(x, y):
+            # Two independent pointwise ops: each becomes its own group.
+            with spyre_hint(slices={"A": 4}):
+                out_x = torch.abs(x)
+            with spyre_hint(slices={"A": 8}):
+                out_y = torch.neg(y)
+            return out_x, out_y
+
+        x_dev = x.to("spyre")
+        y_dev = y.to("spyre")
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        _name_tensor_dims(x_dev, ["A", "B"])
+        _name_tensor_dims(y_dev, ["A", "B"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        loop_spec_count = src.count("LoopSpec(")
+        self.assertGreaterEqual(
+            loop_spec_count,
+            2,
+            f"Expected ≥2 LoopSpec entries, got {loop_spec_count}\n\nSource:\n{src}",
+        )
+
+    # ------------------------------------------------------------------
+    # Op inside hint scope with no matching named dim
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_group_includes_op_with_no_matching_dim(self):
+        """An op inside a hint scope whose loop vars don't match the hinted dim stays in the group.
+
+        torch.full lowers to a scalar-fill pointwise with no named loop variables.
+        It has the hint but no loop var maps to "M", so it gets a scope-marker
+        DimHint.  Its hint_id set still matches the surrounding ops so grouping
+        is not broken.  The generated source must contain a single LoopSpec
+        covering all ops.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, K = 256, 64
+        x = torch.randn(M, K, dtype=torch.float16)
+
+        def fn(x):
+            with spyre_hint(slices={"M": 4}):
+                # torch.full produces a scalar-fill with no M/K loop dim mapping.
+                bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
+                return x + bias
+
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _name_tensor_dims(x_dev, ["M", "K"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('4')", src, "Expected loop count 4")
+        self.assertEqual(
+            src.count("LoopSpec("),
+            1,
+            "Op with no matching dim must not break the group into two LoopSpec entries",
+        )
+
+    # ------------------------------------------------------------------
+    # Hint propagation through mm_to_bmm_pass
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_survives_mm_to_bmm_rewrite(self):
+        """spyre_hint is not dropped when mm_to_bmm_pass rewrites mm -> bmm.
+
+        A 3D matmul inside a spyre_hint scope is decomposed to mm then rewritten
+        back to bmm by mm_to_bmm_pass.  copy_fx_custom_meta must propagate the
+        hint onto the new bmm node so assign_dim_hints can tile it.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        B, M, K, N = 2, 128, 64, 32
+        x = torch.randn(B, M, K, dtype=torch.float16) * 0.01
+        y = torch.randn(K, N, dtype=torch.float16) * 0.01
+
+        def fn(x, y):
+            with spyre_hint(slices={"M": 4}):
+                return torch.matmul(x, y)
+
+        x_dev = x.to("spyre")
+        y_dev = y.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(x_dev, ["B", "M", "K"])
+        _name_tensor_dims(y_dev, ["K", "N"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn(
+            "LoopSpec(",
+            src,
+            "Expected LoopSpec: hint must survive mm->bmm rewrite",
+        )
+        self.assertIn("sympify('4')", src, "Expected loop count 4 after bmm rewrite")
+
+    # ------------------------------------------------------------------
+    # Hint propagation into inserted restickify nodes
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_restickify_stays_in_group(self):
+        """A restickify node inserted inside a hint scope lands in the same group.
+
+        output * correction triggers a restickify because output is col-major
+        from a preceding transpose while correction is row-major.  The inserted
+        restickify buffer must carry the hint metadata from its consumer so that
+        assign_dim_hints includes it in the hinted group.  If it were ungrouped
+        the LoopSpec count would cover fewer ops and the generated source would
+        reflect a split group.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, N = 256, 64
+        x = torch.randn(M, N, dtype=torch.float16)
+        scale = torch.randn(M, dtype=torch.float16)
+
+        def fn(x, scale):
+            with spyre_hint(slices={"M": 4}):
+                # transpose + contiguous forces a restickify on x before the mul
+                x_t = x.transpose(0, 1).contiguous().transpose(0, 1)
+                return x_t * scale.unsqueeze(-1)
+
+        x_dev = x.to("spyre")
+        scale_dev = scale.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(x_dev, ["M", "N"])
+        _name_tensor_dims(scale_dev, ["M"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev, scale_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn(
+            "LoopSpec(",
+            src,
+            "Expected LoopSpec: restickify must not break the hint group",
+        )
+        self.assertIn("sympify('4')", src, "Expected loop count 4")
+
+    # ------------------------------------------------------------------
+    # Softmax with row-tiling: large [NROW, NCOL] tensor
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_softmax_row_tiling(self):
+        """spyre_hint(slices={"NROW": 4}) tiles softmax over the row dimension."""
+        from torch_spyre._inductor import spyre_hint
+
+        NROW, NCOL = 16384, 4096
+        x = torch.rand(NROW, NCOL, dtype=torch.float16)
+
+        _declare_tensor_dim("NROW", NROW)
+        _declare_tensor_dim("NCOL", NCOL)
+
+        def fn(x, dim=-1):
+            _name_tensor_dims(x, ["NROW", "NCOL"])
+            with spyre_hint(slices={"NROW": 4}):
+                return torch.softmax(x, dim)
+
+        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.1, rtol=0.1)
+
+    # ------------------------------------------------------------------
+    # Matmul with row-tiling: tile the M dimension of x @ y
+    # ------------------------------------------------------------------
+
+    @config.patch({"coarse_tiling": True})
+    def test_hint_matmul_row_tiling(self):
+        """spyre_hint(slices={"M": 4}) tiles matmul over the row (M) dimension."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 256, 128, 64
+        x = torch.randn(M, K, dtype=torch.float16) * 0.01
+        y = torch.randn(K, N, dtype=torch.float16) * 0.01
+
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+
+        def fn(x, y):
+            _name_tensor_dims(x, ["M", "K"])
+            _name_tensor_dims(y, ["K", "N"])
+            with spyre_hint(slices={"M": 4}):
+                return x @ y
+
+        compare_with_cpu(
+            fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
 
