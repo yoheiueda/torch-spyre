@@ -130,7 +130,8 @@ def _single_arg_op_layout(
             out_dim_order = out_dim_order + [out_stick_dim]
         c_size = [concretize_expr(s) for s in output.size]
         c_stride = [concretize_expr(s) for s in output.stride]
-        return [SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)]
+        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+        return [stl]
 
     # Single-arg pointwise
     assert isinstance(data, Pointwise)
@@ -142,11 +143,10 @@ def _single_arg_op_layout(
             # Concretize for C++ SpyreTensorLayout constructor.
             c_size = [concretize_expr(s) for s in output.size]
             c_stride = [concretize_expr(s) for s in output.stride]
-            return [
-                SpyreTensorLayout(
-                    c_size, c_stride, output.dtype, list(range(len(output.size)))
-                )
-            ]
+            stl = SpyreTensorLayout(
+                c_size, c_stride, output.dtype, list(range(len(output.size)))
+            )
+            return [stl]
 
         case prims.convert_element_type.default:
             # Type conversion may require padding when input has padding due to stick
@@ -166,11 +166,10 @@ def _single_arg_op_layout(
             else:
                 c_size = [concretize_expr(s) for s in output.size]
                 c_stride = [concretize_expr(s) for s in output.stride]
-            return [
-                SpyreTensorLayout(
-                    c_size, c_stride, output.dtype, list(range(len(c_size)))
-                )
-            ]
+            stl = SpyreTensorLayout(
+                c_size, c_stride, output.dtype, list(range(len(c_size)))
+            )
+            return [stl]
 
         case _:
             in_coords = host_coordinates(in_layout, dep)
@@ -183,13 +182,10 @@ def _single_arg_op_layout(
             ):
                 # Input and output tensors are being accessed identically and elem size is the same.
                 # We can simply propagate the device_layout.
-                return [
-                    SpyreTensorLayout(
-                        stl.device_size,
-                        stl.stride_map,
-                        get_device_dtype(output.dtype),
-                    )
-                ]
+                stl = SpyreTensorLayout(
+                    stl.device_size, stl.stride_map, get_device_dtype(output.dtype)
+                )
+                return [stl]
 
             # TODO: We should be able to preserve the input stride_map
             #       unless the operation is changing elems_per_stick.
@@ -219,11 +215,10 @@ def _single_arg_op_layout(
             # Try to preserve input stick dimension
             if is_supported_stick_expr(stick_expr, stick_size):
                 maybe_stick_dim = matching_dim(out_coords, stick_expr)
-                if maybe_stick_dim is not None:
-                    dim_order = compute_dim_order(maybe_stick_dim)
-                    return [
-                        SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-                    ]
+                out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
+                dim_order = compute_dim_order(out_stick_dim)
+                stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+                return [stl]
 
             # Try alternative stick dimensions
             layouts = []
