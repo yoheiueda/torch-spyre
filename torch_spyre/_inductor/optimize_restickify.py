@@ -80,34 +80,17 @@ class EdgeCostMap:
 
         Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
         """
-        logger.debug(
-            f"[_compute_and_cache_cost] Computing cost for dep={self.dep.name}, "
-            f"in_stl={in_stl}, target_stl={target_stl}"
-        )
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep
         )
-        logger.debug(
-            f"[_compute_and_cache_cost] compute_restickify_needed returned: "
-            f"needed={needed}, tgt={tgt}"
-        )
         if not needed:
             cost = 0.0
-            logger.debug(
-                "[_compute_and_cache_cost] Stick-compatible (no restickify needed), cost=0.0"
-            )
         elif tgt is None:
             cost = INF  # infeasible restickify
-            logger.debug("[_compute_and_cache_cost] Infeasible restickify, cost=INF")
         else:
             cost = float(math.prod(in_stl.device_size))
-            logger.debug(
-                f"[_compute_and_cache_cost] Restickify needed, "
-                f"device_size={in_stl.device_size}, cost={cost}"
-            )
         self._cost[in_stl][target_stl] = cost
         self._layout[in_stl][target_stl] = tgt
-        logger.debug(f"[_compute_and_cache_cost] Cached cost={cost}, layout={tgt}")
 
     def cost(
         self, in_stl: "SpyreTensorLayout", target_stl: "SpyreTensorLayout"
@@ -481,10 +464,6 @@ def beam_global_min_cost(operations: list) -> None:
         next_states = []
         for state in frontier.states:
             in_layouts = [frontier.input_stl(state, dep.name) for dep in deps]
-            for i, stl in enumerate(in_layouts):
-                logger.debug(f"[optimize_restickify] in_layouts[{i}] STL: {stl}")
-            for i, stl in enumerate(op.layouts):
-                logger.debug(f"[optimize_restickify] op.layouts[{i}] STL: {stl}")
 
             for candidate_stl in op.layouts:
                 extra_cost = cost_fn.cost(in_layouts, candidate_stl)
