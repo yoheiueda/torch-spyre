@@ -190,73 +190,60 @@ def _single_arg_op_layout(
                         get_device_dtype(output.dtype),
                     )
                 ]
-            else:
-                # TODO: We should be able to preserve the input stride_map
-                #       unless the operation is changing elems_per_stick.
-                #       For now, use the default layout for a mostly row major dimension
-                #       ordering, adjusted to put the stick dimension last and move all
-                #       non-stick size one dimensions to the right to avoid tiling them.
-                in_device_coords = device_coordinates(stl, dep, strict=False)
-                stick_expr = in_device_coords[-1]
-                c_size = [concretize_expr(s) for s in output.size]
-                c_stride = [concretize_expr(s) for s in output.stride]
-                stick_size = get_elem_in_stick(output.dtype)
 
-                if is_supported_stick_expr(stick_expr, stick_size):
-                    maybe_stick_dim = matching_dim(out_coords, stick_expr)
-                    out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
-                    dim_order = [
-                        d
-                        for d in range(len(output.size))
-                        if d != out_stick_dim and out_coords[d] != 0
-                    ]
-                    dim_order += [
-                        d
-                        for d in range(len(output.size))
-                        if d != out_stick_dim and out_coords[d] == 0
-                    ]
-                    dim_order += [out_stick_dim]
+            # TODO: We should be able to preserve the input stride_map
+            #       unless the operation is changing elems_per_stick.
+            #       For now, use the default layout for a mostly row major dimension
+            #       ordering, adjusted to put the stick dimension last and move all
+            #       non-stick size one dimensions to the right to avoid tiling them.
+            in_device_coords = device_coordinates(stl, dep, strict=False)
+            stick_expr = in_device_coords[-1]
+            c_size = [concretize_expr(s) for s in output.size]
+            c_stride = [concretize_expr(s) for s in output.stride]
+            stick_size = get_elem_in_stick(output.dtype)
+
+            def compute_dim_order(stick_dim):
+                dim_order = [
+                    d
+                    for d in range(len(c_size))
+                    if d != stick_dim and out_coords[d] != 0
+                ]
+                dim_order += [
+                    d
+                    for d in range(len(c_size))
+                    if d != stick_dim and out_coords[d] == 0
+                ]
+                dim_order += [stick_dim]
+                return dim_order
+
+            # Try to preserve input stick dimension
+            if is_supported_stick_expr(stick_expr, stick_size):
+                maybe_stick_dim = matching_dim(out_coords, stick_expr)
+                if maybe_stick_dim is not None:
+                    dim_order = compute_dim_order(maybe_stick_dim)
                     return [
                         SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
                     ]
 
-                layouts = []
+            # Try alternative stick dimensions
+            layouts = []
+            for alt_stick_dim in range(len(output.size) - 1):
+                if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
+                    continue
 
-                for alt_stick_dim in range(len(output.size) - 1):
-                    # Only consider dimensions divisible by stick_size
-                    dim_size = concretize_expr(output.size[alt_stick_dim])
-                    if dim_size % stick_size != 0:
-                        # TODO: We need to pad the dimension to make it divisible
-                        continue
+                dim_order = compute_dim_order(alt_stick_dim)
+                layout = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+                coords = device_coordinates(layout, output_dep, strict=False)
+                if is_supported_stick_expr(coords[-1], stick_size):
+                    layouts.append(layout)
 
-                    # Create layout with this dimension as stick
-                    alt_dim_order = [
-                        d
-                        for d in range(len(output.size))
-                        if d != alt_stick_dim and out_coords[d] != 0
-                    ]
-                    alt_dim_order += [
-                        d
-                        for d in range(len(output.size))
-                        if d != alt_stick_dim and out_coords[d] == 0
-                    ]
-                    alt_dim_order += [alt_stick_dim]
-                    alt_layout = SpyreTensorLayout(
-                        c_size, c_stride, output.dtype, alt_dim_order
-                    )
-                    alt_in_device_coords = device_coordinates(
-                        alt_layout, output_dep, strict=False
-                    )
-                    alt_stick_expr = alt_in_device_coords[-1]
-                    if is_supported_stick_expr(alt_stick_expr, stick_size):
-                        layouts.append(alt_layout)
-
-                if layouts:
-                    return layouts
-
+            if not layouts:
                 raise Unsupported(
-                    f"Unexpected stick expression {stick_expr!r}: expected Mod(var, {stick_size}), a bare variable, or 0"
+                    f"Unexpected stick expression {stick_expr!r}: expected "
+                    f"Mod(var, {stick_size}), a bare variable, or 0"
                 )
+
+            return layouts
 
 
 def _exx2_layout(
