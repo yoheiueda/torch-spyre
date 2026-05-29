@@ -42,7 +42,10 @@ from .codegen.superdsc import (
 )
 from .constants import BATCH_MATMUL_OP
 from .ir import FixedTiledLayout, SpyreConstantFallback
+from .logging_utils import get_inductor_logger
 from .views import compute_coordinates, matching_dim
+
+logger = get_inductor_logger("pass_utils")
 
 
 class SchedNodeArg(NamedTuple):
@@ -148,12 +151,12 @@ def check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> 
     is_zero = stick_expr == sympy.S.Zero
 
     has_offset = False
-    constant_part = None
-    if isinstance(stick_expr, sympy.Add) and len(stick_expr.free_symbols) == 1:
-        sym = next(iter(stick_expr.free_symbols))
-        constant_part = stick_expr.subs(sym, 0)
-        if not constant_part.free_symbols and constant_part != sympy.S.Zero:
-            has_offset = True
+    # constant_part = None
+    # if isinstance(stick_expr, sympy.Add) and len(stick_expr.free_symbols) == 1:
+    #     sym = next(iter(stick_expr.free_symbols))
+    #     constant_part = stick_expr.subs(sym, 0)
+    #     if not constant_part.free_symbols and constant_part != sympy.S.Zero:
+    #         has_offset = True
 
     if not (is_supported_mod or is_bare_var or is_zero or has_offset):
         raise Unsupported(
@@ -360,30 +363,72 @@ def compute_restickify_target_layout(
     """Compute the target STL that results from moving stl's stick to target_stick_expr.
     Returns None if the restickify is infeasible.
     """
+    logger.debug(
+        f"[compute_restickify_target_layout] stl={stl}, target_stick_expr={target_stick_expr}, "
+        f"ic={ic}, idc={idc}"
+    )
     new_sd = matching_dim(ic, target_stick_expr)
+    logger.debug(
+        f"[compute_restickify_target_layout] new_sd (matching_dim for target)={new_sd}"
+    )
     if new_sd is None:
+        logger.debug(
+            "[compute_restickify_target_layout] new_sd is None, returning None (infeasible)"
+        )
         return None
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
+    logger.debug(
+        f"[compute_restickify_target_layout] host_size={host_size}, host_stride={host_stride}"
+    )
     old_sd = matching_dim(ic, idc[-1])
+    logger.debug(
+        f"[compute_restickify_target_layout] old_sd (matching_dim for current stick)={old_sd}"
+    )
     if old_sd is None:
+        logger.debug(
+            "[compute_restickify_target_layout] old_sd is None, returning None (infeasible)"
+        )
         return None
     old_stick_expr = idc[-1]
     old_stride_map = list(stl.stride_map)
     old_var = next(iter(old_stick_expr.free_symbols))
     new_var = next(iter(target_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
+    logger.debug(
+        f"[compute_restickify_target_layout] old_stick_expr={old_stick_expr}, old_var={old_var}, "
+        f"new_var={new_var}, stick_size={stick_size}"
+    )
     old_sd_outer_dim = next(
         (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
         next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
     )
+    logger.debug(
+        f"[compute_restickify_target_layout] old_sd_outer_dim={old_sd_outer_dim}"
+    )
     if old_sd_outer_dim is None:
+        logger.debug(
+            "[compute_restickify_target_layout] old_sd_outer_dim is None, returning None (infeasible)"
+        )
         return None
     candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
+    logger.debug(
+        f"[compute_restickify_target_layout] candidates for new_sd_outer_dim={candidates}"
+    )
     if not candidates:
+        logger.debug(
+            "[compute_restickify_target_layout] No candidates found, returning None (infeasible)"
+        )
         return None
     new_sd_outer_dim = candidates[0]
+    logger.debug(
+        f"[compute_restickify_target_layout] new_sd_outer_dim={new_sd_outer_dim}"
+    )
     if host_size[new_sd] % stick_size != 0:
+        logger.debug(
+            f"[compute_restickify_target_layout] host_size[{new_sd}]={host_size[new_sd]} not divisible by "
+            f"stick_size={stick_size}, returning None (infeasible)"
+        )
         return None
     device_size = restickify_device_size(
         list(stl.device_size),
@@ -393,6 +438,9 @@ def compute_restickify_target_layout(
         host_size[new_sd],
         stick_size,
     )
+    logger.debug(
+        f"[compute_restickify_target_layout] computed device_size={device_size}"
+    )
     stride_map = restickify_stride_map(
         old_stride_map,
         old_sd_outer_dim,
@@ -401,7 +449,12 @@ def compute_restickify_target_layout(
         host_stride[new_sd],
         stick_size,
     )
-    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
+    logger.debug(f"[compute_restickify_target_layout] computed stride_map={stride_map}")
+    result = SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
+    logger.debug(
+        f"[compute_restickify_target_layout] Returning target layout: {result}"
+    )
+    return result
 
 
 def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
@@ -441,14 +494,35 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
-    idc = device_coordinates(in_stl, in_dep)
+    logger.debug(
+        f"[compute_restickify_needed] in_dep={in_dep.name}, out_dep={out_dep.name}, "
+        f"in_stl={in_stl}, out_stl={out_stl}"
+    )
+    idc = device_coordinates(in_stl, in_dep, check_stick_expr=False)
     out_idc = device_coordinates(out_stl, out_dep)
+    logger.debug(
+        f"[compute_restickify_needed] device_coordinates: idc={idc}, out_idc={out_idc}"
+    )
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
     if stick_compatible([idc, out_idc]):
+        logger.debug(
+            "[compute_restickify_needed] Stick-compatible, returning (False, None)"
+        )
         return False, None
+    logger.debug(
+        "[compute_restickify_needed] Not stick-compatible, computing target layout"
+    )
     ic = host_coordinates(in_host, in_dep)
-    return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)
+    logger.debug(f"[compute_restickify_needed] host_coordinates: ic={ic}")
+    target_layout = compute_restickify_target_layout(
+        in_stl, in_host, out_idc[-1], ic, idc
+    )
+    logger.debug(
+        f"[compute_restickify_needed] compute_restickify_target_layout returned: {target_layout}"
+    )
+    logger.debug(f"[compute_restickify_needed] Returning (True, {target_layout})")
+    return True, target_layout
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:

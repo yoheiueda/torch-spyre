@@ -297,6 +297,7 @@ def _single_arg_op_layout(
                         logger.debug(
                             f"[propagate_layouts]       Created layout with dim_order={alt_dim_order}"
                         )
+                        logger.debug(f"[propagate_layouts]       STL: {alt_layout}")
                         layouts.append(alt_layout)
 
                 if layouts:
