@@ -227,10 +227,10 @@ def _single_arg_op_layout(
                     continue
 
                 dim_order = compute_dim_order(alt_stick_dim)
-                layout = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-                coords = device_coordinates(layout, output_dep, strict=False)
+                stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+                coords = device_coordinates(stl, output_dep, strict=False)
                 if is_supported_stick_expr(coords[-1], stick_size):
-                    layouts.append(layout)
+                    layouts.append(stl)
 
             if not layouts:
                 raise Unsupported(
