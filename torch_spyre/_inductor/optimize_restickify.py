@@ -163,6 +163,9 @@ class AllSameNode(RestickNodeCost):
     def required_input_stls(self, out_stl):
         return [(ec, out_stl) for ec in self.edge_costs]
 
+    def __repr__(self):
+        return f"AllSameNode(num_inputs={len(self.edge_costs)})"
+
 
 class FixedInOutNode(RestickNodeCost):
     """Cost node for ops whose input and output stick compatibility is fixed by the op (eg, matmul)."""
@@ -201,6 +204,9 @@ class FixedInOutNode(RestickNodeCost):
     def required_input_stls(self, out_stl):
         return list(zip(self.edge_costs, self.required_in_stls))
 
+    def __repr__(self):
+        return f"FixedInOutNode(num_inputs={len(self.edge_costs)}, required_out_stl={self.required_out_stl})"
+
 
 class AnyInNode(RestickNodeCost):
     """Cost node for ops that accept any input layout and produce a fixed output layout.
@@ -217,6 +223,9 @@ class AnyInNode(RestickNodeCost):
         self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
         return 0.0
+
+    def __repr__(self):
+        return "AnyInNode()"
 
     def required_input_stls(self, out_stl):
         return []
