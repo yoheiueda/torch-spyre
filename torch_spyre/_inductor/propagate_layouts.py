@@ -484,18 +484,6 @@ def _multi_arg_pointwise_layouts(
        2. Compute an out STL for each
        3. Construct the AllSameNode cost function since in and out sticks must always match
     """
-    stick_size = get_elem_in_stick(output.dtype)
-
-    def _is_supported_layout(dim_order: list[int]) -> bool:
-        """Check if a dimension order produces supported stick expressions for all args."""
-        for arg in args:
-            c_in_size = [concretize_expr(s) for s in arg.layout.size]
-            c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
-            in_stl = SpyreTensorLayout(c_in_size, c_in_stride, output.dtype, dim_order)
-            in_coords = device_coordinates(in_stl, arg.dep, strict=False)
-            if not is_supported_stick_expr(in_coords[-1], stick_size):
-                return False
-        return True
 
     # Collect all unique non-zero stick expressions from input layouts
     stick_exprs = {
@@ -503,7 +491,6 @@ def _multi_arg_pointwise_layouts(
         for arg in args
         for stl in arg.layouts
         if (stick_expr := device_coordinates(stl, arg.dep, strict=False)[-1]) != 0
-        and is_supported_stick_expr(stick_expr, stick_size)
     }
 
     if len(stick_exprs) > 1:
@@ -515,8 +502,6 @@ def _multi_arg_pointwise_layouts(
     # across all inputs and the output we can just propagate the device layout.
     in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
     out_coords = host_coordinates(output, output_dep)
-    c_size = [concretize_expr(s) for s in output.size]
-    c_stride = [concretize_expr(s) for s in output.stride]
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
@@ -532,23 +517,42 @@ def _multi_arg_pointwise_layouts(
                 can_use_same_layout = False
                 break
 
+    stick_size = get_elem_in_stick(output.dtype)
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+
+    def _is_supported_layout(dim_order) -> bool:
+        for arg in args:
+            c_in_size = [concretize_expr(s) for s in arg.layout.size]
+            c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+            in_stl = SpyreTensorLayout(c_in_size, c_in_stride, output.dtype, dim_order)
+            coord = device_coordinates(in_stl, arg.dep, strict=False)
+            if not is_supported_stick_expr(coord[-1], stick_size):
+                return False
+        return True
+
     results: list[SpyreTensorLayout] = []
-    # Sort stick exprs for determinism
-    for stick_expr in sorted(stick_exprs, key=iter_var_id) if stick_exprs else [None]:
-        if can_use_same_layout:
-            template_stl = next(iter(args[0].layouts))
-            stl = SpyreTensorLayout(
-                template_stl.device_size,
-                template_stl.stride_map,
-                get_device_dtype(output.dtype),
-            )
-            results.append(stl)
-        else:
-            if stick_expr is None:
-                out_stick_dim = -1
-            else:
-                maybe_stick_dim = matching_dim(out_coords, stick_expr)
-                out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
+
+    if can_use_same_layout:
+        template_stl = next(iter(args[0].layouts))
+        stl = SpyreTensorLayout(
+            template_stl.device_size,
+            template_stl.stride_map,
+            get_device_dtype(output.dtype),
+        )
+        results.append(stl)
+    elif not stick_exprs:
+        out_stick_dim = -1
+        dim_order = _compute_dim_order(out_stick_dim, output.size, out_coords)
+        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+        results.append(stl)
+    else:
+        stick_exprs = {e for e in stick_exprs if is_supported_stick_expr(e, stick_size)}
+
+        # Sort stick exprs for determinism
+        for stick_expr in sorted(stick_exprs, key=iter_var_id):
+            maybe_stick_dim = matching_dim(out_coords, stick_expr)
+            out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
             dim_order = _compute_dim_order(out_stick_dim, output.size, out_coords)
             if _is_supported_layout(dim_order):
                 stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
