@@ -439,7 +439,7 @@ def compute_restickify_needed(
       (True, None)    — restickify needed but infeasible
     """
     idc = device_coordinates(in_stl, in_dep, strict=False)
-    out_idc = device_coordinates(out_stl, out_dep)
+    out_idc = device_coordinates(out_stl, out_dep, strict=False)
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
     if stick_compatible([idc, out_idc]):
