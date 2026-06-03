@@ -486,7 +486,7 @@ def _multi_arg_pointwise_layouts(
     """
     stick_size = get_elem_in_stick(output.dtype)
 
-    def _is_supported_dim_order(dim_order: list[int]) -> bool:
+    def _is_supported_layout(dim_order: list[int]) -> bool:
         """Check if a dimension order produces supported stick expressions for all args."""
         for arg in args:
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
@@ -550,7 +550,7 @@ def _multi_arg_pointwise_layouts(
                 maybe_stick_dim = matching_dim(out_coords, stick_expr)
                 out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
             dim_order = _compute_dim_order(out_stick_dim, output.size, out_coords)
-            if _is_supported_dim_order(dim_order):
+            if _is_supported_layout(dim_order):
                 stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
                 results.append(stl)
 
@@ -564,7 +564,7 @@ def _multi_arg_pointwise_layouts(
 
             dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)
 
-            if _is_supported_dim_order(dim_order):
+            if _is_supported_layout(dim_order):
                 stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
                 results.append(stl)
 
