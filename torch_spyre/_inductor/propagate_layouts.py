@@ -484,12 +484,63 @@ def _multi_arg_pointwise_layouts(
        2. Compute an out STL for each
        3. Construct the AllSameNode cost function since in and out sticks must always match
     """
-    stick_exprs = {
-        device_coordinates(stl, arg.dep)[-1]
-        for arg in args
-        for stl in arg.layouts
-        if device_coordinates(stl, arg.dep)[-1] != 0
-    }
+    print(f"\n[_multi_arg_pointwise_layouts] op: {op.get_name()}")
+    print(f"  output: {output}")
+    print(f"  output_dep: {output_dep}")
+    print(f"  args: {len(args)} args")
+    for i, arg in enumerate(args):
+        print(f"    arg[{i}]: {len(arg.layouts)} layouts, dep: {arg.dep}")
+
+    stick_size = get_elem_in_stick(output.dtype)
+    print(f"  stick_size: {stick_size}")
+
+    # Collect all unique non-zero stick expressions from input layouts
+    print("  [DEBUG] Collecting stick expressions from input layouts...")
+    initial_stick_exprs = []
+    for arg_idx, arg in enumerate(args):
+        for stl_idx, stl in enumerate(arg.layouts):
+            stick_expr = device_coordinates(stl, arg.dep, strict=False)[-1]
+            is_supported = is_supported_stick_expr(stick_expr, stick_size)
+            print(
+                f"    arg[{arg_idx}].layout[{stl_idx}]: stick_expr={stick_expr}, is_zero={stick_expr == 0}, is_supported={is_supported}"
+            )
+            if stick_expr != 0 and is_supported:
+                initial_stick_exprs.append(stick_expr)
+
+    stick_exprs = set(initial_stick_exprs)
+    print(f"  [DEBUG] Initial stick_exprs (before filtering): {stick_exprs}")
+
+    # Collect all free symbols from unsupported stick expressions
+    print("  [DEBUG] Collecting unsupported symbols...")
+    unsupported_symbols = set()
+    for arg_idx, arg in enumerate(args):
+        for stl_idx, stl in enumerate(arg.layouts):
+            stick_expr = device_coordinates(stl, arg.dep, strict=False)[-1]
+            if stick_expr != 0 and not is_supported_stick_expr(stick_expr, stick_size):
+                print(
+                    f"    arg[{arg_idx}].layout[{stl_idx}]: unsupported stick_expr={stick_expr}, free_symbols={stick_expr.free_symbols}"
+                )
+                unsupported_symbols.update(stick_expr.free_symbols)
+
+    print(f"  [DEBUG] unsupported_symbols: {unsupported_symbols}")
+
+    # Remove stick expressions that share symbols with unsupported expressions
+    print(
+        "  [DEBUG] Filtering stick expressions that share symbols with unsupported..."
+    )
+    filtered_stick_exprs = set()
+    for expr in stick_exprs:
+        shares_symbols = any(var in unsupported_symbols for var in expr.free_symbols)
+        print(
+            f"    expr={expr}, free_symbols={expr.free_symbols}, shares_unsupported={shares_symbols}"
+        )
+        if not shares_symbols:
+            filtered_stick_exprs.add(expr)
+
+    # stick_exprs = filtered_stick_exprs
+    print(f"  [DEBUG] Final stick_exprs (after filtering): {stick_exprs}")
+
+    print(f"  stick_exprs: {stick_exprs} (count: {len(stick_exprs)})")
 
     if len(stick_exprs) > 1:
         logger.info(
@@ -500,9 +551,13 @@ def _multi_arg_pointwise_layouts(
     # across all inputs and the output we can just propagate the device layout.
     in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
     out_coords = host_coordinates(output, output_dep)
+    print(f"  out_coords: {out_coords}")
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
+        print(
+            "  can_use_same_layout = False (multiple stick_exprs or multiple layouts per arg)"
+        )
         can_use_same_layout = False
     else:
         for arg, arg_coors in zip(args, in_coords):
@@ -512,13 +567,16 @@ def _multi_arg_pointwise_layouts(
                 or arg.dep.index != output_dep.index
                 or not same_device_size(arg.layout.dtype, output.dtype)
             ):
+                print(f"  can_use_same_layout = False (arg {args.index(arg)} differs)")
                 can_use_same_layout = False
                 break
 
+    print(f"  can_use_same_layout: {can_use_same_layout}")
     results: list[SpyreTensorLayout] = []
     # Sort stick exprs for determinism
-    for stick_expr in sorted(stick_exprs, key=iter_var_id) if stick_exprs else [None]:
+    for stick_expr in sorted(stick_exprs, key=iter_var_id) if stick_exprs else []:
         if can_use_same_layout:
+            print("    Using same layout as input")
             template_stl = next(iter(args[0].layouts))
             stl = SpyreTensorLayout(
                 template_stl.device_size,
@@ -535,7 +593,76 @@ def _multi_arg_pointwise_layouts(
             c_size = [concretize_expr(s) for s in output.size]
             c_stride = [concretize_expr(s) for s in output.stride]
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+
         results.append(stl)
+
+    # Filter out layouts where any input has unsupported stick expression
+    print(f"\n  Filtering {len(results)} results")
+    filtered_results = []
+    for idx, stl in enumerate(results):
+        print(f"    Checking result[{idx}]: {stl}")
+        ok = True
+        for arg_idx, arg in enumerate(args):
+            in_coords = device_coordinates(stl, arg.dep, strict=False)
+            print(f"      arg[{arg_idx}] in_coords[-1]: {in_coords[-1]}")
+            if not is_supported_stick_expr(in_coords[-1], stick_size):
+                print(f"      arg[{arg_idx}] has unsupported stick expr, rejecting")
+                ok = False
+                break
+        if ok:
+            print(f"    result[{idx}] passed all checks, keeping")
+            filtered_results.append(stl)
+        else:
+            print(f"    result[{idx}] rejected")
+
+    results = filtered_results
+    print(f"  After filtering: {len(results)} results remain")
+
+    if len(results) == 0:
+        print("\n  No results after filtering, trying alternative stick dimensions")
+        out_coords = host_coordinates(output, output_dep)
+        c_size = [concretize_expr(s) for s in output.size]
+        c_stride = [concretize_expr(s) for s in output.stride]
+        print(f"    out_coords: {out_coords}")
+        print(f"    c_size: {c_size}")
+        print(f"    c_stride: {c_stride}")
+
+        for alt_stick_dim in range(len(output.size) - 1):
+            print(f"\n    Trying alt_stick_dim {alt_stick_dim}")
+            if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
+                # TODO: Support dimensions with size not divisible by stick_size via padding
+                print(
+                    f"      Size {output.size[alt_stick_dim]} not divisible by stick_size {stick_size}, skipping"
+                )
+                continue
+
+            dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)
+
+            ok = True
+            for arg_idx, arg in enumerate(args):
+                print(f"        arg[{arg_idx}] arg.dep: {arg.dep}")
+                c_in_size = [concretize_expr(s) for s in arg.layout.size]
+                c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+                in_stl = SpyreTensorLayout(
+                    c_in_size, c_in_stride, output.dtype, dim_order
+                )
+                in_coords = device_coordinates(in_stl, arg.dep, strict=False)
+                print(f"        arg[{arg_idx}] in_coords: {in_coords}")
+                if not is_supported_stick_expr(in_coords[-1], stick_size):
+                    print(f"        arg[{arg_idx}] has unsupported stick expr")
+                    ok = False
+                    break
+            if ok:
+                print(
+                    f"      alt_stick_dim {alt_stick_dim} passed all checks, adding to results"
+                )
+                stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+                results.append(stl)
+                print(f"      Created stl: {stl}")
+            else:
+                print(f"      alt_stick_dim {alt_stick_dim} rejected")
+    print(f"  Finally: {len(results)} results remain")
+
     op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
     return results
 
