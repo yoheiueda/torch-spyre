@@ -152,15 +152,15 @@ def _single_arg_op_layout(
     data = op.data
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
+    stick_size = get_elem_in_stick(output.dtype)
 
     if isinstance(data, Reduction):
+        # Propagate input stick to output if the dim survives, else put stick last.
         x_dev_coords = device_coordinates(stl, dep, strict=False)
         out_coords = host_coordinates(output, output_dep)
         x_stick_expr = x_dev_coords[-1]
-        stick_size = get_elem_in_stick(output.dtype)
 
-        # Try to preserve input stick if it's supported: propagate to the matching
-        # output dim if it survives the reduction, else put stick last.
+        # Try to preserve input layout
         if is_supported_stick_expr(x_stick_expr, stick_size):
             out_stick_dim = matching_dim(out_coords, x_stick_expr)
             if out_stick_dim is None:
@@ -173,9 +173,7 @@ def _single_arg_op_layout(
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
             return [stl]
 
-        # Input stick is unsupported (e.g. due to offsets/gaps from a slice).
-        # Try alternative output stick dims; AllSameNode will insert a restickify
-        # on the input before the reduction.
+        # Try alternative layouts
         layouts = []
         for alt_stick_dim in range(len(output.size) - 1):
             if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
@@ -244,9 +242,8 @@ def _single_arg_op_layout(
 
     in_device_coords = device_coordinates(stl, dep, strict=False)
     stick_expr = in_device_coords[-1]
-    stick_size = get_elem_in_stick(output.dtype)
 
-    # Try to preserve input stick dimension
+    # Try to preserve input layout
     if is_supported_stick_expr(stick_expr, stick_size):
         maybe_stick_dim = matching_dim(out_coords, stick_expr)
         out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
@@ -254,7 +251,7 @@ def _single_arg_op_layout(
         stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         return [stl]
 
-    # Try alternative stick dimensions
+    # Try alternative layouts
     layouts = []
     for alt_stick_dim in range(len(output.size) - 1):
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
@@ -312,7 +309,7 @@ def _clone_layout(
         op.restick_cost_fn = AnyInNode.from_args()
         return [out_stl]
 
-    # Case 2: Find alternative stick dimension to swap with the current stick dimension
+    # Case 2: Find alternative dimension to swap with the current stick dimension
     out_coords = host_coordinates(output, output_dep)
     required_in_stl = None
     for alt_stick_dim in range(len(output.size) - 1):
@@ -609,7 +606,7 @@ def _multi_arg_pointwise_layouts(
                 stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
                 results.append(stl)
 
-    # Fallback: try alternative stick dimensions if no valid layouts found
+    # Fallback: try alternative layouts if no valid layouts found
     if not results:
         for alt_stick_dim in range(len(output.size) - 1):
             # Skip dimensions not divisible by stick_size
