@@ -487,8 +487,9 @@ def _multi_arg_pointwise_layouts(
     """
     Multi-arg pointwise is a join point so handled specially.
     Algorithm is
-       1. Compute set of output stick expressions possible given the input layouts
-       2. Compute an out STL for each
+       1. Compute set of output stick expressions possible given the input layouts,
+          keeping only those that produce a supported stick expression on every input.
+       2. Compute an out STL for each; fall back to alternate output dims if none survive.
        3. Construct the AllSameNode cost function since in and out sticks must always match
     """
 
@@ -499,11 +500,6 @@ def _multi_arg_pointwise_layouts(
         for stl in arg.layouts
         if (stick_expr := device_coordinates(stl, arg.dep, strict=False)[-1]) != 0
     }
-
-    if len(stick_exprs) > 1:
-        logger.info(
-            f"Multi-stick pointwise ({op.get_name()}): producing {len(stick_exprs)} output layouts."
-        )
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
@@ -527,24 +523,17 @@ def _multi_arg_pointwise_layouts(
     stick_size = get_elem_in_stick(output.dtype)
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    out_rank = len(output.size)
 
-    def _project_dim_order(dim_order, in_rank):
-        # Inductor right-aligns broadcast inputs: input dim k corresponds to
-        # output dim k + (out_rank - in_rank). Drop leading output dims that
-        # don't exist in the input and reindex the rest.
-        if in_rank >= out_rank:
-            return dim_order
-        offset = out_rank - in_rank
-        return [d - offset for d in dim_order if d >= offset]
-
-    def _is_supported_layout(dim_order) -> bool:
+    def _is_supported_layout(dim_order):
         for arg in args:
-            in_rank = len(arg.layout.size)
-            proj = _project_dim_order(dim_order, in_rank)
+            # Project output dim_order to input, dropping leading dims missing due to broadcast.
+            rank_diff = len(output.size) - len(arg.layout.size)
+            projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
-            in_stl = SpyreTensorLayout(c_in_size, c_in_stride, output.dtype, proj)
+            in_stl = SpyreTensorLayout(
+                c_in_size, c_in_stride, output.dtype, projected_dim_order
+            )
             coord = device_coordinates(in_stl, arg.dep, strict=False)
             if not is_supported_stick_expr(coord[-1], stick_size):
                 return False
@@ -590,6 +579,17 @@ def _multi_arg_pointwise_layouts(
             if _is_supported_layout(dim_order):
                 stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
                 results.append(stl)
+
+    if not results:
+        raise Unsupported(
+            f"Multi-arg pointwise ({op.get_name()}): no supported output layout found "
+            f"with size={output.size} and coordinates={out_coords}"
+        )
+
+    if len(results) > 1:
+        logger.info(
+            f"Multi-arg pointwise ({op.get_name()}): producing {len(results)} candidate output layouts."
+        )
 
     op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
     return results
