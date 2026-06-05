@@ -76,12 +76,6 @@ def _format_operations(operations: list[Operation]) -> str:
             buf.write(f"\n  layout={op.layout}")
             if allocation := getattr(op.layout, "allocation", None):
                 buf.write(f"\n  allocation={allocation}")
-            if layouts := getattr(op, "layouts", None):
-                buf.write(f"\n  layouts={layouts}")
-            if restick_cost_fn := getattr(op, "restick_cost_fn", None):
-                buf.write(f"\n  restick_cost_fn={restick_cost_fn}")
-            if committed_stl := getattr(op, "committed_stl", None):
-                buf.write(f"\n  committed_stl={committed_stl}")
             if splits := getattr(op, "op_it_space_splits", None):
                 rw = op.get_read_writes()
                 write_index = next(iter(rw.writes)).index
@@ -255,34 +249,27 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         if logger.isEnabledFor(logging.INFO):
             logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
 
-        def _run(pass_fn, operations, *args, **kwargs):
-            pass_fn(operations, *args, **kwargs)
-
-            if logger.isEnabledFor(logging.DEBUG):
-                pass_name = pass_fn.__name__
-                logger.debug("AFTER %s:\n%s", pass_name, _format_operations(operations))
-
-        _run(deadcode_elimination, operations)
-        _run(propagate_spyre_tensor_layouts, operations)
-        _run(optimize_restickify_locations, operations)
-        _run(finalize_layouts, operations)
-        _run(insert_restickify, operations)
-        _run(insert_bmm_padding, operations)
-        _run(dedup_and_promote_constants, operations)
+        deadcode_elimination(operations)
+        propagate_spyre_tensor_layouts(operations)
+        optimize_restickify_locations(operations)
+        finalize_layouts(operations)
+        insert_restickify(operations)
+        insert_bmm_padding(operations)
+        dedup_and_promote_constants(operations)
         if config.chunk_large_tensors:
-            _run(chunk_large_tensors, operations)
-        _run(propagate_named_dims, operations)
-        _run(assign_dim_hints, operations)
+            chunk_large_tensors(operations)
+        propagate_named_dims(operations)
+        assign_dim_hints(operations)
         if config.coarse_tiling:
             groups = hints_to_coarse_tile_groups(operations)
             if config.coarse_tiling_groups_fn is not None:
                 groups = config.coarse_tiling_groups_fn(operations)
-            _run(coarse_tile, operations, groups=groups)
-        _run(span_reduction, operations)
+            coarse_tile(operations, groups=groups)
+        span_reduction(operations)
         k_fast_ops = (
             k_fast_division(operations) if config.core_id_k_fast_emission else []
         )
-        _run(work_distribution, operations, k_fast_ops)
+        work_distribution(operations, k_fast_ops)
         if config.lx_planning:
             allocator = (
                 StrategyBCoOptimizingAllocator()
