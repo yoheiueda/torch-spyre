@@ -527,12 +527,24 @@ def _multi_arg_pointwise_layouts(
     stick_size = get_elem_in_stick(output.dtype)
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
+    out_rank = len(output.size)
+
+    def _project_dim_order(dim_order, in_rank):
+        # Inductor right-aligns broadcast inputs: input dim k corresponds to
+        # output dim k + (out_rank - in_rank). Drop leading output dims that
+        # don't exist in the input and reindex the rest.
+        if in_rank >= out_rank:
+            return dim_order
+        offset = out_rank - in_rank
+        return [d - offset for d in dim_order if d >= offset]
 
     def _is_supported_layout(dim_order) -> bool:
         for arg in args:
+            in_rank = len(arg.layout.size)
+            proj = _project_dim_order(dim_order, in_rank)
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
-            in_stl = SpyreTensorLayout(c_in_size, c_in_stride, output.dtype, dim_order)
+            in_stl = SpyreTensorLayout(c_in_size, c_in_stride, output.dtype, proj)
             coord = device_coordinates(in_stl, arg.dep, strict=False)
             if not is_supported_stick_expr(coord[-1], stick_size):
                 return False
