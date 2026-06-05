@@ -155,13 +155,13 @@ def _single_arg_op_layout(
     stick_size = get_elem_in_stick(output.dtype)
 
     if isinstance(data, Reduction):
-        # Propagate input stick to output if the dim survives, else put stick last.
         x_dev_coords = device_coordinates(stl, dep, strict=False)
         out_coords = host_coordinates(output, output_dep)
         x_stick_expr = x_dev_coords[-1]
 
         # Try to preserve input layout
         if is_supported_stick_expr(x_stick_expr, stick_size):
+            # Propagate input stick to output if the dim survives, else put stick last.
             out_stick_dim = matching_dim(out_coords, x_stick_expr)
             if out_stick_dim is None:
                 out_dim_order = list(range(len(output.size))) + [-1]
@@ -179,7 +179,6 @@ def _single_arg_op_layout(
             if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
                 # TODO: Support dimensions with size not divisible by stick_size via padding
                 continue
-
             dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
             coords = device_coordinates(stl, output_dep, strict=False)
@@ -257,7 +256,6 @@ def _single_arg_op_layout(
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
             # TODO: Support dimensions with size not divisible by stick_size via padding
             continue
-
         dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)
         stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         coords = device_coordinates(stl, output_dep, strict=False)
@@ -316,7 +314,6 @@ def _clone_layout(
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
             # TODO: Support dimensions with size not divisible by stick_size via padding
             continue
-
         dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)
         stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         coords = device_coordinates(stl, output_dep, strict=False)
