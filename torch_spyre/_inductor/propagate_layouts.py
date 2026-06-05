@@ -184,11 +184,14 @@ def _single_arg_op_layout(
     assert aten_op != aten.clone.default
 
     match aten_op:
-        case prims.convert_element_type.default:
-            # Type conversion may require padding when input has padding due to stick
-            # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
-            # which becomes 64 FP32 elements when converted. We need to reflect this
-            # in the output host size so the constructor creates the correct device layout.
+        case prims.convert_element_type.default if not same_device_size(
+            in_layout.dtype, output.dtype
+        ):
+            # Type conversion between different element sizes may require padding
+            # when input has padding due to stick alignment. For example, 4x16 FP16
+            # has 48 elements of padding (64 total), which becomes 64 FP32 elements
+            # when converted. We need to reflect this in the output host size so
+            # the constructor creates the correct device layout.
 
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
             stick_dim_size = in_layout.size[-1]
