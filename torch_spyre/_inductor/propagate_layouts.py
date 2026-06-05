@@ -178,18 +178,26 @@ def _single_arg_op_layout(
         # decided against the pre-slice base tensor's dim sizes (in_layout.size),
         # not the post-slice/post-reduction output.size.
         in_coords = host_coordinates(in_layout, dep)
+        reduction_var = next(
+            iter(dep.index.free_symbols - output_dep.index.free_symbols), None
+        )
         layouts = []
-        for alt_stick_dim in range(len(output.size)):
-            # Map output dim -> input dim via the loop var on out_coords.
-            coord = out_coords[alt_stick_dim]
-            in_dim = matching_dim(in_coords, coord) if coord.free_symbols else None
-            if in_dim is None:
-                continue
+        for in_dim in range(len(in_layout.size)):
             if concretize_expr(in_layout.size[in_dim]) % stick_size != 0:
                 # TODO: Support dimensions with size not divisible by stick_size via padding
                 continue
-            dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)
-            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+            in_coord = in_coords[in_dim]
+            # Map input dim -> output dim. If this input dim carries the
+            # reduction variable, it's collapsed; place stick on a virtual
+            # dim outside output.size via the -1 placeholder.
+            if reduction_var is not None and reduction_var in in_coord.free_symbols:
+                out_dim_order = list(range(len(output.size))) + [-1]
+            else:
+                out_stick_dim = matching_dim(out_coords, in_coord)
+                if out_stick_dim is None:
+                    continue
+                out_dim_order = _compute_dim_order(out_stick_dim, c_size, out_coords)
+            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
             coords = device_coordinates(stl, output_dep, strict=False)
             if is_supported_stick_expr(coords[-1], stick_size):
                 layouts.append(stl)
