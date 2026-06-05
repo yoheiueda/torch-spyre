@@ -119,6 +119,24 @@ def _compute_dim_order(stick_dim, size, coords):
     return dim_order
 
 
+def _check_supported_input_sticks(args: list["PropArg"], op_label: str) -> None:
+    """Reject ops with fixed-layout requirements when any input has an unsupported
+    stick expression (e.g. offsets/gaps from a slice/split on the stick dim).
+
+    Such ops would need two restickifies — one to remove the offset before the op
+    and another to restore the layout afterwards — which is not yet implemented.
+    """
+    for i, arg in enumerate(args):
+        for stl in arg.layouts:
+            stick_expr = device_coordinates(stl, arg.dep, strict=False)[-1]
+            if not is_supported_stick_expr(stick_expr, stl.elems_per_stick()):
+                raise Unsupported(
+                    f"{op_label}: input arg{i} has unsupported stick expression "
+                    f"{stick_expr!r} (likely from slicing/splitting the stick dimension); "
+                    f"this op requires a fixed input layout and double-restickify is not yet supported"
+                )
+
+
 def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
@@ -170,11 +188,6 @@ def _single_arg_op_layout(
             if is_supported_stick_expr(coords[-1], stick_size):
                 layouts.append(stl)
 
-        if not layouts:
-            raise Unsupported(
-                f"Reduction: no supported output layout found for stick expression "
-                f"{x_stick_expr!r}. size={output.size} coordinates={out_coords}"
-            )
         return layouts
 
     # Single-arg pointwise
@@ -192,6 +205,9 @@ def _single_arg_op_layout(
             # has 48 elements of padding (64 total), which becomes 64 FP32 elements
             # when converted. We need to reflect this in the output host size so
             # the constructor creates the correct device layout.
+            in_stick_expr = device_coordinates(stl, dep, strict=False)[-1]
+            if not is_supported_stick_expr(in_stick_expr, stl.elems_per_stick()):
+                return []
 
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
             stick_dim_size = in_layout.size[-1]
@@ -250,12 +266,6 @@ def _single_arg_op_layout(
         coords = device_coordinates(stl, output_dep, strict=False)
         if is_supported_stick_expr(coords[-1], stick_size):
             layouts.append(stl)
-
-    if not layouts:
-        raise Unsupported(
-            f"No supported layout found for stick expression {stick_expr!r}. "
-            f"Cannot find alternative layout with size={output.size} and coordinates={out_coords}"
-        )
 
     return layouts
 
@@ -339,6 +349,7 @@ def _exx2_layout(
     """exx2 requires its input stick on the reduction dim (= last logical dim).
     Use FixedInOutNode to schedule a restickify if the input stick is elsewhere.
     """
+    _check_supported_input_sticks(args, "exx2")
     x = args[0]
     out_dim_order = list(range(len(output.size))) + [-1]
     c_size = [concretize_expr(s) for s in output.size]
@@ -361,6 +372,7 @@ def _layernormnorm_layout(
     """layernormnorm requires x's stick to match mean/norm_mean (= last logical dim).
     Use FixedInOutNode to schedule a restickify if x's stick is elsewhere.
     """
+    _check_supported_input_sticks(args, "layernormnorm")
     x = args[0]
     out_dim_order = list(range(len(output.size)))
     c_size = [concretize_expr(s) for s in output.size]
@@ -464,6 +476,7 @@ def _matmul_layouts(
        3. Compute the output STL and construct the FixedInOutNode cost function
     """
     data = op.data
+    _check_supported_input_sticks(args, data.reduction_type)
     out_coords = host_coordinates(output, output_dep)
 
     x = args[0]
@@ -631,6 +644,7 @@ def _topk_layouts(
     output_dep: MemoryDep,
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
+    _check_supported_input_sticks(args, "topk")
     x = args[0]
     x_coords = host_coordinates(x.layout, x.dep)
     out_coords = host_coordinates(output, output_dep)
@@ -718,14 +732,18 @@ def compute_layouts(
         return _clone_layout(op, output, output_dep, args)
 
     # All other single arg ops
-    # Each call to _single_arg_op_layout returns a list of layouts.
-    # Concatenate all lists to get all candidate layouts.
     layouts = []
     for stl in args[0].layouts:
         result = _single_arg_op_layout(
             op, output, output_dep, args[0].dep, args[0].layout, stl
         )
         layouts.extend(result)
+    if not layouts:
+        raise Unsupported(
+            f"{op.get_name()} ({aten_op}): no supported output layout found for "
+            f"any of {len(args[0].layouts)} candidate input layouts; "
+            f"output size={output.size}"
+        )
     op.restick_cost_fn = AllSameNode.from_args(args, layouts, output_dep)
     return layouts
 
