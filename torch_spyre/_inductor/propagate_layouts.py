@@ -324,8 +324,15 @@ def _clone_layout(
         op.restick_cost_fn = AnyInNode.from_args()
         return [out_stl]
 
-    # Case 2: Find alternative dimension to swap with the current stick dimension
+    # Case 2: Find alternative dimension to swap with the current stick dimension.
+    # The first divisible candidate may produce a stick coord that
+    # compute_restickify_target_layout can't translate (e.g. multi-var
+    # expressions when the chosen dim is larger than stick_size). Sweep all
+    # candidates and accept the first whose cost edge from the actual input STL
+    # is feasible — i.e. compute_restickify_target_layout returns a non-None STL.
     out_coords = host_coordinates(output, output_dep)
+    in_layout = args[0].layout
+    in_host_coords = host_coordinates(in_layout, in_dep)
     required_in_stl = None
     for alt_stick_dim in range(len(output.size) - 1):
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
@@ -334,9 +341,20 @@ def _clone_layout(
         dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)
         stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         coords = device_coordinates(stl, output_dep, strict=False)
-        if is_supported_stick_expr(coords[-1], stick_size):
-            required_in_stl = stl
-            break
+        if not is_supported_stick_expr(coords[-1], stick_size):
+            continue
+        # Probe whether the cost edge in_stl -> stl is feasible. The optimizer
+        # later asks compute_restickify_target_layout the same question via
+        # EdgeCostMap; pre-checking here avoids selecting a candidate that the
+        # optimizer would mark INF.
+        target_stick = device_coordinates(stl, in_dep, strict=False)[-1]
+        probe = compute_restickify_target_layout(
+            in_stl, in_layout, target_stick, in_host_coords, in_device_coords
+        )
+        if probe is None:
+            continue
+        required_in_stl = stl
+        break
 
     if not required_in_stl:
         raise Unsupported(
@@ -344,9 +362,6 @@ def _clone_layout(
             f"Cannot find alternative layout with size={output.size} and coordinates={out_coords}"
         )
 
-    # Use FixedInOutNode to require the specific input layout
-    # TODO: Currently picks first valid layout. Could be extended to support
-    # multiple candidate input STLs for better optimization.
     op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [required_in_stl])
     return [out_stl]
 
