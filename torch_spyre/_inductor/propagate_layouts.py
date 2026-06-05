@@ -136,19 +136,46 @@ def _single_arg_op_layout(
     c_stride = [concretize_expr(s) for s in output.stride]
 
     if isinstance(data, Reduction):
-        # Propagate input stick to output if the dim survives, else put stick last.
-        x_dev_coords = device_coordinates(stl, dep)
+        x_dev_coords = device_coordinates(stl, dep, strict=False)
         out_coords = host_coordinates(output, output_dep)
         x_stick_expr = x_dev_coords[-1]
-        out_stick_dim = matching_dim(out_coords, x_stick_expr)
-        if out_stick_dim is None:
-            out_dim_order = list(range(len(output.size))) + [-1]
-        else:
-            out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
-            out_dim_order = out_dim_order + [out_stick_dim]
+        stick_size = get_elem_in_stick(output.dtype)
 
-        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-        return [stl]
+        # Try to preserve input stick if it's supported: propagate to the matching
+        # output dim if it survives the reduction, else put stick last.
+        if is_supported_stick_expr(x_stick_expr, stick_size):
+            out_stick_dim = matching_dim(out_coords, x_stick_expr)
+            if out_stick_dim is None:
+                out_dim_order = list(range(len(output.size))) + [-1]
+            else:
+                out_dim_order = [
+                    d for d in range(len(output.size)) if d != out_stick_dim
+                ]
+                out_dim_order = out_dim_order + [out_stick_dim]
+            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+            return [stl]
+
+        # Input stick is unsupported (e.g. due to offsets/gaps from a slice).
+        # Try alternative output stick dims; AllSameNode will insert a restickify
+        # on the input before the reduction.
+        layouts = []
+        for alt_stick_dim in range(len(output.size) - 1):
+            if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
+                # TODO: Support dimensions with size not divisible by stick_size via padding
+                continue
+
+            dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)
+            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+            coords = device_coordinates(stl, output_dep, strict=False)
+            if is_supported_stick_expr(coords[-1], stick_size):
+                layouts.append(stl)
+
+        if not layouts:
+            raise Unsupported(
+                f"Reduction: no supported output layout found for stick expression "
+                f"{x_stick_expr!r}. size={output.size} coordinates={out_coords}"
+            )
+        return layouts
 
     # Single-arg pointwise
     assert isinstance(data, Pointwise)
