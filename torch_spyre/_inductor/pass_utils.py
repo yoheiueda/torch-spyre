@@ -447,7 +447,12 @@ def compute_restickify_needed(
     out_idc = device_coordinates(out_stl, out_dep, strict=False)
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
-    if stick_compatible([idc, out_idc]):
+    # If the input stick is unsupported (e.g. has an offset/gap from a slice),
+    # restickify is always needed even if stick_compatible returns True. The
+    # latter only checks free symbols, so it cannot see constant offsets like
+    # `d0 + 32` and would otherwise let the offset propagate downstream.
+    in_stick_supported = is_supported_stick_expr(idc[-1], in_stl.elems_per_stick())
+    if in_stick_supported and stick_compatible([idc, out_idc]):
         return False, None
     ic = host_coordinates(in_host, in_dep)
     return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)

@@ -173,10 +173,19 @@ def _single_arg_op_layout(
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
             return [stl]
 
-        # Try alternative layouts
+        # Try alternative layouts. The restickify is inserted *before* the
+        # slice (restickify -> slice -> reduce), so stick eligibility is
+        # decided against the pre-slice base tensor's dim sizes (in_layout.size),
+        # not the post-slice/post-reduction output.size.
+        in_coords = host_coordinates(in_layout, dep)
         layouts = []
-        for alt_stick_dim in range(len(output.size) - 1):
-            if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
+        for alt_stick_dim in range(len(output.size)):
+            # Map output dim -> input dim via the loop var on out_coords.
+            coord = out_coords[alt_stick_dim]
+            in_dim = matching_dim(in_coords, coord) if coord.free_symbols else None
+            if in_dim is None:
+                continue
+            if concretize_expr(in_layout.size[in_dim]) % stick_size != 0:
                 # TODO: Support dimensions with size not divisible by stick_size via padding
                 continue
             dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)

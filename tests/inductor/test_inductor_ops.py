@@ -2604,6 +2604,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d2s2": (2, 2, cached_randn((3, 3, 192), dtype=torch.float16)),
             },
         },
+        ("test_slice_stick", "test_slice_stick_cpu"): {
+            "ops_dict": {
+                "exp": lambda dim, x: torch.exp(x),
+                "add": lambda dim, x: torch.add(x.clone(), x),
+                "sum": lambda dim, x: torch.sum(x, dim=dim, keepdim=True),
+                "amax": lambda dim, x: torch.amax(x, dim=dim, keepdim=False),
+            },
+            # Non-stick dims must be multiples of stick size (64 for fp16); the
+            # sliced stick range [32:96] is also 64 (one stick wide). Reduction
+            # `dim` must be a non-stick dim.
+            "param_sets": {
+                "2d0": (0, cached_randn((128, 128), dtype=torch.float16)),
+                "3d0": (0, cached_randn((128, 192, 128), dtype=torch.float16)),
+                "3d1": (1, cached_randn((128, 192, 128), dtype=torch.float16)),
+            },
+        },
         ("test_rope_fms", "test_rope_cpu"): {
             "param_sets": {
                 "prefill_bs1": (
@@ -4979,6 +4995,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 return op(dim, x[:, start:end])
             elif dim == 2:
                 return op(dim, x[:, :, start:end])
+
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
+    def test_slice_stick_cpu(self, op, dim, x):
+        # Slice the last (stick) dimension by [32:96] — width 64, one stick
+        # wide for fp16. `dim` selects the reduction/op dim for sum/amax.
+        def fn(x):
+            if x.dim() == 2:
+                sliced = x[:, 32:96]
+            else:
+                sliced = x[:, :, 32:96]
+            return op(dim, sliced)
 
         self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
