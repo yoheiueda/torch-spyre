@@ -2621,40 +2621,39 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "copy_": lambda dim, x: x.copy_(torch.ones_like(x))._base,
             },
             "param_sets": {
-                "1d0s0": (0, 0, cached_randn((192,), dtype=torch.float16)),
-                "1d0s1": (0, 1, cached_randn((192,), dtype=torch.float16)),
-                "1d0s2": (0, 2, cached_randn((192,), dtype=torch.float16)),
-                "2d0s0": (0, 0, cached_randn((3, 192), dtype=torch.float16)),
-                "2d0s1": (0, 1, cached_randn((3, 192), dtype=torch.float16)),
-                "2d0s2": (0, 2, cached_randn((3, 192), dtype=torch.float16)),
-                "2d1s0": (1, 0, cached_randn((3, 192), dtype=torch.float16)),
-                "2d1s1": (1, 1, cached_randn((3, 192), dtype=torch.float16)),
-                "2d1s2": (1, 2, cached_randn((3, 192), dtype=torch.float16)),
-                "3d0s0": (0, 0, cached_randn((3, 5, 192), dtype=torch.float16)),
-                "3d0s1": (0, 1, cached_randn((3, 5, 192), dtype=torch.float16)),
-                "3d0s2": (0, 2, cached_randn((3, 5, 192), dtype=torch.float16)),
-                "3d1s0": (1, 0, cached_randn((5, 3, 192), dtype=torch.float16)),
-                "3d1s1": (1, 1, cached_randn((5, 3, 192), dtype=torch.float16)),
-                "3d1s2": (1, 2, cached_randn((5, 3, 192), dtype=torch.float16)),
-                "3d2s0": (2, 0, cached_randn((3, 3, 192), dtype=torch.float16)),
-                "3d2s1": (2, 1, cached_randn((3, 3, 192), dtype=torch.float16)),
-                "3d2s2": (2, 2, cached_randn((3, 3, 192), dtype=torch.float16)),
+                "1d0s0": (0, 0, 64, cached_randn((192,), dtype=torch.float16)),
+                "1d0s1": (0, 64, 128, cached_randn((192,), dtype=torch.float16)),
+                "1d0s2": (0, 128, 192, cached_randn((192,), dtype=torch.float16)),
+                "2d0s0": (0, 0, 1, cached_randn((3, 192), dtype=torch.float16)),
+                "2d0s1": (0, 1, 2, cached_randn((3, 192), dtype=torch.float16)),
+                "2d0s2": (0, 2, 3, cached_randn((3, 192), dtype=torch.float16)),
+                "2d1s0": (1, 0, 64, cached_randn((3, 192), dtype=torch.float16)),
+                "2d1s1": (1, 64, 128, cached_randn((3, 192), dtype=torch.float16)),
+                "2d1s2": (1, 128, 192, cached_randn((3, 192), dtype=torch.float16)),
+                "3d0s0": (0, 0, 1, cached_randn((3, 5, 192), dtype=torch.float16)),
+                "3d0s1": (0, 1, 2, cached_randn((3, 5, 192), dtype=torch.float16)),
+                "3d0s2": (0, 2, 3, cached_randn((3, 5, 192), dtype=torch.float16)),
+                "3d1s0": (1, 0, 1, cached_randn((5, 3, 192), dtype=torch.float16)),
+                "3d1s1": (1, 1, 2, cached_randn((5, 3, 192), dtype=torch.float16)),
+                "3d1s2": (1, 2, 3, cached_randn((5, 3, 192), dtype=torch.float16)),
+                "3d2s0": (2, 0, 64, cached_randn((3, 3, 192), dtype=torch.float16)),
+                "3d2s1": (2, 64, 128, cached_randn((3, 3, 192), dtype=torch.float16)),
+                "3d2s2": (2, 128, 192, cached_randn((3, 3, 192), dtype=torch.float16)),
             },
         },
-        ("test_slice_stick", "test_slice_stick_cpu"): {
+        ("test_slice_stick", "test_slice_cpu"): {
             "ops_dict": {
                 "exp": lambda dim, x: torch.exp(x),
                 "add": lambda dim, x: torch.add(x.clone(), x),
                 "sum": lambda dim, x: torch.sum(x, dim=dim, keepdim=True),
                 "amax": lambda dim, x: torch.amax(x, dim=dim, keepdim=False),
+                "copy_": lambda dim, x: x.copy_(torch.ones_like(x))._base,
             },
-            # Non-stick dims must be multiples of stick size (64 for fp16); the
-            # sliced stick range [32:96] is also 64 (one stick wide). Reduction
-            # `dim` must be a non-stick dim.
             "param_sets": {
-                "2d0": (0, cached_randn((128, 128), dtype=torch.float16)),
-                "3d0": (0, cached_randn((128, 192, 128), dtype=torch.float16)),
-                "3d1": (1, cached_randn((128, 192, 128), dtype=torch.float16)),
+                "2d": (0, 32, 96, cached_randn((128, 256), dtype=torch.float16)),
+                "3d0": (1, 32, 96, cached_randn((128, 192, 256), dtype=torch.float16)),
+                "3d1": (1, 32, 96, cached_randn((2, 192, 256), dtype=torch.float16)),
+                "3d01": (1, 32, 96, cached_randn((128, 192, 256), dtype=torch.float16)),
             },
         },
         ("test_rope_fms", "test_rope_cpu"): {
@@ -5116,28 +5115,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
-    def test_slice_cpu(self, op, dim, index, x):
+    def test_slice_cpu(self, op, dim, start, end, x):
         def fn(x):
-            start = index * (x.size()[dim] // 3)
-            end = (index + 1) * (x.size()[dim] // 3)
             if dim == 0:
                 return op(dim, x[start:end])
             elif dim == 1:
                 return op(dim, x[:, start:end])
             elif dim == 2:
                 return op(dim, x[:, :, start:end])
-
-        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
-
-    def test_slice_stick_cpu(self, op, dim, x):
-        # Slice the last (stick) dimension by [32:96] — width 64, one stick
-        # wide for fp16. `dim` selects the reduction/op dim for sum/amax.
-        def fn(x):
-            if x.dim() == 2:
-                sliced = x[:, 32:96]
-            else:
-                sliced = x[:, :, 32:96]
-            return op(dim, sliced)
+            elif dim == 3:
+                return op(dim, x[:, :, start:end])
 
         self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
