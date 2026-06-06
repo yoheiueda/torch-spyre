@@ -755,7 +755,8 @@ def compute_layouts(
 
     if aten_op == aten.clone.default:
         # clone materializes a new buffer in a fixed row-major layout regardless of
-        # input stick — equivalent to a restickify. No restickify before it is needed.
+        # input stick — equivalent to a restickify. No restickify before it is needed,
+        # unless there is an offset in the stick dimension.
         return _clone_layout(op, output, output_dep, args)
 
     # All other single arg ops
