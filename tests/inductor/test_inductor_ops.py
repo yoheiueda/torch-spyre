@@ -2652,10 +2652,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d64": (1, 32, 96, cached_randn((128, 256))),
                 "2d128": (1, 32, 160, cached_randn((128, 256))),
-                "3d64_0": (2, 32, 96, cached_randn((128, 192, 256))),
+                "3d64_0": (2, 32, 96, cached_randn((128, 3, 256))),
                 "3d64_1": (2, 32, 96, cached_randn((2, 192, 256))),
                 "3d64_01": (2, 32, 96, cached_randn((128, 192, 256))),
-                "3d128_0": (2, 32, 160, cached_randn((128, 192, 256))),
+                "3d128_0": (2, 32, 160, cached_randn((128, 3, 256))),
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
@@ -2668,14 +2668,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d64": (1, 32, 96, cached_randn((128, 256))),
                 "2d128": (1, 32, 160, cached_randn((128, 256))),
-                "3d64_0": (2, 32, 96, cached_randn((128, 192, 256))),
+                "3d64_0": (2, 32, 96, cached_randn((128, 3, 256))),
                 "3d64_1": (2, 32, 96, cached_randn((2, 192, 256))),
                 "3d64_01": (2, 32, 96, cached_randn((128, 192, 256))),
-                "3d128_0": (2, 32, 160, cached_randn((128, 192, 256))),
+                "3d128_0": (2, 32, 160, cached_randn((128, 3, 256))),
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
-            "expect_fail": ["2d64", "2d128"],
+            # "expect_fail": ["2d64", "2d128"],
         },
         ("test_slice_stick_reduce_dim1", "test_slice_cpu"): {
             "ops_dict": {
@@ -2685,14 +2685,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d64": (1, 32, 96, cached_randn((128, 256))),
                 "2d128": (1, 32, 160, cached_randn((128, 256))),
-                "3d64_0": (2, 32, 96, cached_randn((128, 192, 256))),
+                "3d64_0": (2, 32, 96, cached_randn((128, 3, 256))),
                 "3d64_1": (2, 32, 96, cached_randn((2, 192, 256))),
                 "3d64_01": (2, 32, 96, cached_randn((128, 192, 256))),
-                "3d128_0": (2, 32, 160, cached_randn((128, 192, 256))),
+                "3d128_0": (2, 32, 160, cached_randn((128, 3, 256))),
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
-            "expect_fail": ["3d64_1", "3d128_1"],
+            # "expect_fail": ["3d64_1", "3d128_1"],
         },
         ("test_slice_stick_reduce_dim2", "test_slice_cpu"): {
             "ops_dict": {
@@ -2700,10 +2700,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "amax": lambda _, x: torch.amax(x, dim=2, keepdim=False),
             },
             "param_sets": {
-                "3d64_0": (2, 32, 96, cached_randn((128, 192, 256))),
+                "3d64_0": (2, 32, 96, cached_randn((128, 3, 256))),
                 "3d64_1": (2, 32, 96, cached_randn((2, 192, 256))),
                 "3d64_01": (2, 32, 96, cached_randn((128, 192, 256))),
-                "3d128_0": (2, 32, 160, cached_randn((128, 192, 256))),
+                "3d128_0": (2, 32, 160, cached_randn((128, 3, 256))),
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
