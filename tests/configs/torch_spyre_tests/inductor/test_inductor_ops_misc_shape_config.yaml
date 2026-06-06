@@ -35,7 +35,6 @@ test_suite_config:
             - TestOps::test_cat.*
             - TestOps::test_pad.*
             - TestOps::test_slice.*
-            - TestOps::test_slice_stick.*
             - TestOps::test_split.*
             # shape ops
             - TestOps::test_flatten.*
