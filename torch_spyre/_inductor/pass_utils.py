@@ -464,7 +464,21 @@ def compute_restickify_needed(
     if in_stick_supported and stick_compatible([idc, out_idc]):
         return False, None
     ic = host_coordinates(in_host, in_dep)
-    return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)
+    target_stick = out_idc[-1]
+    # When the output stick is zero (sparse — e.g. a reduction that collapses
+    # all non-stick dims to size < 64) and the input stick is unsupported (e.g.
+    # an offset from a slice), matching_dim(ic, 0) fails because 0 has no free
+    # symbols.  Instead, promote the reduction variable to the stick so the
+    # hardware sees a clean Mod(red_var, stick_size) expression.  After this
+    # restickify the reduction produces a sparse output as before.
+    if target_stick == sympy.S.Zero and not in_stick_supported:
+        reduction_vars = in_dep.index.free_symbols - out_dep.index.free_symbols
+        if reduction_vars:
+            red_var = next(iter(reduction_vars))
+            target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
+    return True, compute_restickify_target_layout(
+        in_stl, in_host, target_stick, ic, idc
+    )
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:

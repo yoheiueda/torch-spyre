@@ -2675,7 +2675,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
-            # "expect_fail": ["2d64", "2d128"],
         },
         ("test_slice_stick_reduce_dim1", "test_slice_cpu"): {
             "ops_dict": {
@@ -2692,7 +2691,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
-            # "expect_fail": ["3d64_1", "3d128_1"],
         },
         ("test_slice_stick_reduce_dim2", "test_slice_cpu"): {
             "ops_dict": {
