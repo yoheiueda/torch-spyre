@@ -345,13 +345,23 @@ def _clone_layout(
         # later asks compute_restickify_target_layout the same question via
         # EdgeCostMap; pre-checking here avoids selecting a candidate that the
         # optimizer would mark INF.
-        target_stick = device_coordinates(stl, in_dep, strict=False)[-1]
+        #
+        # Use output_dep (not in_dep) to get the target stick expression:
+        # stl was built from output strides, so applying its stride_map to
+        # output_dep gives a clean single-var expression (e.g. Mod(d0, 64)).
+        # Applying it to in_dep produces a garbage multi-var expression because
+        # the clone's input and output have different host strides.
+        target_stick = device_coordinates(stl, output_dep, strict=False)[-1]
         probe = compute_restickify_target_layout(
             in_stl, in_layout, target_stick, in_host_coords, in_device_coords
         )
         if probe is None:
             continue
-        required_in_stl = stl
+        # Store probe (the restickified input STL) as required_in_stl.
+        # Using stl (the output candidate) here would cause the optimizer's
+        # cost computation to re-apply the output stride_map to in_dep,
+        # again producing a garbage multi-var expression → INF cost.
+        required_in_stl = probe
         break
 
     if not required_in_stl:
