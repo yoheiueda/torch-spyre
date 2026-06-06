@@ -209,17 +209,14 @@ def _single_arg_op_layout(
     assert isinstance(data, Pointwise)
     origin_node = next(iter(data.origins))
     aten_op = origin_node.target
-    assert aten_op != aten.clone.default
-
     match aten_op:
         case prims.convert_element_type.default if not same_device_size(
             in_layout.dtype, output.dtype
         ):
-            # Type conversion between different element sizes may require padding
-            # when input has padding due to stick alignment. For example, 4x16 FP16
-            # has 48 elements of padding (64 total), which becomes 64 FP32 elements
-            # when converted. We need to reflect this in the output host size so
-            # the constructor creates the correct device layout.
+            # Type conversion may require padding when input has padding due to stick
+            # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
+            # which becomes 64 FP32 elements when converted. We need to reflect this
+            # in the output host size so the constructor creates the correct device layout.
             in_stick_expr = device_coordinates(stl, dep, strict=False)[-1]
             if not is_supported_stick_expr(in_stick_expr, stl.elems_per_stick()):
                 return []
