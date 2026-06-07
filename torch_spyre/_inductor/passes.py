@@ -48,7 +48,11 @@ from .propagate_layouts import (
     propagate_spyre_tensor_layouts,
 )
 from .optimize_restickify import optimize_restickify_locations
-from .insert_restickify import insert_restickify, finalize_layouts
+from .insert_restickify import (
+    finalize_layouts,
+    insert_post_mutation_restickify,
+    insert_restickify,
+)
 from .memory_planning import memory_planning
 from .work_division import (
     span_reduction,
@@ -260,6 +264,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
+        insert_post_mutation_restickify(operations)
         insert_bmm_padding(operations)
 
         dedup_and_promote_constants(operations)
