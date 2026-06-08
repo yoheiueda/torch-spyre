@@ -684,6 +684,17 @@ class SpyreKernel(Kernel[CSEVariable]):
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
 
+        # If this kernel writes to a mutation target in an alt_stl layout, emit
+        # set_spyre_tensor_layout so DCI downloads the tensor using alt_stl.
+        mutation_restick_needed = getattr(V.graph, "mutation_restick_needed", {})
+        for target_name, alt_stl in mutation_restick_needed.items():
+            for arg_name, tensor_arg in self.spyre_kernel_args:
+                if not tensor_arg.is_input and arg_name == target_name:
+                    wrapper.writeline(
+                        f"set_spyre_tensor_layout({arg_name}, {alt_stl!r})"
+                    )
+                    break
+
 
 def _iter_op_specs(specs):
     """Yield every OpSpec in a (possibly nested) op-spec list, depth-first."""

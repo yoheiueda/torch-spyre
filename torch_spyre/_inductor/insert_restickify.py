@@ -27,7 +27,6 @@ from torch._inductor.ir import (
     InputBuffer,
     MutationLayoutSHOULDREMOVE,
     Operation,
-    ReinterpretView,
     StorageBox,
     TensorBox,
 )
@@ -323,105 +322,9 @@ def finalize_layouts(operations: list) -> None:
 
 
 def insert_post_mutation_restickify(operations: list[Operation]) -> None:
-    """For mutation ops that wrote using an alt_stl, insert a post-mutation restickify
-    that reads the mutation target in alt_stl and writes a new buffer in the original
-    (default) STL, then patches graph_outputs to return the restickified buffer.
-
-    This is needed when the stick dimension is sliced: the mutation kernel must write
-    using an alt_stl to avoid an unsupported stick offset, but DCI reads back using the
-    tensor's original spyre_layout (default_stl). The restickify converts alt_stl → default_stl
-    so DCI sees the correct values.
+    """No-op: post-mutation layout fixup is handled by call_kernel emitting
+    set_spyre_tensor_layout after the mutation kernel runs (Approach A).
+    The alt_stl to use is recorded in V.graph.mutation_restick_needed by
+    propagate_layouts and consumed by SpyreKernel.call_kernel.
     """
-    plan = getattr(V.graph, "mutation_restick_needed", {})
-    print(f"[insert_post_mutation_restickify] plan={plan}")
-    if not plan:
-        return
-
-    graph_lowering = V.graph
-
-    for target_name, orig_target_stl in plan.items():
-        # Find the mutation op that writes to target_name.
-        mutation_op = None
-        mutation_op_index = None
-        for i, op in enumerate(operations):
-            if not (
-                isinstance(op, ComputedBuffer)
-                and isinstance(op.layout, MutationLayoutSHOULDREMOVE)
-            ):
-                continue
-            t = op.layout.target
-            while isinstance(t, ReinterpretView):
-                t = t.data
-            if hasattr(t, "get_name") and t.get_name() == target_name:
-                mutation_op = op
-                mutation_op_index = i
-                break
-
-        print(
-            f"[insert_post_mutation_restickify] target={target_name} mutation_op={mutation_op} idx={mutation_op_index}"
-        )
-        if mutation_op is None:
-            logger.warning(
-                "post-mutation restickify: no mutation op found writing to %s",
-                target_name,
-            )
-            continue
-
-        target_input_buf = graph_lowering.graph_inputs_original.get(target_name)
-        print(
-            f"[insert_post_mutation_restickify] target_input_buf={target_input_buf} layout={getattr(target_input_buf, 'layout', None)}"
-        )
-        if target_input_buf is None:
-            logger.warning(
-                "post-mutation restickify: no InputBuffer for %s in graph_inputs_original",
-                target_name,
-            )
-            continue
-
-        # Build the target layout: same size/stride/device as the mutation target's
-        # committed (alt_stl) layout, but with orig_target_stl as device_layout.
-        restick_arg_info = {
-            "arg_name": target_name,
-            "target_layout": _fixed_tiled(target_input_buf.layout, orig_target_stl),
-        }
-        print(
-            f"[insert_post_mutation_restickify] calling _create_restickify_node with layout={restick_arg_info['target_layout']}"
-        )
-        _old_name, restick_buff = _create_restickify_node(restick_arg_info, mutation_op)
-        print(
-            f"[insert_post_mutation_restickify] restick_buff={restick_buff} layout={restick_buff.layout}"
-        )
-
-        # Move restick_buff to immediately after the mutation op.
-        operations.remove(restick_buff)
-        assert mutation_op_index is not None
-        operations.insert(mutation_op_index + 1, restick_buff)
-
-        # Patch graph_outputs so the return value is the restickified buffer.
-        go_debug = [
-            (type(o).__name__, o.get_name() if hasattr(o, "get_name") else "?", id(o))
-            for o in V.graph.graph_outputs
-        ]
-        print(f"[insert_post_mutation_restickify] graph_outputs={go_debug}")
-        print(
-            f"[insert_post_mutation_restickify] target_input_buf id={id(target_input_buf)} name={target_input_buf.get_name()}"
-        )
-        for i, out in enumerate(V.graph.graph_outputs):
-            out_name = out.get_name() if hasattr(out, "get_name") else "?"
-            print(
-                f"[insert_post_mutation_restickify]  out[{i}] type={type(out).__name__} name={out_name} id={id(out)}"
-            )
-            if out is target_input_buf or out_name == target_name:
-                V.graph.graph_outputs[i] = restick_buff
-                print(
-                    f"[insert_post_mutation_restickify] updated graph_outputs[{i}] -> {restick_buff.get_name()}"
-                )
-                break
-
-        logger.info(
-            "Post-mutation restickify: %s (alt_stl stride_map=%s) -> %s (orig_stl stride_map=%s)",
-            target_name,
-            list(target_input_buf.layout.device_layout.stride_map),
-            restick_buff.get_name(),
-            list(orig_target_stl.stride_map),
-        )
+    return

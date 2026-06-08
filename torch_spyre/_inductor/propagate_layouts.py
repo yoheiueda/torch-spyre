@@ -1040,9 +1040,7 @@ def propagate_spyre_tensor_layouts(
                         if target_stl is not orig_target_stl:
                             if not hasattr(V.graph, "mutation_restick_needed"):
                                 V.graph.mutation_restick_needed = {}
-                            V.graph.mutation_restick_needed[target_name] = (
-                                orig_target_stl
-                            )
+                            V.graph.mutation_restick_needed[target_name] = target_stl
 
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
