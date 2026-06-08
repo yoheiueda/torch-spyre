@@ -27,6 +27,7 @@ from torch._inductor.ir import (
     InputBuffer,
     MutationLayoutSHOULDREMOVE,
     Operation,
+    ReinterpretView,
     StorageBox,
     TensorBox,
 )
@@ -74,6 +75,9 @@ class NameSwapHandler(WrapperHandler):
 
     def load(self, name, index):
         return super().load(self._name_map.get(name, name), index)
+
+    def store(self, name, index, value, mode=None):
+        return super().store(self._name_map.get(name, name), index, value, mode)
 
 
 def _create_restickify_node(
@@ -321,10 +325,109 @@ def finalize_layouts(operations: list) -> None:
             logger.debug("restickify plan: (none)")
 
 
+def _find_mutation_op(
+    operations: list[Operation], target_name: str
+) -> "ComputedBuffer | None":
+    """Find the mutation ComputedBuffer whose peeled target name matches target_name."""
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            continue
+        tgt = op.layout.target
+        while isinstance(tgt, ReinterpretView):
+            tgt = tgt.data
+        if hasattr(tgt, "get_name") and tgt.get_name() == target_name:
+            return op
+    return None
+
+
 def insert_post_mutation_restickify(operations: list[Operation]) -> None:
-    """No-op: post-mutation layout fixup is handled by call_kernel emitting
-    set_spyre_tensor_layout after the mutation kernel runs (Approach A).
-    The alt_stl to use is recorded in V.graph.mutation_restick_needed by
-    propagate_layouts and consumed by SpyreKernel.call_kernel.
+    """Insert pre/post kernels around a slice mutation to handle unsupported stick offsets.
+
+    When the mutation target's orig_stl produces an unsupported stick expression for
+    the slice write, propagate_layouts selects an alt_stl and records the pair in
+    V.graph.mutation_restick_needed.  This pass inserts four kernels:
+
+      1. pre-restickify:  arg0_1 (orig_stl) → buf_tmp (alt_stl)   [layout-change copy]
+      2. mutation:        pool_ones → buf_tmp[slice] (alt_stl)     [slice write]
+      3. copy-back:       buf_tmp (alt_stl) → arg0_1 (alt_stl)    [identity copy]
+      4. set_spyre_tensor_layout(arg0_1, alt_stl)                  [DCI metadata fix]
+
+    arg0_1 is returned unchanged so DCI downloads from its stable HBM address.
     """
-    return
+    plan = getattr(V.graph, "mutation_restick_needed", {})
+    if not plan:
+        return
+
+    graph_lowering = V.graph
+    if not hasattr(graph_lowering, "_store_redirects"):
+        graph_lowering._store_redirects = {}
+    if not hasattr(graph_lowering, "_pre_restickify_input_stl"):
+        graph_lowering._pre_restickify_input_stl = {}
+
+    for target_name, (orig_stl, alt_stl) in plan.items():
+        mutation_op = _find_mutation_op(operations, target_name)
+        if mutation_op is None:
+            logger.warning(
+                "insert_post_mutation_restickify: no mutation op found for %s", target_name
+            )
+            continue
+
+        # Retrieve the InputBuffer for target_name (after finalize_layouts, layout=alt_stl).
+        target_tb = graph_lowering.graph_inputs.get(target_name)
+        if target_tb is None:
+            logger.warning(
+                "insert_post_mutation_restickify: %s not in graph_inputs", target_name
+            )
+            continue
+        target_input_buf = target_tb.data.data  # TensorBox → StorageBox → InputBuffer
+        base_layout = target_input_buf.layout  # FixedTiledLayout(alt_stl)
+        # Create fresh layouts with empty allocation dicts so memory_planning assigns
+        # independent pool/HBM addresses.  Reusing base_layout directly would share its
+        # allocation dict and cause memory_planning to stomp arg0_1's HBM address.
+        buf_tmp_layout = _fixed_tiled(base_layout, alt_stl)
+        buf_copyback_layout = _fixed_tiled(base_layout, alt_stl)
+
+        # Step 1: create pre-restickify node: arg0_1 (orig_stl) → buf_tmp (alt_stl).
+        # Override so create_tensor_arg reads arg0_1 with orig_stl (not the committed alt_stl).
+        orig_stl_layout = _fixed_tiled(base_layout, orig_stl)
+        graph_lowering._pre_restickify_input_stl[target_name] = orig_stl_layout
+        _, buf_tmp = _create_restickify_node(
+            {"arg_name": target_name, "target_layout": buf_tmp_layout},
+            mutation_op,
+        )
+        buf_tmp_name = buf_tmp.get_name()
+
+        # Step 2: redirect mutation writes to buf_tmp.
+        mutation_name = mutation_op.get_name()
+        graph_lowering._store_redirects[mutation_name] = buf_tmp_name
+        graph_lowering.removed_buffers.add(mutation_name)
+
+        # Step 3: create copy-back node: buf_tmp (alt_stl) → buf_copyback (alt_stl).
+        # buf_copyback's store is redirected to arg0_1 so the kernel writes the full
+        # restickified tensor back to the original HBM address.  Both sides share
+        # alt_stl → IDENTITY_OP (no restickify).
+        # Give buf_copyback a MutationLayoutSHOULDREMOVE so the scheduler treats it as
+        # a live mutation of arg0_1 and does not DCE it (or its input buf_tmp).
+        _, buf_copyback = _create_restickify_node(
+            {"arg_name": buf_tmp_name, "target_layout": buf_copyback_layout},
+            mutation_op,
+        )
+        copyback_name = buf_copyback.get_name()
+        buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_tb)
+        graph_lowering._store_redirects[copyback_name] = target_name
+
+        # Insert buf_tmp before mutation, copy-back after mutation.
+        mutation_op_index = operations.index(mutation_op)
+        operations.remove(buf_tmp)
+        operations.insert(mutation_op_index, buf_tmp)
+        # mutation_op is now at mutation_op_index + 1; insert copy-back after it.
+        operations.remove(buf_copyback)
+        operations.insert(mutation_op_index + 2, buf_copyback)
+
+        logger.info(
+            "insert_post_mutation_restickify: "
+            "%s (orig→alt) before %s; copy-back %s→%s after %s",
+            target_name, mutation_name, buf_tmp_name, target_name, mutation_name,
+        )

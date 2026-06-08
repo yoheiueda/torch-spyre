@@ -1040,7 +1040,7 @@ def propagate_spyre_tensor_layouts(
                         if target_stl is not orig_target_stl:
                             if not hasattr(V.graph, "mutation_restick_needed"):
                                 V.graph.mutation_restick_needed = {}
-                            V.graph.mutation_restick_needed[target_name] = target_stl
+                            V.graph.mutation_restick_needed[target_name] = (orig_target_stl, target_stl)
 
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
@@ -1099,13 +1099,35 @@ def propagate_mutation_layouts(
     mutation layout during its initialisation to set up mutation tracking.
     This pass runs as a _pre_fusion_custom_pass (after scheduler init) to
     assign FixedTiledLayout to those remaining mutation ops.
+
+    For ops listed in V.graph._mutation_layout_plan (set by
+    insert_post_mutation_restickify), the mutation is redirected: its layout
+    is changed to buf_pre's pool layout and a _store_redirects entry is added
+    so SpyreKernel.store writes to buf_pre instead of the original HBM target.
+    InputBuffer.layout is also flipped to orig_stl here so that codegen reads
+    the original tensor with the correct upload layout.
     """
+    mutation_layout_plan = getattr(V.graph, "_mutation_layout_plan", {})
+    store_redirects: dict[str, str] = {}
+
     for n in nodes:
         if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
             continue
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
             continue
-        if isinstance(n.node.data, (Pointwise, Reduction)):
+
+        node_name = n.node.get_name()
+        if node_name in mutation_layout_plan:
+            entry = mutation_layout_plan[node_name]
+            # Redirect mutation to write to buf_pre (HBM, alt_stl) instead of
+            # the original HBM target.  SpyreKernel.store uses _store_redirects.
+            n.node.layout = entry["buf_pre"].layout
+            store_redirects[node_name] = entry["buf_pre_name"]
+            # Safe to flip InputBuffer.layout now: scheduler already initialised
+            # with alt_stl, so work_distribution is done.  Codegen will read
+            # arg0_1 with orig_stl device coordinates.
+            entry["target_input_buf"].layout = entry["orig_stl_layout"]
+        elif isinstance(n.node.data, (Pointwise, Reduction)):
             real = n.node.layout.real_layout()
             if isinstance(real, FixedTiledLayout):
                 n.node.layout = real
@@ -1129,5 +1151,10 @@ def propagate_mutation_layouts(
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"
             )
+
+    if store_redirects:
+        existing = getattr(V.graph, "_store_redirects", {})
+        existing.update(store_redirects)
+        V.graph._store_redirects = existing
 
     return nodes

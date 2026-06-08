@@ -392,25 +392,35 @@ class SpyreKernel(Kernel[CSEVariable]):
         # can correctly isolate each loop variable's contribution.
 
         index = concretize_index(tensor.index, set(it_space.keys()))
+
+        # For the pre-restickify INPUT: arg0_1 has alt_stl committed layout but its
+        # HBM data was uploaded with orig_stl.  Pop the override so it is consumed once
+        # (during SpyreKernel codegen) and does not affect any subsequent kernel.
+        layout = tensor.layout
+        if is_input:
+            override = getattr(V.graph, "_pre_restickify_input_stl", {})
+            if name in override:
+                layout = override.pop(name)
+
         device_coords = compute_coordinates(
-            tensor.layout.device_layout.device_size,
-            tensor.layout.device_layout.stride_map,
+            layout.device_layout.device_size,
+            layout.device_layout.stride_map,
             it_space,
             index,
         )
         tensor_arg = TensorArg(
             is_input,
             -1,
-            tensor.layout.device_layout.device_dtype,
-            tensor.layout.device_layout.device_size,
+            layout.device_layout.device_dtype,
+            layout.device_layout.device_size,
             device_coords,
-            tensor.layout.allocation,
-            stride_map=list(tensor.layout.device_layout.stride_map),
-            per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
+            layout.allocation,
+            stride_map=list(layout.device_layout.stride_map),
+            per_tile_fixed=getattr(layout, "per_tile_fixed", False),
         )
         if (
-            "lx" not in tensor.layout.allocation
-            and "pool" not in tensor.layout.allocation
+            "lx" not in layout.allocation
+            and "pool" not in layout.allocation
         ):
             self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
@@ -511,6 +521,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         value: RValue,
         mode: StoreMode = None,
     ) -> None:
+        store_redirects = getattr(V.graph, "_store_redirects", {})
+        original_name = name
+        name = store_redirects.get(name, name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
@@ -522,10 +535,16 @@ class SpyreKernel(Kernel[CSEVariable]):
             _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
-        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
-        if real_dst_name != name:
-            # Skip allocating an output buffer; this name is an alias to another buffer
-            V.graph.removed_buffers.add(name)
+        # mutation_real_name remaps a mutation op's buffer name to the underlying buffer
+        # it aliases.  Skip this when _store_redirects already resolved the name — the
+        # redirect is an explicit target and does not alias via mutation_real_name.
+        if original_name not in store_redirects:
+            real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
+            if real_dst_name != name:
+                # Skip allocating an output buffer; this name is an alias to another buffer
+                V.graph.removed_buffers.add(name)
+        else:
+            real_dst_name = name
         op_info: dict[str, Any] = {}
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
@@ -684,16 +703,20 @@ class SpyreKernel(Kernel[CSEVariable]):
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
 
-        # If this kernel writes to a mutation target in an alt_stl layout, emit
-        # set_spyre_tensor_layout so DCI downloads the tensor using alt_stl.
+        # If this kernel writes to the original mutation target (arg0_1) as its output,
+        # emit set_spyre_tensor_layout so DCI downloads the tensor using alt_stl.
+        # This fires on the copy-back kernel (buf_tmp → arg0_1), which is the last
+        # kernel to touch arg0_1 before it is returned.
         mutation_restick_needed = getattr(V.graph, "mutation_restick_needed", {})
-        for target_name, alt_stl in mutation_restick_needed.items():
+        for target_name, stl_info in mutation_restick_needed.items():
+            _orig_stl, alt_stl = stl_info
             for arg_name, tensor_arg in self.spyre_kernel_args:
                 if not tensor_arg.is_input and arg_name == target_name:
                     wrapper.writeline(
                         f"set_spyre_tensor_layout({arg_name}, {alt_stl!r})"
                     )
                     break
+
 
 
 def _iter_op_specs(specs):
