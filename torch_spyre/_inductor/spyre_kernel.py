@@ -671,6 +671,12 @@ class SpyreKernel(Kernel[CSEVariable]):
                 V.graph.removed_buffers.add(name)
         else:
             real_dst_name = name
+            # Propagate _emit_set_layout from the IR node onto this kernel instance
+            # so call_kernel can emit set_spyre_tensor_layout without scanning the graph.
+            orig_buf = V.graph.get_buffer(original_name)
+            emit = getattr(orig_buf, "_emit_set_layout", None)
+            if emit is not None:
+                self._emit_set_layout = emit
         op_info: dict[str, Any] = {}
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
@@ -835,19 +841,13 @@ class SpyreKernel(Kernel[CSEVariable]):
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
 
-        # If this kernel writes to the original mutation target (arg0_1) as its output,
-        # emit set_spyre_tensor_layout so DCI downloads the tensor using alt_stl.
-        # This fires on the copy-back kernel (buf_tmp → arg0_1), which is the last
-        # kernel to touch arg0_1 before it is returned.
-        mutation_restick_needed = getattr(V.graph, "mutation_restick_needed", {})
-        for target_name, stl_info in mutation_restick_needed.items():
-            _orig_stl, alt_stl = stl_info
-            for arg_name, tensor_arg in self.spyre_kernel_args:
-                if not tensor_arg.is_input and arg_name == target_name:
-                    wrapper.writeline(
-                        f"set_spyre_tensor_layout({arg_name}, {alt_stl!r})"
-                    )
-                    break
+        # If this is the copy-back kernel, emit set_spyre_tensor_layout so DCI
+        # downloads the mutation target using alt_stl.  _emit_set_layout is set on
+        # this kernel instance by store() when it processes the copy-back redirect.
+        emit = getattr(self, "_emit_set_layout", None)
+        if emit is not None:
+            target_name, alt_stl = emit
+            wrapper.writeline(f"set_spyre_tensor_layout({target_name}, {alt_stl!r})")
 
 
 def _iter_op_specs(specs):

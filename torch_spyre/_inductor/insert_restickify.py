@@ -28,7 +28,6 @@ from torch._inductor.ir import (
     InputBuffer,
     MutationLayoutSHOULDREMOVE,
     Operation,
-    ReinterpretView,
     StorageBox,
     TensorBox,
 )
@@ -76,9 +75,6 @@ class NameSwapHandler(WrapperHandler):
 
     def load(self, name, index):
         return super().load(self._name_map.get(name, name), index)
-
-    def store(self, name, index, value, mode=None):
-        return super().store(self._name_map.get(name, name), index, value, mode)
 
 
 def _create_restickify_node(
@@ -328,29 +324,12 @@ def finalize_layouts(graph: GraphLowering) -> None:
             logger.debug("restickify plan: (none)")
 
 
-def _find_mutation_op(
-    operations: list[Operation], target_name: str
-) -> "ComputedBuffer | None":
-    """Find the mutation ComputedBuffer whose peeled target name matches target_name."""
-    for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
-        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-            continue
-        tgt = op.layout.target
-        while isinstance(tgt, ReinterpretView):
-            tgt = tgt.data
-        if hasattr(tgt, "get_name") and tgt.get_name() == target_name:
-            return op
-    return None
-
-
 def insert_post_mutation_restickify(graph: GraphLowering) -> None:
     """Insert pre/post kernels around a slice mutation to handle unsupported stick offsets.
 
     When the mutation target's orig_stl produces an unsupported stick expression for
     the slice write, propagate_layouts selects an alt_stl and records the pair in
-    V.graph.mutation_restick_needed.  This pass inserts three kernels:
+    graph.mutation_restick_needed.  This pass inserts three kernels:
 
       1. pre-restickify:  arg0_1 (orig_stl) → buf_tmp (alt_stl)   [layout-change copy]
       2. mutation:        pool_ones → buf_tmp[slice] (alt_stl)     [slice write]
@@ -358,7 +337,7 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
       4. set_spyre_tensor_layout(arg0_1, alt_stl)                  [DCI metadata fix]
 
     Store redirects for the mutation and copy-back ops are recorded in
-    V.graph._store_redirects and applied at codegen time in SpyreKernel.store().
+    graph._store_redirects and applied at codegen time in SpyreKernel.store().
     NameSwapHandler cannot be used here because for a ComputedBuffer the store target
     name is passed to SpyreKernel.store() from outside inner_fn — inner_fn only
     produces the value (loader); the NameSwapHandler wrapping V.ops only intercepts
@@ -367,19 +346,16 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
     arg0_1 is returned unchanged so DCI downloads from its stable HBM address.
     """
     operations = graph.operations
-    plan = getattr(V.graph, "mutation_restick_needed", {})
+    plan = getattr(graph, "mutation_restick_needed", {})
     if not plan:
         return
 
-    graph_lowering = V.graph
-    if not hasattr(graph_lowering, "_store_redirects"):
-        graph_lowering._store_redirects = {}
-    if not hasattr(graph_lowering, "_pre_restickify_input_stl"):
-        graph_lowering._pre_restickify_input_stl = {}
+    graph._store_redirects = {}
+    graph._pre_restickify_input_stl = {}
 
-    for target_name, (orig_stl, alt_stl) in plan.items():
-        mutation_op = _find_mutation_op(operations, target_name)
-        if mutation_op is None:
+    for target_name, (orig_stl, alt_stl, mutation_op_name) in plan.items():
+        mutation_op = graph.name_to_buffer.get(mutation_op_name)
+        if not isinstance(mutation_op, ComputedBuffer):
             logger.warning(
                 "insert_post_mutation_restickify: no mutation op found for %s",
                 target_name,
@@ -387,7 +363,7 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
             continue
 
         # Retrieve the InputBuffer for target_name (after finalize_layouts, layout=alt_stl).
-        target_tb = graph_lowering.graph_inputs.get(target_name)
+        target_tb = graph.graph_inputs.get(target_name)
         if target_tb is None:
             logger.warning(
                 "insert_post_mutation_restickify: %s not in graph_inputs", target_name
@@ -399,12 +375,16 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         # independent pool/HBM addresses.  Reusing base_layout directly would share its
         # allocation dict and cause memory_planning to stomp arg0_1's HBM address.
         buf_tmp_layout = _fixed_tiled(base_layout, alt_stl)
+        # buf_copyback_layout is the initial layout passed to _create_restickify_node;
+        # it is immediately replaced by MutationLayoutSHOULDREMOVE below.  A fresh
+        # FixedTiledLayout is still needed so memory_planning gets its own allocation
+        # dict, independent of base_layout and buf_tmp_layout.
         buf_copyback_layout = _fixed_tiled(base_layout, alt_stl)
 
         # Step 1: create pre-restickify node: arg0_1 (orig_stl) → buf_tmp (alt_stl).
         # Override so create_tensor_arg reads arg0_1 with orig_stl (not the committed alt_stl).
         orig_stl_layout = _fixed_tiled(base_layout, orig_stl)
-        graph_lowering._pre_restickify_input_stl[target_name] = orig_stl_layout
+        graph._pre_restickify_input_stl[target_name] = orig_stl_layout
         _, buf_tmp = _create_restickify_node(
             {"arg_name": target_name, "target_layout": buf_tmp_layout},
             mutation_op,
@@ -421,8 +401,8 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         # The mutation op's own buffer name becomes a dead allocation; add to removed_buffers
         # so the scheduler/codegen does not try to allocate or pass it as a kernel arg.
         mutation_name = mutation_op.get_name()
-        graph_lowering._store_redirects[mutation_name] = buf_tmp_name
-        graph_lowering.removed_buffers.add(mutation_name)
+        graph._store_redirects[mutation_name] = buf_tmp_name
+        graph.removed_buffers.add(mutation_name)
 
         # Step 3: create copy-back node: buf_tmp (alt_stl) → buf_copyback (alt_stl).
         # Redirect its store to target_name (arg0_1) so the kernel writes the full
@@ -435,7 +415,10 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         )
         copyback_name = buf_copyback.get_name()
         buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_tb)
-        graph_lowering._store_redirects[copyback_name] = target_name
+        graph._store_redirects[copyback_name] = target_name
+        # Mark the copy-back node so SpyreKernel.call_kernel emits
+        # set_spyre_tensor_layout after this kernel runs.
+        buf_copyback._emit_set_layout = (target_name, alt_stl)
 
         # Insert buf_tmp before mutation, copy-back after mutation.
         mutation_op_index = operations.index(mutation_op)
