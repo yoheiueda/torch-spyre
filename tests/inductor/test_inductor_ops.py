@@ -2664,6 +2664,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "add1": lambda _, x: torch.add(x.clone(), x),
                 "add2": lambda _, x: torch.add(x, x),
                 "to_dtype": lambda _, x: x.to(dtype=torch.bool),
+                "copy_": lambda dim, x: x.copy_(torch.ones_like(x))._base,
             },
             "param_sets": {
                 "2d64": (1, 32, 96, cached_randn((128, 256))),

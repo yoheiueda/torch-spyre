@@ -964,15 +964,70 @@ def propagate_spyre_tensor_layouts(
                 target = op.layout.target
                 while isinstance(target, ReinterpretView):
                     target = target.data
-                target_stl = _target_device_layout(
-                    target,
-                    target.get_name() if hasattr(target, "get_name") else "",
-                )
+                target_name = target.get_name() if hasattr(target, "get_name") else ""
+                target_stl = _target_device_layout(target, target_name)
                 if target_stl is None:
                     continue
                 rw = op.get_read_writes()
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
+
+                # If writing through a slice gives an unsupported stick expression
+                # (e.g. d2+32 from an offset), find an alternative layout for the
+                # mutation target where the write dep has a supported stick.
+                # We then force the optimizer to commit that layout for the target
+                # graph input so that work_division can compute device coordinates.
+                target_layout = target.get_layout()
+                if isinstance(target_layout, FixedLayout):
+                    stick_size = get_elem_in_stick(target_layout.dtype)
+                    write_stick = device_coordinates(
+                        target_stl, output_dep, strict=False
+                    )[-1]
+                    if not is_supported_stick_expr(write_stick, stick_size):
+                        c_target_size = [concretize_expr(s) for s in target_layout.size]
+                        c_target_stride = [
+                            concretize_expr(s) for s in target_layout.stride
+                        ]
+                        target_write_coords = host_coordinates(
+                            target_layout, output_dep
+                        )
+                        orig_target_stl = target_stl
+                        for alt_dim in range(len(target_layout.size)):
+                            if (
+                                concretize_expr(target_layout.size[alt_dim])
+                                % stick_size
+                                != 0
+                            ):
+                                continue
+                            dim_order = _compute_dim_order(
+                                alt_dim, c_target_size, target_write_coords
+                            )
+                            candidate = SpyreTensorLayout(
+                                c_target_size,
+                                c_target_stride,
+                                target_layout.dtype,
+                                dim_order,
+                            )
+                            cand_stick = device_coordinates(
+                                candidate, output_dep, strict=False
+                            )[-1]
+                            if not is_supported_stick_expr(cand_stick, stick_size):
+                                continue
+                            target_tb = V.graph.graph_inputs.get(target_name)
+                            if target_tb is None or not hasattr(target_tb, "layouts"):
+                                continue
+                            target_tb.layouts = [candidate]
+                            target_stl = candidate
+                            break
+                        if target_stl is not orig_target_stl:
+                            if not hasattr(V.graph, "mutation_restick_needed"):
+                                V.graph.mutation_restick_needed = {}
+                            V.graph.mutation_restick_needed[target_name] = (
+                                orig_target_stl,
+                                target_stl,
+                                op.get_name(),
+                            )
+
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep
@@ -1036,6 +1091,7 @@ def propagate_mutation_layouts(
             continue
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
             continue
+
         if isinstance(n.node.data, (Pointwise, Reduction)):
             real = n.node.layout.real_layout()
             if isinstance(real, FixedTiledLayout):
@@ -1047,15 +1103,6 @@ def propagate_mutation_layouts(
                 output = n.node.get_layout()
                 layouts = list(compute_layouts(n.node, output, output_dep, args))
                 n.node.layout = layouts[0]
-        elif isinstance(n.node.data, Reduction):
-            real = n.node.layout.real_layout()
-            if isinstance(real, FixedTiledLayout):
-                n.node.layout = real
-            else:
-                logger.warning(
-                    "propagate_mutation_layouts: unhandled mutation Reduction"
-                    f" op {n.node.get_name()}: real_layout is {type(real)}"
-                )
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"

@@ -879,13 +879,31 @@ def _iter_computed_buffers(operations: list[Operation]):
             logger.warning(f"unhandled operation type {type(op)}")
 
 
+def _apply_input_layout_overrides(
+    op: ComputedBuffer, args: list[SchedNodeArg]
+) -> list[SchedNodeArg]:
+    """Apply per-op input layout overrides stored in op._input_layout_overrides.
+
+    insert_post_mutation_restickify sets this on the pre-restickify node to
+    tell work division that a given input buffer should be treated as having a
+    different layout than its committed FixedTiledLayout.  Without this, work
+    division would use the committed layout (alt_stl) for both input and output
+    of the pre-restickify kernel, leaving the INPUT's stick variable unrecognized
+    and producing an invalid sub-stick split.
+    """
+    overrides: dict[str, FixedTiledLayout] = getattr(op, "_input_layout_overrides", {})
+    if not overrides:
+        return args
+    return [SchedNodeArg(a.dep, overrides.get(a.dep.name, a.layout)) for a in args]
+
+
 def span_reduction(graph: GraphLowering) -> None:
     """Pass 1: compute minimum per-op splits required by the 256MB span limit."""
     operations = graph.operations
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
         rw = op.get_read_writes()
-        args = get_mem_deps_from_rw(rw)
+        args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
         if isinstance(op.data, Pointwise):
             divide_pointwise_op(op, args, max_cores, span_reduction_pass)
         elif isinstance(op.data, Reduction):
@@ -907,7 +925,7 @@ def work_distribution(
         if op in preassigned_ops:
             continue
         rw = op.get_read_writes()
-        args = get_mem_deps_from_rw(rw)
+        args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
         if isinstance(op.data, Pointwise):
             divide_pointwise_op(op, args, max_cores, work_distribution_pass)
         elif isinstance(op.data, Reduction):
