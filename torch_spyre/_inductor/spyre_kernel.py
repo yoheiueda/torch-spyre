@@ -418,10 +418,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             stride_map=list(layout.device_layout.stride_map),
             per_tile_fixed=getattr(layout, "per_tile_fixed", False),
         )
-        if (
-            "lx" not in layout.allocation
-            and "pool" not in layout.allocation
-        ):
+        if "lx" not in layout.allocation and "pool" not in layout.allocation:
             self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
 
@@ -521,6 +518,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         value: RValue,
         mode: StoreMode = None,
     ) -> None:
+        store_redirects = getattr(V.graph, "_store_redirects", {})
+        original_name = name
+        name = store_redirects.get(name, name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
@@ -533,11 +533,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
         # mutation_real_name remaps a mutation op's buffer name to the underlying buffer
-        # it aliases.  When they differ the mutation op's own buffer is an alias that
-        # should not be allocated as a separate output.
-        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
-        if real_dst_name != name:
-            V.graph.removed_buffers.add(name)
+        # it aliases.  Skip this when _store_redirects already resolved the name — the
+        # redirect is an explicit target and does not alias via mutation_real_name.
+        if original_name not in store_redirects:
+            real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
+            if real_dst_name != name:
+                V.graph.removed_buffers.add(name)
+        else:
+            real_dst_name = name
         op_info: dict[str, Any] = {}
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
@@ -709,7 +712,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                         f"set_spyre_tensor_layout({arg_name}, {alt_stl!r})"
                     )
                     break
-
 
 
 def _iter_op_specs(specs):

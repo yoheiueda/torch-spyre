@@ -144,45 +144,6 @@ def _create_restickify_node(
     return arg_name, restick_buff
 
 
-def _patch_store_name(
-    op: ComputedBuffer,
-    old_name: str,
-    new_name: str,
-    operations: list[Operation],
-) -> ComputedBuffer:
-    """Patch op's inner_fn so stores to old_name are redirected to new_name.
-
-    Uses NameSwapHandler (same mechanism as insert_restickify_on_node_inputs uses
-    for input renames).  Returns the reconstructed ComputedBuffer that replaces op
-    in the operations list.
-    """
-    orig_inner = op.data.inner_fn
-
-    def new_inner_fn(*args, _map={old_name: new_name}, _orig=orig_inner):
-        with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
-            return _orig(*args)
-
-    object.__setattr__(op.data, "inner_fn", new_inner_fn)
-
-    new_buf = ComputedBuffer(
-        name=op.get_name(),
-        layout=op.layout,
-        data=op.data,
-        _split_size=op._split_size,
-        _original_inner_fn=op._original_inner_fn,
-        _original_ranges=op._original_ranges,
-        _original_reduction_ranges=op._original_reduction_ranges,
-    )
-    new_buf.operation_name = op.operation_name
-    new_buf.origins = op.origins
-
-    op_index = operations.index(op)
-    operations[op_index] = new_buf
-    V.graph.name_to_buffer[new_buf.get_name()] = new_buf
-    ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
-    return new_buf
-
-
 def insert_restickify_on_node_inputs(
     op: ComputedBuffer,
     resticks_needed: list[dict],
@@ -393,9 +354,12 @@ def insert_post_mutation_restickify(operations: list[Operation]) -> None:
       3. copy-back:       buf_tmp (alt_stl) → arg0_1 (alt_stl)    [identity copy]
       4. set_spyre_tensor_layout(arg0_1, alt_stl)                  [DCI metadata fix]
 
-    Output store redirects are expressed as NameSwapHandler patches on each op's
-    inner_fn (same mechanism as insert_restickify_on_node_inputs), keeping all name
-    substitutions local to the IR node rather than in a global side-channel on V.graph.
+    Store redirects for the mutation and copy-back ops are recorded in
+    V.graph._store_redirects and applied at codegen time in SpyreKernel.store().
+    NameSwapHandler cannot be used here because for a ComputedBuffer the store target
+    name is passed to SpyreKernel.store() from outside inner_fn — inner_fn only
+    produces the value (loader); the NameSwapHandler wrapping V.ops only intercepts
+    ops.load/ops.store calls made *inside* inner_fn.
 
     arg0_1 is returned unchanged so DCI downloads from its stable HBM address.
     """
@@ -404,6 +368,8 @@ def insert_post_mutation_restickify(operations: list[Operation]) -> None:
         return
 
     graph_lowering = V.graph
+    if not hasattr(graph_lowering, "_store_redirects"):
+        graph_lowering._store_redirects = {}
     if not hasattr(graph_lowering, "_pre_restickify_input_stl"):
         graph_lowering._pre_restickify_input_stl = {}
 
@@ -411,7 +377,8 @@ def insert_post_mutation_restickify(operations: list[Operation]) -> None:
         mutation_op = _find_mutation_op(operations, target_name)
         if mutation_op is None:
             logger.warning(
-                "insert_post_mutation_restickify: no mutation op found for %s", target_name
+                "insert_post_mutation_restickify: no mutation op found for %s",
+                target_name,
             )
             continue
 
@@ -440,16 +407,16 @@ def insert_post_mutation_restickify(operations: list[Operation]) -> None:
         )
         buf_tmp_name = buf_tmp.get_name()
 
-        # Step 2: redirect mutation inner_fn to write to buf_tmp instead of mutation_name.
+        # Step 2: redirect mutation's store to buf_tmp instead of its own buffer name.
         # The mutation op's own buffer name becomes a dead allocation; add to removed_buffers
         # so the scheduler/codegen does not try to allocate or pass it as a kernel arg.
         mutation_name = mutation_op.get_name()
-        mutation_op = _patch_store_name(mutation_op, mutation_name, buf_tmp_name, operations)
+        graph_lowering._store_redirects[mutation_name] = buf_tmp_name
         graph_lowering.removed_buffers.add(mutation_name)
 
         # Step 3: create copy-back node: buf_tmp (alt_stl) → buf_copyback (alt_stl).
-        # Redirect its inner_fn to store to target_name (arg0_1) so the kernel writes
-        # the full restickified tensor back to the original HBM address.
+        # Redirect its store to target_name (arg0_1) so the kernel writes the full
+        # restickified tensor back to the original HBM address.
         # MutationLayoutSHOULDREMOVE makes the scheduler treat copy-back as a live
         # mutation of arg0_1, preventing DCE of buf_copyback (and transitively buf_tmp).
         _, buf_copyback = _create_restickify_node(
@@ -458,7 +425,7 @@ def insert_post_mutation_restickify(operations: list[Operation]) -> None:
         )
         copyback_name = buf_copyback.get_name()
         buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_tb)
-        buf_copyback = _patch_store_name(buf_copyback, copyback_name, target_name, operations)
+        graph_lowering._store_redirects[copyback_name] = target_name
 
         # Insert buf_tmp before mutation, copy-back after mutation.
         mutation_op_index = operations.index(mutation_op)
@@ -471,5 +438,9 @@ def insert_post_mutation_restickify(operations: list[Operation]) -> None:
         logger.info(
             "insert_post_mutation_restickify: "
             "%s (orig→alt) before %s; copy-back %s→%s after %s",
-            target_name, mutation_name, buf_tmp_name, target_name, mutation_name,
+            target_name,
+            mutation_name,
+            buf_tmp_name,
+            target_name,
+            mutation_name,
         )
