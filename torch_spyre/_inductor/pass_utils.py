@@ -177,8 +177,14 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
-def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
-    """Raise Unsupported for stick expressions may be valid but are not yet supported."""
+def is_supported_stick_expr(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+    """Check if a stick expression is supported.
+
+    Returns True for stick expressions that are valid and supported:
+    - Mod(var, elems_per_stick) where var is a single symbol
+    - A bare variable (symbol)
+    - Zero
+    """
     is_supported_mod = (
         isinstance(stick_expr, sympy.Mod)
         and len(stick_expr.args[0].free_symbols) == 1
@@ -186,14 +192,12 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     )
     is_bare_var = stick_expr.is_symbol
     is_zero = stick_expr == sympy.S.Zero
-    if not (is_supported_mod or is_bare_var or is_zero):
-        raise Unsupported(
-            f"Unexpected stick expression {stick_expr!r}: expected "
-            f"Mod(var, {elems_per_stick}), a bare variable, or 0"
-        )
+    return is_supported_mod or is_bare_var or is_zero
 
 
-def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Expr]:
+def device_coordinates(
+    stl: SpyreTensorLayout, dep: MemoryDep, strict: bool = True
+) -> list[sympy.Expr]:
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
     index = concretize_index(dep.index, set(dep.ranges.keys()))
@@ -203,7 +207,12 @@ def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Exp
         dep.ranges,
         index,
     )
-    _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    stick_expr = coords[-1]
+    if strict and not is_supported_stick_expr(stick_expr, stl.elems_per_stick()):
+        raise Unsupported(
+            f"Unexpected stick expression {stick_expr!r}: expected "
+            f"Mod(var, {stl.elems_per_stick()}), a bare variable, or 0"
+        )
     return coords
 
 
@@ -469,14 +478,27 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
-    idc = device_coordinates(in_stl, in_dep)
-    out_idc = device_coordinates(out_stl, out_dep)
+    idc = device_coordinates(in_stl, in_dep, strict=False)
+    out_idc = device_coordinates(out_stl, out_dep, strict=False)
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
-    if stick_compatible([idc, out_idc]):
+    # Unsupported input stick (e.g. with offset) always need restickify.
+    in_stick_supported = is_supported_stick_expr(idc[-1], in_stl.elems_per_stick())
+    if in_stick_supported and stick_compatible([idc, out_idc]):
         return False, None
     ic = host_coordinates(in_host, in_dep)
-    return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)
+    target_stick = out_idc[-1]
+
+    if target_stick == sympy.S.Zero and not in_stick_supported:
+        # When output stick is zero (reduced dim) and input stick is unsupported,
+        # matching dim fails. Promote reduction var to stick dimension
+        reduction_vars = in_dep.index.free_symbols - out_dep.index.free_symbols
+        if reduction_vars:
+            red_var = next(iter(reduction_vars))
+            target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
+    return True, compute_restickify_target_layout(
+        in_stl, in_host, target_stick, ic, idc
+    )
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:

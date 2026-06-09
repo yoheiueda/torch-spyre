@@ -266,14 +266,14 @@ def _no_feasible_layout_error(op) -> NotImplementedError:
         host_layout = V.graph.get_buffer(ec.dep.name).get_layout()
         lines.append(f"    {ec.dep.name}:  {_fmt_buf(host_layout, ec.dep)}")
         for j, stl in enumerate(ec._in_layouts):
-            lines.append(
-                f"      STL {j}:  {_fmt_stl(device_coordinates(stl, ec.dep), stl)}"
-            )
+            d_coords = device_coordinates(stl, ec.dep, strict=False)
+            lines.append(f"      STL {j}:  {_fmt_stl(d_coords, stl)}")
         lines.append("")
 
     lines.append(f"  Output:  {_fmt_buf(out_layout, out_dep)}")
     for i, stl in enumerate(op.layouts):
-        lines.append(f"    STL {i}:  {_fmt_stl(device_coordinates(stl, out_dep), stl)}")
+        d_coords = device_coordinates(stl, out_dep, strict=False)
+        lines.append(f"    STL {i}:  {_fmt_stl(d_coords, stl)}")
 
     analysis = []
     for i, candidate_stl in enumerate(op.layouts):
@@ -281,10 +281,11 @@ def _no_feasible_layout_error(op) -> NotImplementedError:
         if blocking_ec is None:
             analysis.append(f"    STL {i}: no blocking input identified")
         else:
-            out_stick = device_coordinates(candidate_stl, out_dep)[-1]
+            out_stick = device_coordinates(candidate_stl, out_dep, strict=False)[-1]
             for j, in_stl in enumerate(blocking_ec._in_layouts):
                 if blocking_ec.cost(in_stl, candidate_stl) == INF:
-                    in_stick = device_coordinates(in_stl, blocking_ec.dep)[-1]
+                    d_coords = device_coordinates(in_stl, blocking_ec.dep, strict=False)
+                    in_stick = d_coords[-1]
                     reason = _stick_incompatibility_reason(in_stick, out_stick)
                     reason_str = f": {reason}" if reason else ""
                     analysis.append(
