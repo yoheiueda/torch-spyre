@@ -406,6 +406,12 @@ def insert_post_mutation_restickify(operations: list[Operation]) -> None:
             mutation_op,
         )
         buf_tmp_name = buf_tmp.get_name()
+        # Work division sees arg0_1 with its committed alt_stl layout (set by the
+        # optimizer), but the pre-restickify kernel physically reads it as orig_stl.
+        # Store the override here so work division uses orig_stl when computing stick
+        # variable constraints for buf_tmp's input, preventing a sub-stick split on
+        # the orig_stl stick dimension.
+        buf_tmp._input_layout_overrides = {target_name: orig_stl_layout}
 
         # Step 2: redirect mutation's store to buf_tmp instead of its own buffer name.
         # The mutation op's own buffer name becomes a dead allocation; add to removed_buffers
