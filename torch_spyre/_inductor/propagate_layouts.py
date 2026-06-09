@@ -1045,6 +1045,7 @@ def propagate_spyre_tensor_layouts(
                             V.graph.mutation_restick_needed[target_name] = (
                                 orig_target_stl,
                                 target_stl,
+                                op.get_name(),
                             )
 
                 op.layouts = [target_stl]
