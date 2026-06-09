@@ -21,6 +21,7 @@ from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import copy_fx_custom_meta
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -201,14 +202,15 @@ def insert_restickify_on_node_inputs(
     ComputedBuffer.get_default_sizes_body.clear_cache(new_consumer_buffer)
 
 
-def insert_restickify(operations: list[Operation]) -> None:
+def insert_restickify(graph: GraphLowering) -> None:
     """Insert restickify operations before all nodes in restickify_plan.
 
-    Consumes V.graph.restickify_plan (built by finalize_layouts) and splices the
+    Consumes graph.restickify_plan (built by finalize_layouts) and splices the
     necessary ComputedBuffer nodes into the operations list in-place.
     No scheduler state is touched.
     """
-    restickify_plan = V.graph.restickify_plan
+    operations = graph.operations
+    restickify_plan = graph.restickify_plan
     if not restickify_plan:
         return
 
@@ -221,9 +223,9 @@ def insert_restickify(operations: list[Operation]) -> None:
             )
 
 
-def finalize_layouts(operations: list) -> None:
+def finalize_layouts(graph: GraphLowering) -> None:
     """Convert committed STLs (set by the optimizer) to FixedTiledLayouts and build
-    V.graph.restickify_plan for insert_restickify.
+    graph.restickify_plan for insert_restickify.
 
     Two steps:
     - Commit: wrap each op's committed_stl in a FixedTiledLayout and assign it to
@@ -232,8 +234,9 @@ def finalize_layouts(operations: list) -> None:
     - Schedule restickifies: for each input edge where the committed input STL is
       incompatible with what the op requires, record a restickify in the plan.
     """
-    for name in V.graph.graph_input_names:
-        tensor_box = V.graph.graph_inputs[name]
+    operations = graph.operations
+    for name in graph.graph_input_names:
+        tensor_box = graph.graph_inputs[name]
         if (
             isinstance(tensor_box, TensorBox)
             and isinstance(tensor_box.data, StorageBox)
@@ -270,7 +273,7 @@ def finalize_layouts(operations: list) -> None:
         if not cost_fn:
             continue
         for edge, target_stl in cost_fn.required_input_stls(committed):
-            input_buf = V.graph.get_buffer(edge.dep.name)
+            input_buf = graph.get_buffer(edge.dep.name)
             in_layout = input_buf.get_layout()
             if isinstance(in_layout, MutationLayoutSHOULDREMOVE):
                 assert getattr(input_buf, ELIDED_COPY_BACK_ATTR, False), (
@@ -293,7 +296,7 @@ def finalize_layouts(operations: list) -> None:
         if plan:
             lines = ["restickify plan:"]
             for op_name, resticks in plan.items():
-                consumer = V.graph.get_buffer(op_name)
+                consumer = graph.get_buffer(op_name)
                 if isinstance(consumer, ComputedBuffer) and hasattr(
                     consumer.data, "reduction_type"
                 ):
@@ -305,7 +308,7 @@ def finalize_layouts(operations: list) -> None:
                 for r in resticks:
                     tgt = r["target_layout"]
                     arg_name = r["arg_name"]
-                    arg_buf = V.graph.get_buffer(arg_name)
+                    arg_buf = graph.get_buffer(arg_name)
                     if (
                         isinstance(arg_buf, TensorBox)
                         and isinstance(arg_buf.data, StorageBox)
@@ -342,7 +345,7 @@ def _find_mutation_op(
     return None
 
 
-def insert_post_mutation_restickify(operations: list[Operation]) -> None:
+def insert_post_mutation_restickify(graph: GraphLowering) -> None:
     """Insert pre/post kernels around a slice mutation to handle unsupported stick offsets.
 
     When the mutation target's orig_stl produces an unsupported stick expression for
@@ -363,6 +366,7 @@ def insert_post_mutation_restickify(operations: list[Operation]) -> None:
 
     arg0_1 is returned unchanged so DCI downloads from its stable HBM address.
     """
+    operations = graph.operations
     plan = getattr(V.graph, "mutation_restick_needed", {})
     if not plan:
         return
