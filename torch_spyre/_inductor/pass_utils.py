@@ -318,28 +318,25 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
 
 
 def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
-    """Raise Unsupported for stick expressions that are not yet supported.
-
-    Accepts offset-free expressions and offset variants (handled via restickify):
-    - Mod(var, elems_per_stick) where var is a single symbol
-    - A bare variable (symbol)
-    - Zero
-    - Any of the above with an additive constant offset
-    """
-    if is_stick_expr_offset_free(stick_expr, elems_per_stick):
-        return
-    # Also accept offset variants: strip the constant and check the remainder.
-    if isinstance(stick_expr, sympy.Add):
-        free_args = [a for a in stick_expr.args if a.free_symbols]
-        if len(free_args) == 1 and is_stick_expr_offset_free(
-            free_args[0], elems_per_stick
-        ):
-            return
-    raise Unsupported(
-        f"Unexpected stick expression {stick_expr!r}: expected "
-        f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
-        f"with a constant offset"
+    """Raise Unsupported for stick expressions may be valid but are not yet supported."""
+    is_supported_mod = (
+        isinstance(stick_expr, sympy.Mod)
+        and len(stick_expr.args[0].free_symbols) == 1
+        and stick_expr.args[1] == elems_per_stick
     )
+    is_bare_var = stick_expr.is_symbol
+    is_zero = stick_expr == sympy.S.Zero
+    # Also accept offset variants: Mod(var, N) + c, var + c (handled via restickify)
+    has_offset = isinstance(stick_expr, sympy.Add) and is_stick_expr_offset_free(
+        next((a for a in stick_expr.args if a.free_symbols), sympy.S.Zero),
+        elems_per_stick,
+    )
+    if not (is_supported_mod or is_bare_var or is_zero or has_offset):
+        raise Unsupported(
+            f"Unexpected stick expression {stick_expr!r}: expected "
+            f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
+            f"with a constant offset"
+        )
 
 
 def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Expr]:
