@@ -133,7 +133,7 @@ def _make_output_stl(
     c_size: list,
     c_stride: list,
     stick_dim: int,
-) -> "SpyreTensorLayout | None":
+) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
     Returns None if the resulting stick expression has an offset.
@@ -152,16 +152,15 @@ def _candidate_output_stls(
     c_size: list,
     c_stride: list,
     stick_size: int,
-) -> "list[SpyreTensorLayout]":
+) -> list[SpyreTensorLayout]:
     """Enumerate candidate output STLs by trying each non-last dim as the stick.
 
-    Skips dims whose size is not divisible by stick_size, and skips any candidate
-    whose resulting device stick expression has an offset.
+    Skips any candidate whose resulting device stick expression has an offset.
     """
     result = []
     for alt_stick_dim in range(len(output.size) - 1):
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
-            # TODO: Support dimensions with size not divisible by stick_size via padding
+            # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
             continue
         stl = _make_output_stl(output, output_dep, c_size, c_stride, alt_stick_dim)
         if stl is not None:
@@ -169,7 +168,7 @@ def _candidate_output_stls(
     return result
 
 
-def _check_supported_input_sticks(args: list["PropArg"], op_label: str) -> None:
+def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
     """Reject fixed-layout ops when any input has a stick expression with a constant offset.
 
     These ops require a fixed input layout.  An offset stick would need two
@@ -231,7 +230,7 @@ def _single_arg_op_layout(
         layouts = []
         for in_dim in range(len(in_layout.size)):
             if concretize_expr(in_layout.size[in_dim]) % stick_size != 0:
-                # TODO: Support dimensions with size not divisible by stick_size via padding
+                # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
                 continue
             in_coord = in_coords[in_dim]
             # Map input dim to output dim. If input dim carries reduction var, it's collapsed
@@ -428,11 +427,11 @@ def _layernormnorm_layout(
     return [out_stl]
 
 
-def _index_symbols(dep: "MemoryDep") -> "set[sympy.Symbol]":
+def _index_symbols(dep: MemoryDep) -> set[sympy.Symbol]:
     return dep.index.free_symbols
 
 
-def _find_reduction_var(x_dep, out_dep, op_name: str = "reduction") -> "sympy.Symbol":
+def _find_reduction_var(x_dep, out_dep, op_name: str = "reduction") -> sympy.Symbol:
     """Reduction loop variable: appears in x's index but not in output's index."""
     reduction_vars = _index_symbols(x_dep) - _index_symbols(out_dep)
     if len(reduction_vars) != 1:
@@ -442,7 +441,7 @@ def _find_reduction_var(x_dep, out_dep, op_name: str = "reduction") -> "sympy.Sy
     return next(iter(reduction_vars))
 
 
-def _find_matmul_generated_var(y_dep, x_dep, out_dep) -> "sympy.Symbol":
+def _find_matmul_generated_var(y_dep, x_dep, out_dep) -> sympy.Symbol:
     """N loop variable: appears in y's and output's index but not in x's index."""
     generated_vars = (_index_symbols(y_dep) & _index_symbols(out_dep)) - _index_symbols(
         x_dep
@@ -463,11 +462,11 @@ def _dev_coord_for_var(dev_coords, arg_host_coords, var):
 
 
 def find_stick_compatible_input_layout(
-    arg: "PropArg",
-    reduction_var: "sympy.Symbol",
+    arg: PropArg,
+    reduction_var: sympy.Symbol,
     reduction_type: str,
     label: str,
-) -> "SpyreTensorLayout":
+) -> SpyreTensorLayout:
     """Find the required STL for a matmul input by iterating all candidate layouts.
 
     1. Return the first layout whose stick already carries reduction_var (zero cost).
@@ -653,7 +652,7 @@ def _multi_arg_pointwise_layouts(
     # Try alternative layouts if no valid layouts found
     if not results:
         for alt_stick_dim in range(len(output.size) - 1):
-            # TODO: Support dimensions with size not divisible by stick_size via padding
+            # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
             if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
                 continue
             _try_stick_dim(alt_stick_dim)
