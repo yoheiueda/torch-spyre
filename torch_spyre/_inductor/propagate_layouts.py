@@ -127,6 +127,25 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
     return -1 if maybe is None else maybe
 
 
+def _output_stl_from_stick_expr(
+    stick_expr,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    c_size: list,
+    c_stride: list,
+) -> SpyreTensorLayout | None:
+    """If stick_expr is offset-free, build an output STL with it mapped to the right dim.
+
+    Returns None if stick_expr has an offset (caller should fall back to scanning).
+    """
+    stick_size = get_elem_in_stick(output.dtype)
+    if not is_stick_expr_offset_free(stick_expr, stick_size):
+        return None
+    out_coords = host_coordinates(output, output_dep)
+    out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
+    return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim)
+
+
 def _make_output_stl(
     output: FixedLayout,
     output_dep: MemoryDep,
@@ -209,12 +228,11 @@ def _single_arg_op_layout(
         x_stick_expr = x_dev_coords[-1]
 
         # Try to preserve input layout
-        if is_stick_expr_offset_free(x_stick_expr, stick_size):
-            # Propagate input stick to output if the dim survives, else put stick last.
-            out_stick_dim = _pick_stick_dim(x_stick_expr, out_coords)
-            out_dim_order = _compute_dim_order(out_stick_dim, c_size, out_coords)
-            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-            return [stl]
+        out_stl = _output_stl_from_stick_expr(
+            x_stick_expr, output, output_dep, c_size, c_stride
+        )
+        if out_stl is not None:
+            return [out_stl]
 
         # Try alternative layouts when input layout is not supported
         in_coords = host_coordinates(in_layout, dep)
@@ -235,10 +253,10 @@ def _single_arg_op_layout(
                 if out_stick_dim < 0:
                     continue
             out_dim_order = _compute_dim_order(out_stick_dim, c_size, out_coords)
-            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-            coords = device_coordinates(stl, output_dep)
+            out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+            coords = device_coordinates(out_stl, output_dep)
             if is_stick_expr_offset_free(coords[-1], stick_size):
-                layouts.append(stl)
+                layouts.append(out_stl)
 
         return layouts
 
@@ -295,11 +313,11 @@ def _single_arg_op_layout(
     stick_expr = in_device_coords[-1]
 
     # Try to preserve input layout, fall back to scanning all output dims
-    if is_stick_expr_offset_free(stick_expr, stick_size):
-        out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
-        out_stl = _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim)
-        if out_stl is not None:
-            return [out_stl]
+    out_stl = _output_stl_from_stick_expr(
+        stick_expr, output, output_dep, c_size, c_stride
+    )
+    if out_stl is not None:
+        return [out_stl]
     return _candidate_output_stls(output, output_dep, c_size, c_stride, stick_size)
 
 

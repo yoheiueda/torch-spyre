@@ -317,7 +317,7 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
     return is_supported_mod or is_bare_var or is_zero
 
 
-def _has_stick_expr_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
     """Return True if stick_expr is an offset variant: Mod(var, N) + c or var + c."""
     if not isinstance(stick_expr, sympy.Add):
         return False
@@ -330,7 +330,7 @@ def _has_stick_expr_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool
 def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
     """Raise Unsupported for stick expressions may be valid but are not yet supported."""
     offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
-    has_offset = _has_stick_expr_offset(stick_expr, elems_per_stick)
+    has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
     if not (offset_free or has_offset):
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
