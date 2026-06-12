@@ -317,32 +317,43 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
     return is_supported_mod or is_bare_var or is_zero
 
 
-def is_supported_stick_expr(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
-    """Check if a stick expression is supported by the current torch-spyre implementation.
+def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
+    """Raise Unsupported for stick expressions that are not yet supported.
 
-    Returns True for any stick expression handled by the compiler, including
-    offset expressions (e.g. Mod(var, elems_per_stick) + offset) which are
-    supported via the restickify mechanism.  The only unsupported case is an
-    expression that cannot be computed at all (structurally invalid).
-
-    Use is_stick_expr_offset_free() when you specifically need to test for the
-    absence of a constant offset (e.g. when deciding whether restickify is needed).
+    Accepts offset-free expressions and offset variants (handled via restickify):
+    - Mod(var, elems_per_stick) where var is a single symbol
+    - A bare variable (symbol)
+    - Zero
+    - Any of the above with an additive constant offset
     """
-    # All structurally valid expressions are supported; constant offsets are handled
-    # by inserting a restickify before the op.
-    return True
+    if is_stick_expr_offset_free(stick_expr, elems_per_stick):
+        return
+    # Also accept offset variants: strip the constant and check the remainder.
+    if isinstance(stick_expr, sympy.Add):
+        free_args = [a for a in stick_expr.args if a.free_symbols]
+        if len(free_args) == 1 and is_stick_expr_offset_free(
+            free_args[0], elems_per_stick
+        ):
+            return
+    raise Unsupported(
+        f"Unexpected stick expression {stick_expr!r}: expected "
+        f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
+        f"with a constant offset"
+    )
 
 
 def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Expr]:
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
     index = concretize_index(dep.index, set(dep.ranges.keys()))
-    return compute_coordinates(
+    coords = compute_coordinates(
         stl.device_size,
         stl.stride_map,
         dep.ranges,
         index,
     )
+    _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    return coords
 
 
 def iter_var_id(stick_expr) -> int:
