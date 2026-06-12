@@ -128,11 +128,7 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
 
 
 def _output_stl_from_stick_expr(
-    stick_expr,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    c_size: list,
-    c_stride: list,
+    stick_expr, output, output_dep, c_size, c_stride
 ) -> SpyreTensorLayout | None:
     """If stick_expr is offset-free, build an output STL with it mapped to the right dim.
 
@@ -147,11 +143,7 @@ def _output_stl_from_stick_expr(
 
 
 def _make_output_stl(
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    c_size: list,
-    c_stride: list,
-    stick_dim: int,
+    output, output_dep, c_size, c_stride, stick_dim
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
@@ -162,7 +154,9 @@ def _make_output_stl(
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
     coords = device_coordinates(stl, output_dep)
-    return stl if is_stick_expr_offset_free(coords[-1], stick_size) else None
+    if is_stick_expr_offset_free(coords[-1], stick_size):
+        return stl
+    return None
 
 
 def _candidate_output_stls(
@@ -252,10 +246,10 @@ def _single_arg_op_layout(
                 out_stick_dim = _pick_stick_dim(in_coord, out_coords)
                 if out_stick_dim < 0:
                     continue
-            out_dim_order = _compute_dim_order(out_stick_dim, c_size, out_coords)
-            out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-            coords = device_coordinates(out_stl, output_dep)
-            if is_stick_expr_offset_free(coords[-1], stick_size):
+            out_stl = _make_output_stl(
+                output, output_dep, c_size, c_stride, out_stick_dim
+            )
+            if out_stl is not None:
                 layouts.append(out_stl)
 
         return layouts
