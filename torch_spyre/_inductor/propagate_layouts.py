@@ -59,7 +59,7 @@ from .pass_utils import (
     concretize_expr,
     host_coordinates,
     device_coordinates,
-    is_supported_stick_expr,
+    is_stick_expr_offset_free,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -122,19 +122,19 @@ def _compute_dim_order(stick_dim, size, coords):
 
 
 def _check_supported_input_sticks(args: list["PropArg"], op_label: str) -> None:
-    """Reject fixed-layout ops when any input has unsupported stick expression
-    (e.g. offset from slicing on stick dim).
+    """Reject fixed-layout ops when any input has a stick expression with a constant offset.
 
-    These ops would need two restickify ops: one to remove the offset before
-    the op, and another to restore the layout after — not yet implemented.
+    These ops require a fixed input layout.  An offset stick would need two
+    restickify ops — one to remove the offset before the op, and one to restore
+    the layout after — which is not yet implemented.
     """
     for i, arg in enumerate(args):
         for stl in arg.layouts:
-            stick_expr = device_coordinates(stl, arg.dep, strict=False)[-1]
-            if not is_supported_stick_expr(stick_expr, stl.elems_per_stick()):
+            stick_expr = device_coordinates(stl, arg.dep)[-1]
+            if not is_stick_expr_offset_free(stick_expr, stl.elems_per_stick()):
                 raise Unsupported(
-                    f"{op_label}: input arg{i} has unsupported stick expression "
-                    f"{stick_expr!r} (likely from slicing/splitting the stick dimension); "
+                    f"{op_label}: input arg{i} has stick expression with offset "
+                    f"{stick_expr!r} (likely from slicing the stick dimension); "
                     f"this op requires a fixed input layout and double-restickify is not yet supported"
                 )
 
@@ -157,12 +157,12 @@ def _single_arg_op_layout(
     stick_size = get_elem_in_stick(output.dtype)
 
     if isinstance(data, Reduction):
-        x_dev_coords = device_coordinates(stl, dep, strict=False)
+        x_dev_coords = device_coordinates(stl, dep)
         out_coords = host_coordinates(output, output_dep)
         x_stick_expr = x_dev_coords[-1]
 
         # Try to preserve input layout
-        if is_supported_stick_expr(x_stick_expr, stick_size):
+        if is_stick_expr_offset_free(x_stick_expr, stick_size):
             # Propagate input stick to output if the dim survives, else put stick last.
             out_stick_dim = matching_dim(out_coords, x_stick_expr)
             if out_stick_dim is None:
@@ -195,8 +195,8 @@ def _single_arg_op_layout(
                     continue
                 out_dim_order = _compute_dim_order(out_stick_dim, c_size, out_coords)
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-            coords = device_coordinates(stl, output_dep, strict=False)
-            if is_supported_stick_expr(coords[-1], stick_size):
+            coords = device_coordinates(stl, output_dep)
+            if is_stick_expr_offset_free(coords[-1], stick_size):
                 layouts.append(stl)
 
         return layouts
@@ -213,8 +213,8 @@ def _single_arg_op_layout(
             # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
             # which becomes 64 FP32 elements when converted. We need to reflect this
             # in the output host size so the constructor creates the correct device layout.
-            in_stick_expr = device_coordinates(stl, dep, strict=False)[-1]
-            if not is_supported_stick_expr(in_stick_expr, stl.elems_per_stick()):
+            in_stick_expr = device_coordinates(stl, dep)[-1]
+            if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
                 return []
 
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
@@ -250,18 +250,18 @@ def _single_arg_op_layout(
         )
         return [stl]
 
-    in_device_coords = device_coordinates(stl, dep, strict=False)
+    in_device_coords = device_coordinates(stl, dep)
     stick_expr = in_device_coords[-1]
 
     # Try to preserve input layout
-    if is_supported_stick_expr(stick_expr, stick_size):
+    if is_stick_expr_offset_free(stick_expr, stick_size):
         maybe_stick_dim = matching_dim(out_coords, stick_expr)
         out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
         dim_order = _compute_dim_order(out_stick_dim, c_size, out_coords)
         stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         return [stl]
 
-    # Try alternative layouts when input layout is not supported
+    # Try alternative layouts when input has offset stick
     layouts = []
     for alt_stick_dim in range(len(output.size) - 1):
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
@@ -269,8 +269,8 @@ def _single_arg_op_layout(
             continue
         dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)
         stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-        coords = device_coordinates(stl, output_dep, strict=False)
-        if is_supported_stick_expr(coords[-1], stick_size):
+        coords = device_coordinates(stl, output_dep)
+        if is_stick_expr_offset_free(coords[-1], stick_size):
             layouts.append(stl)
 
     return layouts
@@ -303,7 +303,7 @@ def _clone_layout(
 
     in_dep = args[0].dep
     in_stl = next(iter(args[0].layouts))
-    in_device_coords = device_coordinates(in_stl, in_dep, strict=False)
+    in_device_coords = device_coordinates(in_stl, in_dep)
     stick_expr = in_device_coords[-1]
     stick_size = get_elem_in_stick(output.dtype)
 
@@ -313,7 +313,7 @@ def _clone_layout(
         c_size, c_stride, output.dtype, list(range(len(output.size)))
     )
 
-    if is_supported_stick_expr(stick_expr, stick_size):
+    if is_stick_expr_offset_free(stick_expr, stick_size):
         # Case 1: No restickify insertion needed.
         # Use AnyInNode to produce the fixed output layout.
         op.restick_cost_fn = AnyInNode.from_args()
@@ -330,13 +330,13 @@ def _clone_layout(
             continue
         dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)
         stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-        coords = device_coordinates(stl, output_dep, strict=False)
-        if not is_supported_stick_expr(coords[-1], stick_size):
+        coords = device_coordinates(stl, output_dep)
+        if not is_stick_expr_offset_free(coords[-1], stick_size):
             continue
         # TODO: FixedInOutNode only supports a single required STL, so we select
         # a layout where restickify is feasible to avoid optimizer rejection.
         # Consider implementing a cost node that supports multiple required STLs.
-        target_stick = device_coordinates(stl, output_dep, strict=False)[-1]
+        target_stick = device_coordinates(stl, output_dep)[-1]
         target_stl = compute_restickify_target_layout(
             in_stl, in_layout, target_stick, in_host_coords, in_device_coords
         )
@@ -556,7 +556,7 @@ def _multi_arg_pointwise_layouts(
         stick_expr
         for arg in args
         for stl in arg.layouts
-        if (stick_expr := device_coordinates(stl, arg.dep, strict=False)[-1]) != 0
+        if (stick_expr := device_coordinates(stl, arg.dep)[-1]) != 0
     }
 
     # If the indexing and device element size are identical
@@ -592,8 +592,8 @@ def _multi_arg_pointwise_layouts(
             in_stl = SpyreTensorLayout(
                 c_in_size, c_in_stride, output.dtype, projected_dim_order
             )
-            coord = device_coordinates(in_stl, arg.dep, strict=False)
-            if not is_supported_stick_expr(coord[-1], stick_size):
+            coord = device_coordinates(in_stl, arg.dep)
+            if not is_stick_expr_offset_free(coord[-1], stick_size):
                 return False
         return True
 
@@ -613,7 +613,9 @@ def _multi_arg_pointwise_layouts(
         stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         results.append(stl)
     else:
-        stick_exprs = {e for e in stick_exprs if is_supported_stick_expr(e, stick_size)}
+        stick_exprs = {
+            e for e in stick_exprs if is_stick_expr_offset_free(e, stick_size)
+        }
 
         # Sort stick exprs for determinism
         for stick_expr in sorted(stick_exprs, key=iter_var_id):

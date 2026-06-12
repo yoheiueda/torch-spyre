@@ -299,10 +299,10 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
-def is_supported_stick_expr(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
-    """Check if a stick expression is supported.
+def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+    """Check if a stick expression is free of constant offsets.
 
-    Returns True for stick expressions that are valid and supported:
+    Returns True for stick expressions with no additive offset:
     - Mod(var, elems_per_stick) where var is a single symbol
     - A bare variable (symbol)
     - Zero
@@ -317,25 +317,32 @@ def is_supported_stick_expr(stick_expr: sympy.Expr, elems_per_stick: int) -> boo
     return is_supported_mod or is_bare_var or is_zero
 
 
-def device_coordinates(
-    stl: SpyreTensorLayout, dep: MemoryDep, strict: bool = True
-) -> list[sympy.Expr]:
+def is_supported_stick_expr(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+    """Check if a stick expression is supported by the current torch-spyre implementation.
+
+    Returns True for any stick expression handled by the compiler, including
+    offset expressions (e.g. Mod(var, elems_per_stick) + offset) which are
+    supported via the restickify mechanism.  The only unsupported case is an
+    expression that cannot be computed at all (structurally invalid).
+
+    Use is_stick_expr_offset_free() when you specifically need to test for the
+    absence of a constant offset (e.g. when deciding whether restickify is needed).
+    """
+    # All structurally valid expressions are supported; constant offsets are handled
+    # by inserting a restickify before the op.
+    return True
+
+
+def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Expr]:
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
     index = concretize_index(dep.index, set(dep.ranges.keys()))
-    coords = compute_coordinates(
+    return compute_coordinates(
         stl.device_size,
         stl.stride_map,
         dep.ranges,
         index,
     )
-    stick_expr = coords[-1]
-    if strict and not is_supported_stick_expr(stick_expr, stl.elems_per_stick()):
-        raise Unsupported(
-            f"Unexpected stick expression {stick_expr!r}: expected "
-            f"Mod(var, {stl.elems_per_stick()}), a bare variable, or 0"
-        )
-    return coords
 
 
 def iter_var_id(stick_expr) -> int:
@@ -600,18 +607,18 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
-    idc = device_coordinates(in_stl, in_dep, strict=False)
-    out_idc = device_coordinates(out_stl, out_dep, strict=False)
+    idc = device_coordinates(in_stl, in_dep)
+    out_idc = device_coordinates(out_stl, out_dep)
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
-    # Unsupported input stick (e.g. with offset) always need restickify.
-    in_stick_supported = is_supported_stick_expr(idc[-1], in_stl.elems_per_stick())
-    if in_stick_supported and stick_compatible([idc, out_idc]):
+    # Input stick with an offset always needs restickify to remove the offset.
+    in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
+    if in_stick_offset_free and stick_compatible([idc, out_idc]):
         return False, None
     ic = host_coordinates(in_host, in_dep)
     target_stick = out_idc[-1]
 
-    if target_stick == sympy.S.Zero and not in_stick_supported:
+    if target_stick == sympy.S.Zero and not in_stick_offset_free:
         # When output stick is zero (reduced dim) and input stick is unsupported,
         # matching dim fails. Promote reduction var to stick dimension
         reduction_vars = in_dep.index.free_symbols - out_dep.index.free_symbols
