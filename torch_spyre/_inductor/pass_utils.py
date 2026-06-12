@@ -627,8 +627,10 @@ def compute_restickify_needed(
     target_stick = out_idc[-1]
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
-        # When output stick is zero (reduced dim) and input stick is unsupported,
-        # matching dim fails. Promote reduction var to stick dimension
+        # Output stick is 0 (reduced dim) and input stick has an offset.
+        # No output dim carries the input's stick var, so compute_restickify_target_layout's
+        # matching_dim would return None. Promote the reduction var to the stick dimension
+        # so the restickify removes the offset and lands on the reduced dim.
         reduction_vars = in_dep.index.free_symbols - out_dep.index.free_symbols
         if reduction_vars:
             red_var = next(iter(reduction_vars))
