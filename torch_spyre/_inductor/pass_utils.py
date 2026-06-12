@@ -336,12 +336,8 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     )
     is_bare_var = stick_expr.is_symbol
     is_zero = stick_expr == sympy.S.Zero
-    if not (
-        is_supported_mod
-        or is_bare_var
-        or is_zero
-        or _has_stick_expr_offset(stick_expr, elems_per_stick)
-    ):
+    has_offset = _has_stick_expr_offset(stick_expr, elems_per_stick)
+    if not (is_supported_mod or is_bare_var or is_zero or has_offset):
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
             f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
