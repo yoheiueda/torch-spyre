@@ -211,14 +211,8 @@ def _single_arg_op_layout(
         # Try to preserve input layout
         if is_stick_expr_offset_free(x_stick_expr, stick_size):
             # Propagate input stick to output if the dim survives, else put stick last.
-            out_stick_dim = matching_dim(out_coords, x_stick_expr)
-            if out_stick_dim is None:
-                out_dim_order = list(range(len(output.size))) + [-1]
-            else:
-                out_dim_order = [
-                    d for d in range(len(output.size)) if d != out_stick_dim
-                ]
-                out_dim_order = out_dim_order + [out_stick_dim]
+            out_stick_dim = _pick_stick_dim(x_stick_expr, out_coords)
+            out_dim_order = _compute_dim_order(out_stick_dim, c_size, out_coords)
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
             return [stl]
 
@@ -235,12 +229,12 @@ def _single_arg_op_layout(
             in_coord = in_coords[in_dim]
             # Map input dim to output dim. If input dim carries reduction var, it's collapsed
             if reduction_var is not None and reduction_var in in_coord.free_symbols:
-                out_dim_order = list(range(len(output.size))) + [-1]
+                out_stick_dim = -1
             else:
-                out_stick_dim = matching_dim(out_coords, in_coord)
-                if out_stick_dim is None:
+                out_stick_dim = _pick_stick_dim(in_coord, out_coords)
+                if out_stick_dim < 0:
                     continue
-                out_dim_order = _compute_dim_order(out_stick_dim, c_size, out_coords)
+            out_dim_order = _compute_dim_order(out_stick_dim, c_size, out_coords)
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
             coords = device_coordinates(stl, output_dep)
             if is_stick_expr_offset_free(coords[-1], stick_size):
@@ -642,11 +636,11 @@ def _multi_arg_pointwise_layouts(
     elif not stick_exprs:
         _try_stick_dim(-1)
     else:
-        stick_exprs = {
+        offset_free_stick_exprs = {
             e for e in stick_exprs if is_stick_expr_offset_free(e, stick_size)
         }
         # Sort stick exprs for determinism
-        for stick_expr in sorted(stick_exprs, key=iter_var_id):
+        for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
             _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
 
     # Try alternative layouts if no valid layouts found
