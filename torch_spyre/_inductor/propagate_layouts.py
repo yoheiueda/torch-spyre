@@ -624,48 +624,39 @@ def _multi_arg_pointwise_layouts(
                 return False
         return True
 
+    def _try_stick_dim(stick_dim):
+        dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
+        if _is_supported_layout(dim_order):
+            results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order))
+
     results: list[SpyreTensorLayout] = []
 
     if can_use_same_layout:
         template_stl = next(iter(args[0].layouts))
-        stl = SpyreTensorLayout(
-            template_stl.device_size,
-            template_stl.stride_map,
-            get_device_dtype(output.dtype),
+        results.append(
+            SpyreTensorLayout(
+                template_stl.device_size,
+                template_stl.stride_map,
+                get_device_dtype(output.dtype),
+            )
         )
-        results.append(stl)
     elif not stick_exprs:
-        out_stick_dim = -1
-        dim_order = _compute_dim_order(out_stick_dim, output.size, out_coords)
-        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-        results.append(stl)
+        _try_stick_dim(-1)
     else:
         stick_exprs = {
             e for e in stick_exprs if is_stick_expr_offset_free(e, stick_size)
         }
-
         # Sort stick exprs for determinism
         for stick_expr in sorted(stick_exprs, key=iter_var_id):
-            maybe_stick_dim = matching_dim(out_coords, stick_expr)
-            out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
-            dim_order = _compute_dim_order(out_stick_dim, output.size, out_coords)
-            if _is_supported_layout(dim_order):
-                stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-                results.append(stl)
+            _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
 
     # Try alternative layouts if no valid layouts found
     if not results:
         for alt_stick_dim in range(len(output.size) - 1):
-            # Skip dimensions not divisible by stick_size
             # TODO: Support dimensions with size not divisible by stick_size via padding
             if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
                 continue
-
-            dim_order = _compute_dim_order(alt_stick_dim, c_size, out_coords)
-
-            if _is_supported_layout(dim_order):
-                stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-                results.append(stl)
+            _try_stick_dim(alt_stick_dim)
 
     if not results:
         raise Unsupported(
