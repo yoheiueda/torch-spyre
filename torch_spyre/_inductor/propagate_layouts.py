@@ -151,24 +151,31 @@ def _make_output_stl(
     Returns None if the resulting stick expression has an offset.
     """
 
-    # Type conversion may require padding when input has padding due to stick
-    # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
-    # which becomes 64 FP32 elements when converted. We need to reflect this
-    # in the output host size so the constructor creates the correct device layout.
-    fmt = ElementArrangement.STANDARD
-    if not same_device_size(in_layout.dtype, output.dtype) and stick_dim >= 0:
-        in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-        if concretize_expr(in_layout.size[stick_dim] % in_elems_per_stick) > 0:
-            c_size = list(c_size)
-            c_stride = list(c_stride)
-            c_size[stick_dim] = in_elems_per_stick
-            c_stride[stick_dim] = 1
-            if in_layout.dtype == torch.float16 and output.dtype == torch.float32:
-                fmt = ElementArrangement.DL16_TO_FP32
-
     stick_size = get_elem_in_stick(output.dtype)
     out_coords = host_coordinates(output, output_dep)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
+
+    # Type conversion may require padding when input has padding due to stick
+    # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
+    # which becomes 64 FP32 elements when converted. We need to reflect this
+    # in the output host size so the constructor creates the correct device layout,
+    # and recompute c_stride row-major over dim_order so non-stick dims step
+    # past the padded stick rather than the original unpadded stick.
+    fmt = ElementArrangement.STANDARD
+    if not same_device_size(in_layout.dtype, output.dtype) and stick_dim >= 0:
+        in_stick_size = get_elem_in_stick(in_layout.dtype)
+        if concretize_expr(in_layout.size[stick_dim] % in_stick_size) > 0:
+            c_size = list(c_size)
+            c_size[stick_dim] = in_stick_size
+            c_stride = [1] * len(c_size)
+            running = 1
+            for d in reversed(dim_order):
+                if d < 0:
+                    continue
+                c_stride[d] = running
+                running *= c_size[d]
+            if in_layout.dtype == torch.float16 and output.dtype == torch.float32:
+                fmt = ElementArrangement.DL16_TO_FP32
     stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order, fmt)
     coords = device_coordinates(stl, output_dep)
     if is_stick_expr_offset_free(coords[-1], stick_size):
@@ -187,10 +194,10 @@ def _candidate_output_stls(
 
     Skips any candidate whose resulting device stick expression has an offset.
     """
-    in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
+    in_stick_size = get_elem_in_stick(in_layout.dtype)
     result = []
     for alt_stick_dim in range(len(output.size) - 1):
-        if concretize_expr(in_layout.size[alt_stick_dim]) % in_elems_per_stick != 0:
+        if concretize_expr(in_layout.size[alt_stick_dim]) % in_stick_size != 0:
             continue
         stl = _make_output_stl(
             output, output_dep, c_size, c_stride, alt_stick_dim, in_layout
