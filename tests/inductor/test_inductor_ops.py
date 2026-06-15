@@ -1106,6 +1106,110 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_transpose_2d_unaligned", "test_transpose_2d_cpu"): {
+            "param_sets": {
+                "unaligned_65x64": (
+                    -2,
+                    -1,
+                    cached_randn((2, 2, 65, 64), abs=True),
+                ),
+                "unaligned_33x64": (
+                    -2,
+                    -1,
+                    cached_randn((2, 2, 33, 64), abs=True),
+                ),
+                "unaligned_129x128": (
+                    -2,
+                    -1,
+                    cached_randn((4, 8, 129, 128), abs=True),
+                ),
+                "unaligned_100x64": (
+                    -2,
+                    -1,
+                    cached_randn((2, 3, 100, 64), abs=True),
+                ),
+                "unaligned_17x64": (
+                    -2,
+                    -1,
+                    cached_randn((1, 17, 64), abs=True),
+                ),
+                "unaligned_63x64": (
+                    -2,
+                    -1,
+                    cached_randn((2, 63, 64), abs=True),
+                ),
+                "unaligned_127x128": (
+                    -2,
+                    -1,
+                    cached_randn((2, 127, 128), abs=True),
+                ),
+                "unaligned_193x192": (
+                    -2,
+                    -1,
+                    cached_randn((2, 193, 192), abs=True),
+                ),
+                "unaligned_4d_65x64": (
+                    -2,
+                    -1,
+                    cached_randn((2, 3, 65, 64), abs=True),
+                ),
+                "unaligned_5d_33x128": (
+                    -2,
+                    -1,
+                    cached_randn((2, 2, 3, 33, 128), abs=True),
+                ),
+                "unaligned_6d_100x64": (
+                    -2,
+                    -1,
+                    cached_randn((2, 2, 2, 2, 100, 64), abs=True),
+                ),
+                "unaligned_1000x512": (
+                    -2,
+                    -1,
+                    cached_randn((2, 1000, 512), abs=True),
+                ),
+                "unaligned_500x256": (
+                    -2,
+                    -1,
+                    cached_randn((4, 500, 256), abs=True),
+                ),
+                "unaligned_2049x2048": (
+                    -2,
+                    -1,
+                    cached_randn((2, 2049, 2048), abs=True),
+                ),
+                "unaligned_4097x4096": (
+                    -2,
+                    -1,
+                    cached_randn((1, 4097, 4096), abs=True),
+                ),
+                "unaligned_8193x1024": (
+                    -2,
+                    -1,
+                    cached_randn((1, 8193, 1024), abs=True),
+                ),
+                "unaligned_1025x8192": (
+                    -2,
+                    -1,
+                    cached_randn((1, 1025, 8192), abs=True),
+                ),
+                "unaligned_dim1_dim2": (
+                    1,
+                    2,
+                    cached_randn((2, 33, 64), abs=True),
+                ),
+                "unaligned_dim0_dim2": (
+                    0,
+                    2,
+                    cached_randn((100, 2, 64), abs=True),
+                ),
+                "unaligned_dim0_dim1_to_last": (
+                    0,
+                    2,
+                    cached_randn((65, 2, 64), abs=True),
+                ),
+            },
+        },
         ("test_transpose_2d_contiguous", "test_transpose_2d_contiguous_cpu"): {
             "param_sets": {
                 "dim_0_2": (

@@ -29,7 +29,10 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    StorageBox,
+    TensorBox,
 )
+from torch._inductor.graph import GraphLowering
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
@@ -1124,3 +1127,181 @@ def _per_core_view_on_buf(
     if cache is not None:
         cache[key] = result
     return result
+
+
+
+def _patch_env(graph_lowering) -> None:
+    """Add view nodes (ReinterpretView) to env from name_to_users."""
+    env: dict = {}
+    for tbs in graph_lowering.name_to_users.values():
+        for tb in tbs:
+            if not tb.data.origins:
+                continue
+            tb_fx_node = list(tb.data.origins)[0]
+            env[tb_fx_node] = tb
+    graph_lowering.env.update(env)
+
+
+def _find_arg_fx_node(
+    arg_name: str, expected_size: list[int] | None = None
+) -> torch.fx.Node:
+    """Return the FX node whose lowered TensorBox has the given buffer name."""
+    graph_lowering = V.graph
+    _patch_env(graph_lowering)
+    candidates = [
+        (fx_node, tb)
+        for fx_node, tb in graph_lowering.env.items()
+        if isinstance(fx_node, torch.fx.Node)
+        and isinstance(tb, TensorBox)
+        and tb.get_name() == arg_name
+    ]
+    if not candidates:
+        raise RuntimeError(f"no FX node found for buffer {arg_name!r}")
+    if expected_size is not None:
+        for fx_node, tb in candidates:
+            if [int(s) for s in tb.get_size()] == expected_size:
+                return fx_node
+        raise RuntimeError(
+            f"no FX node for buffer {arg_name!r} with size {expected_size}; "
+            f"found sizes {[[int(s) for s in tb.get_size()] for _, tb in candidates]}"
+        )
+    return candidates[0][0]
+
+
+def _rebuild_restickify_input(
+    restickify_op: ComputedBuffer,
+    padded_buf: Buffer,
+    old_input_name: str,
+    operations: list[Operation],
+) -> None:
+    """Update the restickify op to read from the padded buffer instead of the original input."""
+    original_data = restickify_op.data
+    padded_loader = padded_buf.make_loader()
+
+    def new_inner_fn(index, _loader=padded_loader):
+        return _loader(index)
+
+    object.__setattr__(original_data, "inner_fn", new_inner_fn)
+
+    V.graph.name_to_buffer[restickify_op.get_name()] = restickify_op
+
+def insert_restickify_padding(graph: GraphLowering) -> None:
+    """Insert padding before Restickify operations when needed for stick alignment.
+
+    when transpose swaps non-stick and stick dimensions,
+    the backend assumes both are divisible by stick size. This pass pads the
+    dimension that will become the stick dimension if it's not aligned.
+    """
+    operations = graph.operations
+
+    # Find all restickify operations
+    restickify_ops = []
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        if hasattr(op, "origins") and op.origins:
+            for origin_node in op.origins:
+                if (
+                    hasattr(origin_node, "target")
+                    and hasattr(origin_node.target, "__name__")
+                    and "restickify" in origin_node.target.__name__
+                ):
+                    restickify_ops.append(op)
+                    break
+
+    if not restickify_ops:
+        return
+
+    logger.info(f"Checking {len(restickify_ops)} restickify ops for padding needs")
+
+    for restickify_op in list(restickify_ops):
+        layout = restickify_op.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            continue
+
+        rw = restickify_op.get_read_writes()
+        reads = [r for r in rw.reads if hasattr(r, "name")]
+        if len(reads) != 1:
+            continue
+
+        input_dep = reads[0]
+        input_buf = graph.get_buffer(input_dep.name)
+        if input_buf is None:
+            continue
+
+        if isinstance(input_buf, TensorBox) and isinstance(input_buf.data, StorageBox):
+            actual_buf = input_buf.data.data
+        else:
+            actual_buf = input_buf
+
+        input_layout = actual_buf.get_layout()
+        if not isinstance(input_layout, FixedTiledLayout):
+            continue
+
+        output_stl = layout.device_layout
+        input_stl = input_layout.device_layout
+
+        input_host_coords = host_coordinates(input_layout, input_dep)
+        output_device_coords = device_coordinates(output_stl, input_dep)
+
+        new_stick_expr = output_device_coords[-1]
+
+        new_stick_dim = matching_dim(input_host_coords, new_stick_expr)
+        if new_stick_dim is None:
+            continue
+
+        host_size = [concretize_expr(s) for s in input_layout.size]
+        dtype = input_layout.dtype
+        stick_size = get_elem_in_stick(dtype)
+
+        new_stick_size = host_size[new_stick_dim]
+
+        stick_size = get_elem_in_stick(dtype)
+        pad = (stick_size - (new_stick_size % stick_size)) % stick_size
+
+        if pad == 0:
+            continue
+        
+        logger.info(
+            f"Padding {input_dep.name} dim[{new_stick_dim}]: {new_stick_size} -> {new_stick_size + pad}"
+        )
+
+        padded_size = list(host_size)
+        padded_size[new_stick_dim] = new_stick_size + pad
+
+        input_fx_node = _find_arg_fx_node(input_dep.name, host_size)
+
+        device = actual_buf.get_device()
+        if device is None:
+            continue
+
+        restickify_fx_node = None
+        if hasattr(restickify_op, "origins") and restickify_op.origins:
+            restickify_fx_node = list(restickify_op.origins)[0]
+
+        if restickify_fx_node is None:
+            continue
+
+        try:
+            padded_buf, new_ops = lower_pad_sequence(
+                input_fx_node,
+                padded_size,
+                device,
+                dtype,
+                new_stick_dim,
+                restickify_fx_node,
+                input_stl,
+                fill_value=0.0,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to insert padding: {e}")
+            continue
+
+        restickify_idx = operations.index(restickify_op)
+        for i, new_op in enumerate(new_ops):
+            operations.insert(restickify_idx + i, new_op)
+
+        _rebuild_restickify_input(restickify_op, padded_buf, input_dep.name, operations)
+
+
+
