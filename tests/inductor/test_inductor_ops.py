@@ -320,6 +320,22 @@ TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
 ]
 
+TO_DTYPE_ROUND_TRIP_ALT_LAYOUT_PARAMS_SETS = {
+    f"{case}_{_dtype_name(src)}_to_{_dtype_name(dst)}": (
+        cached_randn(shape, dtype=src),
+        dim_order,
+        src,
+        dst,
+    )
+    for case, shape, dim_order in [
+        ("non_last_stick_dim_2d", (64, 64), [1, 0]),
+        ("non_last_stick_dim_3d", (64, 64, 64), [0, 2, 1]),
+        ("sparse_2d", (4, 64), [0, 1, -1]),
+        ("sparse_3d", (4, 8, 64), [0, 1, 2, -1]),
+    ]
+    for src, dst in [(torch.float16, torch.float32), (torch.float32, torch.float16)]
+}
+
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
@@ -3936,6 +3952,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        (
+            "test_to_dtype_round_trip_alt_layout",
+            "test_to_dtype_round_trip_alt_layout",
+        ): {
+            "param_sets": TO_DTYPE_ROUND_TRIP_ALT_LAYOUT_PARAMS_SETS,
+        },
         ("test_conv2d", "test_conv2d_cpu"): {
             "param_sets": {
                 "1x3x32_ksize3_no_pad": (
@@ -5490,98 +5512,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    def test_to_dtype_round_trip_non_last_stick_dim_2d(self):
-        """Round-trip to_dtype on a 2D input whose stick dim is host dim 0.
+    def test_to_dtype_round_trip_alt_layout(self, x_cpu, dim_order, src, dst):
+        """Round-trip to_dtype on inputs with non-default or sparse layouts.
 
         Regression: the to_dtype path previously hardcoded
         `in_layout.size[-1]`, producing an incorrect output layout when the
-        input's stick dim was non-last (constructed via an explicit
-        SpyreTensorLayout dim_order). The round trip is needed because the
-        intermediate dst-dtype tensor has a permuted element arrangement
-        that does not directly compare to a CPU result.
+        input's stick dim was non-last or synthetic (sparse).  The round trip
+        is needed because the intermediate dst-dtype tensor has a permuted
+        element arrangement that does not directly compare to a CPU result.
         """
         from torch.spyre import SpyreTensorLayout
 
-        for src, dst in [
-            (torch.float16, torch.float32),
-            (torch.float32, torch.float16),
-        ]:
-            x = torch.randn((64, 64), dtype=src)
-            stl = SpyreTensorLayout(list(x.size()), list(x.stride()), src, [1, 0])
-            x_spyre = x.to("spyre", device_layout=stl)
+        stl = SpyreTensorLayout(
+            list(x_cpu.size()), list(x_cpu.stride()), src, dim_order
+        )
+        x_spyre = x_cpu.to("spyre", device_layout=stl)
 
-            def fn(t):
-                y = t.to(dst)
-                return (y + y).to(src)
+        def fn(t):
+            y = t.to(dst)
+            return (y + y).to(src)
 
-            spyre_result = torch.compile(fn, backend="inductor")(x_spyre).cpu()
-            torch.testing.assert_close(spyre_result, fn(x), atol=0.1, rtol=0.1)
-
-    def test_to_dtype_round_trip_non_last_stick_dim_3d(self):
-        """Round-trip to_dtype on a 3D input whose stick dim is the middle dim."""
-        from torch.spyre import SpyreTensorLayout
-
-        for src, dst in [
-            (torch.float16, torch.float32),
-            (torch.float32, torch.float16),
-        ]:
-            x = torch.randn((64, 64, 64), dtype=src)
-            # Stick on host dim 1 (middle); dims 0 and 2 are non-stick.
-            stl = SpyreTensorLayout(list(x.size()), list(x.stride()), src, [0, 2, 1])
-            x_spyre = x.to("spyre", device_layout=stl)
-
-            def fn(t):
-                y = t.to(dst)
-                return (y + y).to(src)
-
-            spyre_result = torch.compile(fn, backend="inductor")(x_spyre).cpu()
-            torch.testing.assert_close(spyre_result, fn(x), atol=0.1, rtol=0.1)
-
-    def test_to_dtype_round_trip_sparse_input_2d(self):
-        """Round-trip to_dtype on a sparse 2D input.
-
-        A sparse layout has a synthetic stick dim (no host counterpart);
-        construct one directly via a dim_order ending in -1 so the test
-        exercises the to_dtype path on a sparse input regardless of how
-        the input was produced.
-        """
-        from torch.spyre import SpyreTensorLayout
-
-        for src, dst in [
-            (torch.float16, torch.float32),
-            (torch.float32, torch.float16),
-        ]:
-            x = torch.randn((4, 64), dtype=src)
-            dim_order = list(range(len(x.size()))) + [-1]
-            stl = SpyreTensorLayout(list(x.size()), list(x.stride()), src, dim_order)
-            x_spyre = x.to("spyre", device_layout=stl)
-
-            def fn(t):
-                y = t.to(dst)
-                return (y + y).to(src)
-
-            spyre_result = torch.compile(fn, backend="inductor")(x_spyre).cpu()
-            torch.testing.assert_close(spyre_result, fn(x), atol=0.1, rtol=0.1)
-
-    def test_to_dtype_round_trip_sparse_input_3d(self):
-        """Round-trip to_dtype on a sparse 3D input."""
-        from torch.spyre import SpyreTensorLayout
-
-        for src, dst in [
-            (torch.float16, torch.float32),
-            (torch.float32, torch.float16),
-        ]:
-            x = torch.randn((4, 8, 64), dtype=src)
-            dim_order = list(range(len(x.size()))) + [-1]
-            stl = SpyreTensorLayout(list(x.size()), list(x.stride()), src, dim_order)
-            x_spyre = x.to("spyre", device_layout=stl)
-
-            def fn(t):
-                y = t.to(dst)
-                return (y + y).to(src)
-
-            spyre_result = torch.compile(fn, backend="inductor")(x_spyre).cpu()
-            torch.testing.assert_close(spyre_result, fn(x), atol=0.1, rtol=0.1)
+        spyre_result = torch.compile(fn, backend="inductor")(x_spyre).cpu()
+        torch.testing.assert_close(spyre_result, fn(x_cpu), atol=0.1, rtol=0.1)
 
     def test_bool_conversion_from_spyre(self):
         torch.manual_seed(42)
