@@ -2940,6 +2940,46 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "5d": (cached_randn((2, 3, 4, 5, 192), dtype=torch.float16),),
             },
         },
+        ("test_slice_then_transpose", "test_slice_then_transpose_cpu"): {
+            "param_sets": {
+                "default": (cached_randn((2, 2, 128, 64), dtype=torch.float16),),
+            },
+        },
+        ("test_transpose_then_slice", "test_transpose_then_slice_cpu"): {
+            "param_sets": {
+                "default": (cached_randn((2, 2, 65, 128), dtype=torch.float16),),
+            },
+        },
+        ("test_slice_unaligned_transpose", "test_slice_unaligned_transpose_cpu"): {
+            "param_sets": {
+                "default": (cached_randn((2, 2, 100, 64), dtype=torch.float16),),
+            },
+        },
+        ("test_multiple_slices_transpose", "test_multiple_slices_transpose_cpu"): {
+            "param_sets": {
+                "default": (cached_randn((2, 2, 128, 128), dtype=torch.float16),),
+            },
+        },
+        ("test_slice_transpose_slice", "test_slice_transpose_slice_cpu"): {
+            "param_sets": {
+                "default": (cached_randn((2, 2, 128, 64), dtype=torch.float16),),
+            },
+        },
+        ("test_complex_offset_pattern", "test_complex_offset_pattern_cpu"): {
+            "param_sets": {
+                "default": (cached_randn((2, 2, 128, 128), dtype=torch.float16),),
+            },
+        },
+        ("test_4d_unaligned", "test_4d_unaligned_cpu"): {
+            "param_sets": {
+                "default": (cached_randn((2, 3, 100, 64), dtype=torch.float16),),
+            },
+        },
+        ("test_odd_unaligned", "test_odd_unaligned_cpu"): {
+            "param_sets": {
+                "default": (cached_randn((2, 2, 150, 64), dtype=torch.float16),),
+            },
+        },
         ("test_rope_fms", "test_rope_cpu"): {
             "param_sets": {
                 "prefill_bs1": (
@@ -5504,6 +5544,55 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(x):
             return x[:, 1:2, :, :, :] + x[:, :, 2:3, :, :]
 
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+    
+    def test_slice_then_transpose_cpu(self, x):
+        def fn(x):
+            y = x[:, :, 1:66, :]
+            return y.transpose(-2, -1)
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
+    def test_transpose_then_slice_cpu(self, x):
+        def fn(x):
+            y = x.transpose(-2, -1)
+            return y[:, :, :, 1:66]
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
+    def test_slice_unaligned_transpose_cpu(self, x):
+        def fn(x):
+            y = x[:, :, 2:35, :]
+            return y.transpose(-2, -1)
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
+    def test_multiple_slices_transpose_cpu(self, x):
+        def fn(x):
+            y = x[:, :, 5:70, 10:74]
+            return y.transpose(-2, -1)
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
+    def test_slice_transpose_slice_cpu(self, x):
+        def fn(x):
+            y = x[:, :, 2:67, :]
+            z = y.transpose(-2, -1)
+            return z[:, :, :, 5:60]
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
+    def test_complex_offset_pattern_cpu(self, x):
+        def fn(x):
+            y = x[:, :, 7:72, 3:67]
+            return y.transpose(-2, -1)
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
+    def test_4d_unaligned_cpu(self, x):
+        def fn(x):
+            y = x[:, :, 1:34, :]
+            return y.transpose(-2, -1)
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
+    def test_odd_unaligned_cpu(self, x):
+        def fn(x):
+            y = x[:, :, 11:78, :]
+            return y.transpose(-2, -1)
         self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
     def test_rope_cpu(self, q, freqs):

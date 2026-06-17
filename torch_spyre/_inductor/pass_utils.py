@@ -1311,7 +1311,6 @@ def _per_core_view_on_buf(
     return result
 
 
-
 def _patch_env(graph_lowering) -> None:
     """Add view nodes (ReinterpretView) to env from name_to_users."""
     env: dict = {}
@@ -1366,6 +1365,7 @@ def _rebuild_restickify_input(
     object.__setattr__(original_data, "inner_fn", new_inner_fn)
 
     V.graph.name_to_buffer[restickify_op.get_name()] = restickify_op
+
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
     """Insert padding before Restickify operations when needed for stick alignment.
