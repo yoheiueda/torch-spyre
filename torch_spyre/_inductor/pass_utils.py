@@ -1443,7 +1443,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
         if pad == 0:
             continue
-        
+
         logger.info(
             f"Padding {input_dep.name} dim[{new_stick_dim}]: {new_stick_size} -> {new_stick_size + pad}"
         )
@@ -1484,6 +1484,3 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
             operations.insert(restickify_idx + i, new_op)
 
         _rebuild_restickify_input(restickify_op, padded_buf, input_dep.name, operations)
-
-
-

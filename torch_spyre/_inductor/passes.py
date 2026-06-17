@@ -322,7 +322,7 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
-	    insert_restickify_padding,
+            insert_restickify_padding,
             insert_bmm_padding,
             #
             dedup_and_promote_constants,
