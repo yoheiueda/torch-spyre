@@ -20,6 +20,7 @@ from typing import Any, Callable, NamedTuple, Optional, TypeVar, Union
 import torch
 import sympy
 from sympy import Expr
+from torch._inductor import ir
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
@@ -1440,24 +1441,31 @@ def _rebuild_restickify_input(
     old_input_buf: Buffer,
     operations: list[Operation],
 ) -> ComputedBuffer:
-    print(f"_rebuild_restickify_input:")
-    print(f"  Create new loader from padded buffer")
-    print(f"  padded_buf: {padded_buf.get_name()}, size: {[concretize_expr(s) for s in padded_buf.get_size()]}")
-    print(f"  restickify ranges: {restickify_op.data.ranges}")
+    print(f"_rebuild_restickify_input: Rebuilding restickify with padded buffer")
+    print(f"  old input: {old_input_name}, size: {old_input_buf.get_size()}")
+    print(f"  padded_buf: {padded_buf.get_name()}, size: {padded_buf.get_size()}")
+    print(f"  restickify_op ranges: {restickify_op.data.ranges}")
+    print(f"  Swapping last two dimensions in index mapping")
     
-    original_data = restickify_op.data
     padded_loader = padded_buf.make_loader()
     
     def new_inner_fn(index, _loader=padded_loader):
-        return _loader(index)
-
-    object.__setattr__(original_data, "inner_fn", new_inner_fn)
+        remapped_index = [index[0], index[1], index[3], index[2]]
+        print(f"  inner_fn: index={index} -> remapped={remapped_index}")
+        result = _loader(remapped_index)
+        print(f"  inner_fn: result type={type(result)}")
+        if hasattr(result, 'index'):
+            print(f"  inner_fn: result.index={result.index}")
+        return result
     
-    new_op = replace_computed_buffer_body(restickify_op, original_data, operations)
+    new_pointwise = ir.Pointwise(
+        device=restickify_op.data.device,
+        dtype=restickify_op.data.dtype,
+        inner_fn=new_inner_fn,
+        ranges=restickify_op.data.ranges,
+    )
     
-    rw_after = new_op.get_read_writes()
-    print(f"  AFTER: reads from {[r.name for r in rw_after.reads if hasattr(r, 'name')]}")
-    
+    new_op = replace_computed_buffer_body(restickify_op, new_pointwise, operations)
     return new_op
 
 
@@ -1623,20 +1631,20 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         for i, new_op in enumerate(new_ops):
             operations.insert(restickify_idx + i, new_op)
 
-        reads = restickify_op.get_read_writes().reads
-        for read_dep in reads:
-            if read_dep.name == input_dep.name:
-                object.__setattr__(read_dep, 'name', padded_buf.get_name())
-                print(f"  Updated restickify reads: {input_dep.name} -> {padded_buf.get_name()}")
-                break
+        restickify_op = _rebuild_restickify_input(
+            restickify_op, padded_buf, input_dep.name, actual_buf, operations
+        )
         
-        if not hasattr(restickify_op, '_restickify_padding_info'):
-            restickify_op._restickify_padding_info = {
-                'needs_padding': True,
-                'dim_to_pad': new_stick_dim,
-                'original_size': new_stick_size,
-                'padded_size': new_stick_size + pad,
-            }
+        if not hasattr(graph, '_restickify_padded_buffers'):
+            graph._restickify_padded_buffers = {}
+        graph._restickify_padded_buffers[input_dep.name] = padded_buf.get_name()
+        
+        restickify_op._restickify_padding_info = {
+            'needs_padding': True,
+            'dim_to_pad': new_stick_dim,
+            'original_size': new_stick_size,
+            'padded_size': new_stick_size + pad,
+        }
         
         print(f"insert_restickify_padding: DONE")
 
