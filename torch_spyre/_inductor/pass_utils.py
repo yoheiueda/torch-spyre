@@ -284,14 +284,19 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in read_writes.reads:
-        # Indirect deps are index tensors (e.g. gather indices) whose access
-        # pattern is data-dependent; they cannot drive work-division planning.
         if (
             isinstance(arg, MemoryDep)
             and isinstance(arg.index, sympy.Basic)
             and not arg.is_indirect()
         ):
-            buf = V.graph.get_buffer(arg.name)
+            try:
+                buf = V.graph.get_buffer(arg.name)
+            except RuntimeError as e:
+                print(f"ERROR in get_mem_deps_from_rw: {e}")
+                print(f"  Looking for: {arg.name}")
+                print(f"  Available buffers: {list(V.graph.name_to_buffer.keys())}")
+                print(f"  read_writes: {read_writes}")
+                raise
             res.append(SchedNodeArg(arg, _fixed_read_layout(buf)))
     return res
 
@@ -1433,8 +1438,13 @@ def _rebuild_restickify_input(
     padded_buf: Buffer,
     old_input_name: str,
     operations: list[Operation],
-) -> None:
-    """Update the restickify op to read from the padded buffer instead of the original input."""
+) -> ComputedBuffer:
+    print(f"_rebuild_restickify_input:")
+    print(f"  padded_buf name: {padded_buf.get_name()}")
+    print(f"  padded_buf size: {[concretize_expr(s) for s in padded_buf.get_size()]}")
+    print(f"  restickify_op name: {restickify_op.get_name()}")
+    print(f"  restickify_op output size (ranges): {restickify_op.data.ranges}")
+    
     original_data = restickify_op.data
     padded_loader = padded_buf.make_loader()
 
@@ -1442,37 +1452,71 @@ def _rebuild_restickify_input(
         return _loader(index)
 
     object.__setattr__(original_data, "inner_fn", new_inner_fn)
-
-    V.graph.name_to_buffer[restickify_op.get_name()] = restickify_op
+    
+    new_op = replace_computed_buffer_body(restickify_op, original_data, operations)
+    
+    print(f"  new_op read_writes: {new_op.get_read_writes()}")
+    
+    return new_op
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
-    """Insert padding before Restickify operations when needed for stick alignment.
-
-    when transpose swaps non-stick and stick dimensions,
-    the backend assumes both are divisible by stick size. This pass pads the
-    dimension that will become the stick dimension if it's not aligned.
-    """
+    print("=" * 80)
+    print("insert_restickify_padding: STARTING")
+    print("=" * 80)
+    
     operations = graph.operations
 
-    # Find all restickify operations
     restickify_ops = []
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
-        if hasattr(op, "origins") and op.origins:
-            for origin_node in op.origins:
-                if (
-                    hasattr(origin_node, "target")
-                    and hasattr(origin_node.target, "__name__")
-                    and "restickify" in origin_node.target.__name__
-                ):
-                    restickify_ops.append(op)
-                    break
+        
+        layout = op.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            continue
+            
+        data = op.data
+        if not isinstance(data, Pointwise):
+            continue
+        
+        rw = op.get_read_writes()
+        reads = [r for r in rw.reads if hasattr(r, "name")]
+        if len(reads) != 1:
+            continue
+        
+        input_dep = reads[0]
+        input_buf = graph.get_buffer(input_dep.name)
+        if input_buf is None:
+            continue
+        
+        if isinstance(input_buf, TensorBox) and isinstance(input_buf.data, StorageBox):
+            actual_buf = input_buf.data.data
+        else:
+            actual_buf = input_buf
+        
+        input_layout = actual_buf.get_layout()
+        if not isinstance(input_layout, FixedTiledLayout):
+            continue
+        
+        output_stl = layout.device_layout
+        input_stl = input_layout.device_layout
+        
+        input_host_coords = host_coordinates(input_layout, input_dep)
+        output_device_coords = device_coordinates(output_stl, input_dep)
+        
+        in_stick_syms = input_host_coords[-1].free_symbols
+        out_stick_syms = output_device_coords[-1].free_symbols
+        
+        if in_stick_syms != out_stick_syms:
+            restickify_ops.append(op)
+            print(f"insert_restickify_padding: Found restickify candidate: {op.get_name()}")
 
     if not restickify_ops:
+        print("insert_restickify_padding: NO restickify ops found")
         return
 
+    print(f"insert_restickify_padding: Found {len(restickify_ops)} restickify ops")
     logger.info(f"Checking {len(restickify_ops)} restickify ops for padding needs")
 
     for restickify_op in list(restickify_ops):
@@ -1523,12 +1567,21 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         if pad == 0:
             continue
 
+        print(f"insert_restickify_padding: PADDING NEEDED!")
+        print(f"  Buffer: {input_dep.name}")
+        print(f"  Input layout size: {host_size}")
+        print(f"  Input stick dim (current): {input_host_coords[-1]}")
+        print(f"  Output stick dim (new): {new_stick_expr}")
+        print(f"  Dim to pad: {new_stick_dim}")
+        print(f"  Size: {new_stick_size} -> {new_stick_size + pad}")
         logger.info(
             f"Padding {input_dep.name} dim[{new_stick_dim}]: {new_stick_size} -> {new_stick_size + pad}"
         )
 
         padded_size = list(host_size)
         padded_size[new_stick_dim] = new_stick_size + pad
+        
+        print(f"  Padded size will be: {padded_size}")
 
         input_fx_node = _find_arg_fx_node(input_dep.name, host_size)
 
@@ -1555,11 +1608,28 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
                 fill_value=0.0,
             )
         except Exception as e:
+            print(f"insert_restickify_padding: FAILED to insert padding: {e}")
             logger.debug(f"Failed to insert padding: {e}")
             continue
 
+        print(f"insert_restickify_padding: Successfully created {len(new_ops)} padding ops")
+        print(f"  padded_buf (buf1) size: {[concretize_expr(s) for s in padded_buf.get_size()]}")
+        for i, op in enumerate(new_ops):
+            print(f"  new_ops[{i}]: {op.get_name()} - {type(op).__name__}")
+            if hasattr(op, 'get_size'):
+                print(f"    size: {[concretize_expr(s) for s in op.get_size()]}")
+            if isinstance(op, ComputedBuffer):
+                rw = op.get_read_writes()
+                print(f"    reads: {[r.name for r in rw.reads if hasattr(r, 'name')]}")
+        
+        for new_op in new_ops:
+            operations.remove(new_op)
+        
         restickify_idx = operations.index(restickify_op)
         for i, new_op in enumerate(new_ops):
             operations.insert(restickify_idx + i, new_op)
 
+        print(f"insert_restickify_padding: Rebuilding restickify input")
         _rebuild_restickify_input(restickify_op, padded_buf, input_dep.name, operations)
+        print(f"insert_restickify_padding: DONE for this op")
+
