@@ -679,35 +679,38 @@ def _extend_restickify_to_padded(
     sdsc_iteration_space: dict,
     symbol_mapping: dict,
 ) -> None:
-    if not hasattr(op_spec, '_restickify_padding_info'):
+    print(f"_extend_restickify_to_padded: op={op_spec.op}")
+    print(f"  op_info keys: {list(op_spec.op_info.keys())}")
+    
+    info = op_spec.op_info.get('restickify_padding')
+    print(f"  restickify_padding from op_info: {info}")
+    
+    if info is None or not info.get('needs_padding'):
+        print(f"  Skipping (info={info})")
         return
     
-    info = op_spec._restickify_padding_info
-    if not info.get('needs_padding'):
-        return
+    print(f"  PROCESSING")
+    print(f"  sdsc_iteration_space BEFORE: {sdsc_iteration_space}")
     
     input_arg = op_spec.args[0]
-    dim_order, stick_dim = _get_device_dim_order(input_arg, symbol_mapping, op_spec)
-    
-    dim_to_pad = info['dim_to_pad']
-    if dim_to_pad >= len(dim_order):
-        return
-    
-    sym_to_extend = dim_order[dim_to_pad]
-    if sym_to_extend not in sdsc_iteration_space:
-        return
-    
-    current_size = sdsc_iteration_space[sym_to_extend]
+    original_size = info['original_size']
     padded_size = info['padded_size']
     
-    if padded_size > current_size:
-        logger.debug(
-            "_extend_restickify_to_padded: extending dim %s: %d -> %d",
-            sym_to_extend,
-            current_size,
-            padded_size,
-        )
-        sdsc_iteration_space[sym_to_extend] = padded_size
+    print(f"  original={original_size}, padded={padded_size}")
+    
+    for i, coord in enumerate(input_arg.device_coordinates[:-1]):
+        mapped = coord.subs(symbol_mapping)
+        print(f"  coord[{i}]: {coord} -> {mapped}")
+        for sym in mapped.free_symbols:
+            if sym in sdsc_iteration_space:
+                print(f"    {sym}: space={sdsc_iteration_space[sym]}, orig={original_size}")
+                if sdsc_iteration_space[sym] == original_size:
+                    print(f"    MATCH! Extending {sym}: {original_size} -> {padded_size}")
+                    sdsc_iteration_space[sym] = padded_size
+                    print(f"  sdsc_iteration_space AFTER: {sdsc_iteration_space}")
+                    return
+    
+    print(f"  NO MATCH")
 
 
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:

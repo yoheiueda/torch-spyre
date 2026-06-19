@@ -1589,8 +1589,46 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         )
 
         print(f"  restickify ranges (view size): {restickify_op.data.ranges}")
-        print(f"  Strategy: Mark for codegen-time padding (like BMM)")
-        print(f"  Restickify will keep original ranges, codegen will extend iteration space")
+        print(f"  Strategy: Pad input buffer AND extend iteration space in codegen")
+        
+        padded_base_size = list(host_size)
+        padded_base_size[new_stick_dim] = new_stick_size + pad
+        
+        device = actual_buf.get_device()
+        if device is None:
+            continue
+
+        restickify_fx_node = None
+        if hasattr(restickify_op, "origins") and restickify_op.origins:
+            restickify_fx_node = list(restickify_op.origins)[0]
+        if restickify_fx_node is None:
+            continue
+
+        input_fx_node = _find_arg_fx_node(input_dep.name, host_size)
+        
+        try:
+            padded_buf, new_ops = lower_pad_sequence(
+                input_fx_node, padded_base_size, device, dtype,
+                new_stick_dim, restickify_fx_node, orig_stl=input_stl, fill_value=0.0,
+            )
+        except Exception as e:
+            print(f"  FAILED to pad: {e}")
+            continue
+
+        print(f"  Padded buffer: {padded_buf.get_name()}")
+        
+        for new_op in new_ops:
+            operations.remove(new_op)
+        restickify_idx = operations.index(restickify_op)
+        for i, new_op in enumerate(new_ops):
+            operations.insert(restickify_idx + i, new_op)
+
+        reads = restickify_op.get_read_writes().reads
+        for read_dep in reads:
+            if read_dep.name == input_dep.name:
+                object.__setattr__(read_dep, 'name', padded_buf.get_name())
+                print(f"  Updated restickify reads: {input_dep.name} -> {padded_buf.get_name()}")
+                break
         
         if not hasattr(restickify_op, '_restickify_padding_info'):
             restickify_op._restickify_padding_info = {
@@ -1599,9 +1637,8 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
                 'original_size': new_stick_size,
                 'padded_size': new_stick_size + pad,
             }
-            print(f"  Marked restickify for padding: dim {new_stick_dim}, {new_stick_size} -> {new_stick_size + pad}")
         
-        print(f"insert_restickify_padding: DONE (marked for codegen)")
+        print(f"insert_restickify_padding: DONE")
 
 
 

@@ -582,6 +582,11 @@ class SpyreKernel(Kernel[CSEVariable]):
                 if n_output_syms + r < len(it_space_keys)
             ]
 
+        if hasattr(ir_node, '_restickify_padding_info'):
+            op_info = dict(op_info)
+            op_info['restickify_padding'] = ir_node._restickify_padding_info
+            print(f"create_op_spec: Added restickify_padding to op_info: {op_info['restickify_padding']}")
+        
         return OpSpec(
             op,
             is_reduction,
@@ -1009,3 +1014,4 @@ def simplify_op_spec(op_spec):
             if SHARED_WEIGHT_UNIT_BMM_INFO_KEY in op_spec.op_info and old_stride_map:
                 new_stride_map[-1] = old_stride_map[-1]
             arg.stride_map = new_stride_map
+
