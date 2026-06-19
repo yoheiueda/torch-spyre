@@ -1441,27 +1441,15 @@ def _rebuild_restickify_input(
     operations: list[Operation],
 ) -> ComputedBuffer:
     print(f"_rebuild_restickify_input:")
-    print(f"  old_input_buf name: {old_input_name}")
-    print(f"  old_input_buf size: {[concretize_expr(s) for s in old_input_buf.get_size()]}")
-    print(f"  padded_buf name: {padded_buf.get_name()}")
-    print(f"  padded_buf size: {[concretize_expr(s) for s in padded_buf.get_size()]}")
-    print(f"  restickify_op name: {restickify_op.get_name()}")
-    print(f"  restickify_op data.ranges: {restickify_op.data.ranges}")
-    
-    rw_before = restickify_op.get_read_writes()
-    print(f"  BEFORE: reads from {[r.name for r in rw_before.reads if hasattr(r, 'name')]}")
-    
-    from torch_spyre._inductor.insert_restickify import NameSwapHandler
+    print(f"  Create new loader from padded buffer")
+    print(f"  padded_buf: {padded_buf.get_name()}, size: {[concretize_expr(s) for s in padded_buf.get_size()]}")
+    print(f"  restickify ranges: {restickify_op.data.ranges}")
     
     original_data = restickify_op.data
-    orig_inner_fn = original_data.inner_fn
-    name_map = {old_input_name: padded_buf.get_name()}
+    padded_loader = padded_buf.make_loader()
     
-    print(f"  name_map: {name_map}")
-
-    def new_inner_fn(index, _map=name_map, _orig_inner=orig_inner_fn):
-        with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
-            return _orig_inner(index)
+    def new_inner_fn(index, _loader=padded_loader):
+        return _loader(index)
 
     object.__setattr__(original_data, "inner_fn", new_inner_fn)
     
@@ -1469,7 +1457,6 @@ def _rebuild_restickify_input(
     
     rw_after = new_op.get_read_writes()
     print(f"  AFTER: reads from {[r.name for r in rw_after.reads if hasattr(r, 'name')]}")
-    print(f"  AFTER: read index expr: {[r.index for r in rw_after.reads if hasattr(r, 'index')][:1]}")
     
     return new_op
 
@@ -1602,90 +1589,19 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         )
 
         print(f"  restickify ranges (view size): {restickify_op.data.ranges}")
-        print(f"  Need to pad the VIEW's dimension, not the base tensor!")
+        print(f"  Strategy: Mark for codegen-time padding (like BMM)")
+        print(f"  Restickify will keep original ranges, codegen will extend iteration space")
         
-        view_size = [concretize_expr(s) for s in restickify_op.data.ranges]
-        padded_size = list(view_size)
+        if not hasattr(restickify_op, '_restickify_padding_info'):
+            restickify_op._restickify_padding_info = {
+                'needs_padding': True,
+                'dim_to_pad': new_stick_dim,
+                'original_size': new_stick_size,
+                'padded_size': new_stick_size + pad,
+            }
+            print(f"  Marked restickify for padding: dim {new_stick_dim}, {new_stick_size} -> {new_stick_size + pad}")
         
-        print(f"  output_device_coords: {output_device_coords}")
-        print(f"  new_stick_expr: {new_stick_expr}")
-        print(f"  Looking for stick dim in view coordinates...")
-        
-        view_stick_dim = -1
-        for i in range(len(view_size)):
-            if i < len(output_device_coords) and output_device_coords[i] == new_stick_expr:
-                view_stick_dim = i
-                break
-        
-        if view_stick_dim == -1:
-            view_stick_dim = len(view_size) - 1
-            print(f"  Using last dim as stick dim: {view_stick_dim}")
-        else:
-            print(f"  Found stick dim: {view_stick_dim}")
-            
-        print(f"  View size before pad: {view_size}")
-        
-        padded_size[view_stick_dim] = view_size[view_stick_dim] + pad
-        
-        print(f"  Padded VIEW size will be: {padded_size}")
+        print(f"insert_restickify_padding: DONE (marked for codegen)")
 
-        device = actual_buf.get_device()
-        if device is None:
-            continue
-
-        restickify_fx_node = None
-        if hasattr(restickify_op, "origins") and restickify_op.origins:
-            restickify_fx_node = list(restickify_op.origins)[0]
-
-        if restickify_fx_node is None:
-            continue
-        
-        print(f"  restickify_fx_node: {restickify_fx_node}")
-        print(f"  restickify_fx_node.args: {restickify_fx_node.args}")
-        
-        if not restickify_fx_node.args:
-            print(f"  ERROR: restickify node has no args")
-            continue
-            
-        view_fx_node = restickify_fx_node.args[0]
-        print(f"  view_fx_node (input to restickify): {view_fx_node}")
-        print(f"  view_fx_node.target: {view_fx_node.target if hasattr(view_fx_node, 'target') else 'N/A'}")
-
-        try:
-            padded_buf, new_ops = lower_pad_sequence(
-                view_fx_node,
-                padded_size,
-                device,
-                dtype,
-                view_stick_dim,
-                restickify_fx_node,
-                input_stl,
-                fill_value=0.0,
-            )
-        except Exception as e:
-            print(f"insert_restickify_padding: FAILED to insert padding: {e}")
-            logger.debug(f"Failed to insert padding: {e}")
-            continue
-
-        print(f"insert_restickify_padding: Successfully created {len(new_ops)} padding ops")
-        print(f"  padded_buf (buf1) size: {[concretize_expr(s) for s in padded_buf.get_size()]}")
-        for i, op in enumerate(new_ops):
-            print(f"  new_ops[{i}]: {op.get_name()} - {type(op).__name__}")
-            if hasattr(op, 'get_size'):
-                print(f"    size: {[concretize_expr(s) for s in op.get_size()]}")
-            if isinstance(op, ComputedBuffer):
-                rw = op.get_read_writes()
-                print(f"    reads: {[r.name for r in rw.reads if hasattr(r, 'name')]}")
-        
-        for new_op in new_ops:
-            operations.remove(new_op)
-        
-        restickify_idx = operations.index(restickify_op)
-        for i, new_op in enumerate(new_ops):
-            operations.insert(restickify_idx + i, new_op)
-
-        print(f"insert_restickify_padding: Rebuilding restickify input")
-        _rebuild_restickify_input(restickify_op, padded_buf, input_dep.name, actual_buf, operations)
-        print(f"insert_restickify_padding: DONE for this op")
 
 

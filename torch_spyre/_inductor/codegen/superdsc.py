@@ -674,6 +674,42 @@ def _extend_matmul_k_to_padded(
         sdsc_iteration_space[k_sym] = k_padded
 
 
+def _extend_restickify_to_padded(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    if not hasattr(op_spec, '_restickify_padding_info'):
+        return
+    
+    info = op_spec._restickify_padding_info
+    if not info.get('needs_padding'):
+        return
+    
+    input_arg = op_spec.args[0]
+    dim_order, stick_dim = _get_device_dim_order(input_arg, symbol_mapping, op_spec)
+    
+    dim_to_pad = info['dim_to_pad']
+    if dim_to_pad >= len(dim_order):
+        return
+    
+    sym_to_extend = dim_order[dim_to_pad]
+    if sym_to_extend not in sdsc_iteration_space:
+        return
+    
+    current_size = sdsc_iteration_space[sym_to_extend]
+    padded_size = info['padded_size']
+    
+    if padded_size > current_size:
+        logger.debug(
+            "_extend_restickify_to_padded: extending dim %s: %d -> %d",
+            sym_to_extend,
+            current_size,
+            padded_size,
+        )
+        sdsc_iteration_space[sym_to_extend] = padded_size
+
+
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -729,6 +765,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+    
+    if op_spec.op == RESTICKIFY_OP:
+        _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,
@@ -872,3 +911,4 @@ def compile_op_spec(
         tiled_symbols=tiled_symbols,
         use_symbols=use_symbols,
     )
+
