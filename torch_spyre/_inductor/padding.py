@@ -44,7 +44,6 @@ M=1 (decode phase) correctly.
 """
 
 import torch
-from torch._inductor import ir
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
@@ -415,18 +414,49 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         for i, o in enumerate(new_ops):
             operations.insert(idx + i, o)
 
-        # Rewire: build a SliceView over the padded buffer that trims dim
-        # ``new_stick_dim`` back to the original size ``n``, and replace the
-        # restickify body with a Pointwise that loads through the view.
+        # Rewire: replace the restickify body with a Pointwise that loads from
+        # the padded buffer through the same input-axis permutation the
+        # original op used.  perm is recovered from the original read_dep's
+        # per-input-host-dim coordinate expressions: for each input host dim
+        # i, in_host_coords[i] involves exactly one output-iter symbol, which
+        # we map to that input dim's position in the load.
+        #
+        # ``op.data.ranges`` is left at the user's logical output extent
+        # (== ``op.layout.size``) — widening ranges to the stick-padded extent
+        # was tried but inductor's _simplify_loops fuses the widened iter
+        # back, so the OpSpec ends up unwidened anyway.
         padded_tb = TensorBox.create(padded_buf)
-        sliced = ir.SliceView.create(padded_tb, new_stick_dim, 0, n)
-        sliced_loader = sliced.make_loader()
+        padded_loader = padded_tb.make_loader()
 
+        # Recover per-input-dim → output-iter-dim mapping from in_host_coords.
+        # in_host_coords was computed earlier from the original read_dep,
+        # whose iter symbols match the current op.read_writes.
         old_pw = op.data
+        old_iter_syms = list(in_dep.ranges.keys())
+        perm: list[int] = []
+        skip = False
+        for coord in in_host_coords:
+            free = coord.free_symbols
+            picks = [j for j, s in enumerate(old_iter_syms) if s in free]
+            if len(picks) != 1:
+                skip = True
+                break
+            perm.append(picks[0])
+        if skip:
+            logger.warning(
+                "insert_restickify_padding: could not recover permutation "
+                "from in_host_coords=%s; skipping",
+                in_host_coords,
+            )
+            continue
+        assert len(perm) == len(old_pw.ranges)
+
         new_pw = Pointwise(
             device=old_pw.device,
             dtype=old_pw.dtype,
-            inner_fn=lambda index, _loader=sliced_loader: _loader(index),
+            inner_fn=lambda index, _loader=padded_loader, _perm=tuple(perm): (
+                _loader([index[p] for p in _perm])
+            ),
             ranges=old_pw.ranges,
         )
         # Announce intent to the codegen-side classifier: after Inductor's
