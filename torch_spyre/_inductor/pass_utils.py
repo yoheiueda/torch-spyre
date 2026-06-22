@@ -1440,23 +1440,92 @@ def _rebuild_restickify_input(
     old_input_name: str,
     old_input_buf: Buffer,
     operations: list[Operation],
+    dim_to_pad: int,
 ) -> ComputedBuffer:
-    print(f"_rebuild_restickify_input: Rebuilding restickify with padded buffer")
-    print(f"  old input: {old_input_name}, size: {old_input_buf.get_size()}")
-    print(f"  padded_buf: {padded_buf.get_name()}, size: {padded_buf.get_size()}")
-    print(f"  restickify_op ranges: {restickify_op.data.ranges}")
-    print(f"  Swapping last two dimensions in index mapping")
+    print(f"\n{'='*80}")
+    print(f"_rebuild_restickify_input: STARTING")
+    print(f"{'='*80}")
+    print(f"  old input: {old_input_name}")
+    print(f"  old input size: {[concretize_expr(s) for s in old_input_buf.get_size()]}")
+    print(f"  padded_buf: {padded_buf.get_name()}")
+    print(f"  padded_buf size: {[concretize_expr(s) for s in padded_buf.get_size()]}")
+    print(f"  restickify output ranges: {restickify_op.data.ranges}")
+    print(f"  dim_to_pad (in input space): {dim_to_pad}")
+    
+    old_input_layout = old_input_buf.get_layout()
+    padded_layout = padded_buf.get_layout()
+    if isinstance(old_input_layout, FixedTiledLayout) and isinstance(padded_layout, FixedTiledLayout):
+        print(f"\n  Layout details:")
+        print(f"    old input device_layout:")
+        print(f"      device_size: {list(old_input_layout.device_layout.device_size)}")
+        print(f"      stride_map:  {list(old_input_layout.device_layout.stride_map)}")
+        print(f"    padded device_layout:")
+        print(f"      device_size: {list(padded_layout.device_layout.device_size)}")
+        print(f"      stride_map:  {list(padded_layout.device_layout.stride_map)}")
+    
+    old_input_layout = old_input_buf.get_layout()
+    padded_layout = padded_buf.get_layout()
+    
+    input_size = [concretize_expr(s) for s in old_input_layout.size]
+    padded_size = [concretize_expr(s) for s in padded_layout.size]
+    output_ranges = restickify_op.data.ranges
+    
+    print(f"\n  Dimension analysis:")
+    print(f"    input_size:    {input_size}")
+    print(f"    padded_size:   {padded_size}")
+    print(f"    output_ranges: {output_ranges}")
+    
+    input_to_output = {}
+    output_matched = set()
+    
+    for i in range(len(input_size)):
+        best_j = None
+        for j in range(len(output_ranges)):
+            if j in output_matched:
+                continue
+            if input_size[i] == output_ranges[j]:
+                if best_j is None or abs(i - j) < abs(i - best_j):
+                    best_j = j
+        
+        if best_j is not None:
+            input_to_output[i] = best_j
+            output_matched.add(best_j)
+            print(f"    Matched: input[{i}]={input_size[i]} -> output[{best_j}]={output_ranges[best_j]}")
+    
+    print(f"\n  input_to_output mapping: {input_to_output}")
+    
+    transposed_dims = []
+    for i, j in input_to_output.items():
+        if i != j:
+            transposed_dims.append((i, j))
+            print(f"    Transpose detected: input dim {i} -> output dim {j}")
+    
+    swap_a = swap_b = None
+    if len(transposed_dims) == 2:
+        (dim_a, out_a), (dim_b, out_b) = transposed_dims
+        if out_a == dim_b and out_b == dim_a:
+            print(f"\n  ✓ Simple 2-way transpose: swapping dim {dim_a} <-> dim {dim_b}")
+            swap_a, swap_b = dim_a, dim_b
+        else:
+            print(f"\n  ✗ Complex transpose pattern (not simple swap)")
+            print(f"    dim_a={dim_a}->out_a={out_a}, dim_b={dim_b}->out_b={out_b}")
+    elif len(transposed_dims) == 0:
+        print(f"\n  No transpose (identity mapping)")
+    else:
+        print(f"\n  ✗ Unexpected transpose pattern: {len(transposed_dims)} dims transposed")
     
     padded_loader = padded_buf.make_loader()
     
-    def new_inner_fn(index, _loader=padded_loader):
-        remapped_index = [index[0], index[1], index[3], index[2]]
-        print(f"  inner_fn: index={index} -> remapped={remapped_index}")
-        result = _loader(remapped_index)
-        print(f"  inner_fn: result type={type(result)}")
-        if hasattr(result, 'index'):
-            print(f"  inner_fn: result.index={result.index}")
-        return result
+    if swap_a is not None and swap_b is not None:
+        print(f"\n  Creating inner_fn with swap: index[{swap_a}] <-> index[{swap_b}]")
+        def new_inner_fn(index, _loader=padded_loader, _a=swap_a, _b=swap_b):
+            remapped = list(index)
+            remapped[_a], remapped[_b] = remapped[_b], remapped[_a]
+            return _loader(remapped)
+    else:
+        print(f"\n  Creating inner_fn with identity (no swap)")
+        def new_inner_fn(index, _loader=padded_loader):
+            return _loader(index)
     
     new_pointwise = ir.Pointwise(
         device=restickify_op.data.device,
@@ -1466,6 +1535,9 @@ def _rebuild_restickify_input(
     )
     
     new_op = replace_computed_buffer_body(restickify_op, new_pointwise, operations)
+    print(f"{'='*80}")
+    print(f"_rebuild_restickify_input: DONE")
+    print(f"{'='*80}\n")
     return new_op
 
 
@@ -1614,6 +1686,13 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
         input_fx_node = _find_arg_fx_node(input_dep.name, host_size)
         
+        predicted_max_stride = max(input_stl.stride_map) * (new_stick_size + pad) // new_stick_size
+        MAX_SAFE_STRIDE = 100_000_000
+        if predicted_max_stride > MAX_SAFE_STRIDE:
+            print(f"  SKIPPING: Predicted max stride {predicted_max_stride} exceeds safe limit {MAX_SAFE_STRIDE}")
+            print(f"    This would likely cause EAR overflow")
+            continue
+        
         try:
             padded_buf, new_ops = lower_pad_sequence(
                 input_fx_node, padded_base_size, device, dtype,
@@ -1632,7 +1711,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
             operations.insert(restickify_idx + i, new_op)
 
         restickify_op = _rebuild_restickify_input(
-            restickify_op, padded_buf, input_dep.name, actual_buf, operations
+            restickify_op, padded_buf, input_dep.name, actual_buf, operations, new_stick_dim
         )
         
         if not hasattr(graph, '_restickify_padded_buffers'):
@@ -1647,6 +1726,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         }
         
         print(f"insert_restickify_padding: DONE")
+
 
 
 
