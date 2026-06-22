@@ -674,83 +674,6 @@ def _extend_matmul_k_to_padded(
         sdsc_iteration_space[k_sym] = k_padded
 
 
-def _extend_restickify_to_padded(
-    op_spec: OpSpec,
-    sdsc_iteration_space: dict,
-    symbol_mapping: dict,
-) -> None:
-    print(f"_extend_restickify_to_padded: op={op_spec.op}")
-    print(f"  op_info keys: {list(op_spec.op_info.keys())}")
-    
-    info = op_spec.op_info.get('restickify_padding')
-    print(f"  restickify_padding from op_info: {info}")
-    
-    if info is None or not info.get('needs_padding'):
-        print(f"  Skipping (info={info})")
-        return
-    
-    print(f"  PROCESSING")
-    print(f"  sdsc_iteration_space BEFORE: {sdsc_iteration_space}")
-    
-    input_arg = op_spec.args[0]
-    output_arg = op_spec.args[1] if len(op_spec.args) > 1 else None
-    original_size = info['original_size']
-    padded_size = info['padded_size']
-    
-    print(f"  original={original_size}, padded={padded_size}")
-    print(f"  Checking input device_coordinates:")
-    
-    for i, coord in enumerate(input_arg.device_coordinates[:-1]):
-        mapped = coord.subs(symbol_mapping)
-        print(f"    input coord[{i}]: {coord} -> {mapped}")
-        for sym in mapped.free_symbols:
-            if sym in sdsc_iteration_space:
-                print(f"      {sym}: space={sdsc_iteration_space[sym]}, orig={original_size}")
-                if sdsc_iteration_space[sym] == original_size:
-                    print(f"      MATCH! Extending {sym}: {original_size} -> {padded_size}")
-                    sdsc_iteration_space[sym] = padded_size
-                    print(f"  sdsc_iteration_space AFTER: {sdsc_iteration_space}")
-                    print(f"\n  Checking if output device_size needs update:")
-                    if output_arg is not None:
-                        print(f"    output device_size BEFORE: {output_arg.device_size}")
-                        for i, size in enumerate(output_arg.device_size):
-                            old_val = size
-                            if size == (original_size + 63) // 64:
-                                new_val = (padded_size + 63) // 64
-                                print(f"    output device_size[{i}]: {old_val} -> {new_val} (ceil({original_size}/64) -> ceil({padded_size}/64))")
-                            elif size == original_size:
-                                print(f"    output device_size[{i}]: {old_val} -> {padded_size}")
-                    return
-    
-    if output_arg is not None:
-        print(f"  Checking output device_coordinates:")
-        for i, coord in enumerate(output_arg.device_coordinates[:-1]):
-            mapped = coord.subs(symbol_mapping)
-            print(f"    output coord[{i}]: {coord} -> {mapped}")
-            for sym in mapped.free_symbols:
-                if sym in sdsc_iteration_space:
-                    print(f"      {sym}: space={sdsc_iteration_space[sym]}, orig={original_size}")
-                    if sdsc_iteration_space[sym] == original_size:
-                        print(f"      MATCH! Extending {sym}: {original_size} -> {padded_size}")
-                        sdsc_iteration_space[sym] = padded_size
-                        print(f"  sdsc_iteration_space AFTER: {sdsc_iteration_space}")
-                        return
-    
-    print(f"  NO MATCH - trying device_size fallback")
-    print(f"  input device_size: {input_arg.device_size}")
-    for i, size in enumerate(input_arg.device_size[:-1]):
-        if size == padded_size:
-            print(f"    Found padded_size at input device_size[{i}]")
-            for sym, space_size in sdsc_iteration_space.items():
-                if space_size == original_size:
-                    print(f"    Extending {sym}: {original_size} -> {padded_size}")
-                    sdsc_iteration_space[sym] = padded_size
-                    print(f"  sdsc_iteration_space AFTER: {sdsc_iteration_space}")
-                    return
-    
-    print(f"  NO MATCH")
-
-
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -806,9 +729,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
-    
-    if op_spec.op == RESTICKIFY_OP:
-        _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,
@@ -952,5 +872,3 @@ def compile_op_spec(
         tiled_symbols=tiled_symbols,
         use_symbols=use_symbols,
     )
-
-

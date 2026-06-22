@@ -478,6 +478,10 @@ class SpyreKernel(Kernel[CSEVariable]):
         opspec_name: "str | None" = None,
     ) -> TensorArg:
         it_space = iteration_space(self.current_node)
+        # With dynamic=True the host index may contain symbolic strides
+        # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
+        # can correctly isolate each loop variable's contribution.
+
         index = concretize_index(tensor.index, set(it_space.keys()))
         indirect_load_subs = (
             indirect_access_subs_from_kernel(self.indirect_vars)
@@ -491,7 +495,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             index,
             indirect_load_subs,
         )
-        
         tensor_arg = TensorArg(
             is_input,
             -1,
@@ -579,18 +582,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                 if n_output_syms + r < len(it_space_keys)
             ]
 
-        if hasattr(ir_node, '_restickify_padding_info'):
-            op_info = dict(op_info)
-            op_info['restickify_padding'] = ir_node._restickify_padding_info
-            print(f"create_op_spec: restickify_padding={op_info['restickify_padding']}")
-            if len(args) >= 2:
-                input_arg = args[0]
-                output_arg = args[1]
-                print(f"  input_arg device_size: {input_arg.device_size}")
-                print(f"  input_arg device_coords: {input_arg.device_coordinates}")
-                print(f"  output_arg device_size: {output_arg.device_size}")
-                print(f"  output_arg device_coords: {output_arg.device_coordinates}")
-        
         return OpSpec(
             op,
             is_reduction,
@@ -1018,4 +1009,3 @@ def simplify_op_spec(op_spec):
             if SHARED_WEIGHT_UNIT_BMM_INFO_KEY in op_spec.op_info and old_stride_map:
                 new_stride_map[-1] = old_stride_map[-1]
             arg.stride_map = new_stride_map
-

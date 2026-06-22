@@ -44,11 +44,13 @@ M=1 (decode phase) correctly.
 """
 
 import torch
+from torch._inductor import ir
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
     Operation,
+    Pointwise,
     Reduction,
     TensorBox,
 )
@@ -59,12 +61,14 @@ from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
     concretize_expr,
+    device_coordinates,
     find_reduction_var,
     identify_matmul_inputs,
     host_coordinates,
     lower_pad_sequence,
     replace_computed_buffer_body,
 )
+from .views import matching_dim
 from torch_spyre._C import get_elem_in_stick
 
 logger = get_inductor_logger("padding")
@@ -297,3 +301,142 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         # x is left entirely untouched: the original inner_fn's x loader is
         # preserved as-is.  Only y's loader is replaced with the padded buffer.
         _rebuild_matmul(op, y_padded_buf, operations)
+
+
+# --------------------------------------------------------------------------- #
+# insert_restickify_padding                                                   #
+# --------------------------------------------------------------------------- #
+
+
+def _restickify_input_dep(op: Operation, graph: GraphLowering):
+    """Return (in_dep, in_buf, in_layout) when ``op`` is a ComputedBuffer
+    whose layout swaps the stick dimension relative to its single input.
+    Returns None otherwise.
+
+    A "restickify" here is identified structurally: a single-input pointwise
+    copy whose input's within-stick host coord uses a different symbol than
+    the output's within-stick device coord.  This catches both the explicit
+    ``torch.ops.spyre.restickify`` FX op (inserted by ``insert_restickify``)
+    and the fused permute+clone ComputedBuffer that lowers to ReStickifyOpHBM
+    directly.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return None
+    out_layout = op.get_layout()
+    if not isinstance(out_layout, FixedTiledLayout):
+        return None
+    from torch._inductor.ir import Pointwise as _Pointwise
+
+    if not isinstance(op.data, _Pointwise):
+        return None
+
+    rw = op.get_read_writes()
+    reads = [r for r in rw.reads if hasattr(r, "name")]
+    if len(reads) != 1:
+        return None
+    in_dep = reads[0]
+
+    in_buf = graph.get_buffer(in_dep.name)
+    if in_buf is None:
+        return None
+    in_layout = in_buf.get_layout()
+    if not isinstance(in_layout, FixedTiledLayout):
+        return None
+
+    in_host_coords = host_coordinates(in_layout, in_dep)
+    out_dev_coords = device_coordinates(out_layout.device_layout, in_dep)
+    if in_host_coords[-1].free_symbols == out_dev_coords[-1].free_symbols:
+        return None
+    return in_dep, in_buf, in_layout
+
+
+def insert_restickify_padding(graph: GraphLowering) -> None:
+    """Zero-pad a Restickify's input buffer when the dim that becomes the new
+    stick dim is not a multiple of the stick size.
+
+    Without padding, the codegen widens the SDSC iteration space to a stick
+    boundary (#2112) and reads ceil(N/stick) sticks from the input — the tail
+    of the last stick contains uninitialized HBM, which the Restickify writes
+    into the output's stick layout, producing the mismatch tracked by #1756.
+
+    Strategy: insert a stick-aligned, zero-filled copy of the input ahead of
+    the Restickify (lower_pad_sequence) and rewrite the Restickify body to
+    load from the padded buffer.  The Restickify's ranges, layout, and
+    device_layout are NOT touched — they already describe the padded
+    iteration correctly via #2112's ceil-div + backGap path.
+    """
+    operations = graph.operations
+    for op in list(operations):
+        match = _restickify_input_dep(op, graph)
+        if match is None:
+            continue
+        in_dep, in_buf, in_layout = match
+
+        out_layout = op.get_layout()
+        in_host_coords = host_coordinates(in_layout, in_dep)
+        out_dev_coords = device_coordinates(out_layout.device_layout, in_dep)
+        # The dim becoming a stick on the output, expressed in input host axes.
+        new_stick_dim = matching_dim(in_host_coords, out_dev_coords[-1])
+        if new_stick_dim is None:
+            continue
+
+        host_size = [concretize_expr(s) for s in in_layout.size]
+        dtype = in_layout.dtype
+        n = host_size[new_stick_dim]
+        pad = compute_padding(n, dtype)
+        if pad == 0:
+            continue
+
+        device = in_buf.get_device()
+        if device is None:
+            continue
+
+        padded_size = list(host_size)
+        padded_size[new_stick_dim] = n + pad
+
+        in_fx = _find_arg_fx_node(in_dep.name)
+        restick_fx = next(iter(op.origins))
+        padded_buf, new_ops = lower_pad_sequence(
+            in_fx,
+            padded_size=padded_size,
+            device=device,
+            dtype=dtype,
+            dim=new_stick_dim,
+            insert_before=restick_fx,
+            orig_stl=in_layout.device_layout,
+            fill_value=0.0,
+        )
+
+        # Move pad ops to just before the restickify (lower_pad_sequence appends).
+        for o in new_ops:
+            operations.remove(o)
+        idx = operations.index(op)
+        for i, o in enumerate(new_ops):
+            operations.insert(idx + i, o)
+
+        # Rewire: build a SliceView over the padded buffer that trims dim
+        # ``new_stick_dim`` back to the original size ``n``, and replace the
+        # restickify body with a Pointwise that loads through the view.
+        # The view keeps the padded buffer's host strides — so iteration over
+        # the original ranges still produces correct flat offsets — while the
+        # underlying allocation has zero-filled tail elements that #2112's
+        # codegen reads when it widens the SDSC iteration to a stick boundary.
+        padded_tb = TensorBox.create(padded_buf)
+        sliced = ir.SliceView.create(padded_tb, new_stick_dim, 0, n)
+        sliced_loader = sliced.make_loader()
+
+        old_pw = op.data
+        new_pw = Pointwise(
+            device=old_pw.device,
+            dtype=old_pw.dtype,
+            inner_fn=lambda index, _loader=sliced_loader: _loader(index),
+            ranges=old_pw.ranges,
+        )
+        replace_computed_buffer_body(op, new_pw, operations)
+        logger.info(
+            "insert_restickify_padding: padded %s dim[%d]: %d -> %d",
+            in_dep.name,
+            new_stick_dim,
+            n,
+            n + pad,
+        )
