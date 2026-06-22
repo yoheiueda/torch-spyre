@@ -65,6 +65,7 @@ from .pass_utils import (
     find_reduction_var,
     identify_matmul_inputs,
     host_coordinates,
+    lower_pad_preserve_layout,
     lower_pad_sequence,
     replace_computed_buffer_body,
 )
@@ -396,7 +397,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
         in_fx = _find_arg_fx_node(in_dep.name)
         restick_fx = next(iter(op.origins))
-        padded_buf, new_ops = lower_pad_sequence(
+        padded_buf, new_ops = lower_pad_preserve_layout(
             in_fx,
             padded_size=padded_size,
             device=device,
@@ -417,10 +418,6 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         # Rewire: build a SliceView over the padded buffer that trims dim
         # ``new_stick_dim`` back to the original size ``n``, and replace the
         # restickify body with a Pointwise that loads through the view.
-        # The view keeps the padded buffer's host strides — so iteration over
-        # the original ranges still produces correct flat offsets — while the
-        # underlying allocation has zero-filled tail elements that #2112's
-        # codegen reads when it widens the SDSC iteration to a stick boundary.
         padded_tb = TensorBox.create(padded_buf)
         sliced = ir.SliceView.create(padded_tb, new_stick_dim, 0, n)
         sliced_loader = sliced.make_loader()
@@ -432,6 +429,15 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
             inner_fn=lambda index, _loader=sliced_loader: _loader(index),
             ranges=old_pw.ranges,
         )
+        # Announce intent to the codegen-side classifier: after Inductor's
+        # _apply_loop_reordering runs, the iter-axis ordering of this op may
+        # collapse so input/output device coords share the same free symbol
+        # on the within-stick axis, defeating the structural detection in
+        # spyre_kernel.py. The tag preserves RESTICKIFY_OP classification so
+        # #2112's ceil-div + backGap padded-read path stays gated correctly.
+        # Set BEFORE replace_computed_buffer_body so copy_op_metadata carries
+        # the attribute onto the replacement ComputedBuffer.
+        op._spyre_force_restickify = True
         replace_computed_buffer_body(op, new_pw, operations)
         logger.info(
             "insert_restickify_padding: padded %s dim[%d]: %d -> %d",

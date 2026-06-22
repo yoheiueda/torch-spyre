@@ -713,6 +713,14 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op = IDENTITY_OP
             elif in_coords[-1].free_symbols != out_coords[-1].free_symbols:
                 op = RESTICKIFY_OP
+            elif getattr(self.current_node.node, "_spyre_force_restickify", False):
+                # insert_restickify_padding rewired this op to read a padded
+                # buffer; the iter-axis reorder that follows can collapse the
+                # input/output free_symbol distinction even though the op is
+                # still semantically a restickify. The pass announces intent
+                # via this attribute so #2112's RESTICKIFY-gated padded read
+                # path stays armed.
+                op = RESTICKIFY_OP
             else:
                 op = IDENTITY_OP
             op_spec = self.create_op_spec(op, False, args, op_info)
