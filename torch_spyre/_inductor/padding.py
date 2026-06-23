@@ -436,9 +436,9 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         out_stride = [int(concretize_expr(s)) for s in op.get_layout().stride]
         view_size = list(padded_buf.get_layout().size)
 
-        # Row-major strides in op.layout's dim priority (descending stride =
-        # outermost first).  padded_buf's own strides mirror the input's dim
-        # arrangement; the view overrides that with the output's.
+        # Contiguous strides that follow op.layout's dim priority (descending
+        # stride = outermost first).  padded_buf's own strides mirror the
+        # input's dim arrangement; the view overrides that with the output's.
         dim_order = sorted(range(len(out_stride)), key=lambda i: -out_stride[i])
         view_stride = [0] * len(view_size)
         running = 1
@@ -467,10 +467,3 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
             ranges=old_pw.ranges,
         )
         replace_computed_buffer_body(op, new_pw, operations)
-        logger.info(
-            "insert_restickify_padding: padded %s dim[%d]: %d -> %d",
-            in_dep.name,
-            new_stick_dim,
-            n,
-            n + pad,
-        )
