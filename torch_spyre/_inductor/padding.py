@@ -461,14 +461,11 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         # the view's non-canonical stride vector resolved via ``make_loader``.
         # See ``insert_restickify_padding_analysis.md`` §3.
         #
-        # The permutation we need is already encoded in ``op.layout``: its
-        # ``size`` and ``stride`` describe a view onto the input view's
-        # storage with the same axis ordering the clone preserved.  We reuse
-        # that pattern by (a) finding the output axis whose extent matches
-        # the input's padded host dim (= the within-stick axis on the
-        # output's view onto input), (b) bumping that axis's extent from
-        # ``host_size[new_stick_dim]`` to ``padded_size[new_stick_dim]``,
-        # and (c) rescaling neighboring strides.
+        # ``_restickify_input_dep`` guarantees ``in_host_size ==
+        # out_host_size``, so the host axis we padded on the input
+        # (``new_stick_dim``) is the same axis index on the output's view.
+        # We bump that axis's extent from ``host_size[new_stick_dim]`` to
+        # ``padded_size[new_stick_dim]`` and recompute strides.
         #
         # ``op.data.ranges`` stays at the user's logical output extent
         # (== ``op.layout.size``); widening ranges to the stick-padded extent
@@ -479,23 +476,8 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         out_size = [int(concretize_expr(s)) for s in op.get_layout().size]
         out_stride = [int(concretize_expr(s)) for s in op.get_layout().stride]
 
-        # The output axis corresponding to the input's padded host dim is the
-        # one whose extent matches the input's pre-pad extent at new_stick_dim.
-        # ``op.layout`` already encodes the permutation that mapped input
-        # host axes to output host axes; we just need the index.
-        orig_extent = host_size[new_stick_dim]
         padded_extent = padded_size[new_stick_dim]
-        out_axis_candidates = [i for i, s in enumerate(out_size) if s == orig_extent]
-        if len(out_axis_candidates) != 1:
-            logger.warning(
-                "insert_restickify_padding: could not locate output axis for "
-                "input dim %d (extent=%d, out_size=%s); skipping",
-                new_stick_dim,
-                orig_extent,
-                out_size,
-            )
-            continue
-        out_padded_axis = out_axis_candidates[0]
+        out_padded_axis = new_stick_dim
 
         # Build the view: bump out_size at the padded axis, then recompute
         # strides in the same axis-order as op.layout (dim_order = axes
