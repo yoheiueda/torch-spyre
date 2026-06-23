@@ -60,12 +60,12 @@ from .constants import BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
+    _build_layout_preserving_padded_stl,
     concretize_expr,
     concretize_index,
     find_reduction_var,
     host_coordinates,
     identify_matmul_inputs,
-    lower_pad_preserve_layout,
     lower_pad_sequence,
     replace_computed_buffer_body,
 )
@@ -408,7 +408,10 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
         in_fx = _find_arg_fx_node(in_dep.name)
         restick_fx = next(iter(op.origins))
-        padded_buf, new_ops = lower_pad_preserve_layout(
+        padded_stl = _build_layout_preserving_padded_stl(
+            in_fx, padded_size, new_stick_dim, in_layout.device_layout
+        )
+        padded_buf, new_ops = lower_pad_sequence(
             in_fx,
             padded_size=padded_size,
             device=device,
@@ -417,6 +420,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
             insert_before=restick_fx,
             orig_stl=in_layout.device_layout,
             fill_value=0.0,
+            padded_stl=padded_stl,
         )
 
         # Move pad ops to just before the restickify (lower_pad_sequence appends).
