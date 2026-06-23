@@ -48,9 +48,11 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
+    FixedLayout,
     Operation,
     Pointwise,
     Reduction,
+    ReinterpretView,
     TensorBox,
 )
 from torch._inductor.virtualized import V
@@ -414,49 +416,76 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         for i, o in enumerate(new_ops):
             operations.insert(idx + i, o)
 
-        # Rewire: replace the restickify body with a Pointwise that loads from
-        # the padded buffer through the same input-axis permutation the
-        # original op used.  perm is recovered from the original read_dep's
-        # per-input-host-dim coordinate expressions: for each input host dim
-        # i, in_host_coords[i] involves exactly one output-iter symbol, which
-        # we map to that input dim's position in the load.
+        # Rewire: replace the restickify body with a Pointwise whose loader
+        # reads ``padded_buf`` through a ReinterpretView that mirrors the
+        # original input view's stride pattern.  This is the same idiom
+        # Inductor uses for vanilla slice/transpose: the buffer keeps its
+        # canonical PyTorch strides; the load address pattern is encoded in
+        # the view's non-canonical stride vector resolved via ``make_loader``.
+        # See ``insert_restickify_padding_analysis.md`` §3.
         #
-        # ``op.data.ranges`` is left at the user's logical output extent
-        # (== ``op.layout.size``) — widening ranges to the stick-padded extent
+        # The permutation we need is already encoded in ``op.layout``: its
+        # ``size`` and ``stride`` describe a view onto the input view's
+        # storage with the same axis ordering the clone preserved.  We reuse
+        # that pattern by (a) finding the output axis whose extent matches
+        # the input's padded host dim (= the within-stick axis on the
+        # output's view onto input), (b) bumping that axis's extent from
+        # ``host_size[new_stick_dim]`` to ``padded_size[new_stick_dim]``,
+        # and (c) rescaling neighboring strides.
+        #
+        # ``op.data.ranges`` stays at the user's logical output extent
+        # (== ``op.layout.size``); widening ranges to the stick-padded extent
         # was tried but inductor's _simplify_loops fuses the widened iter
         # back, so the OpSpec ends up unwidened anyway.
-        padded_tb = TensorBox.create(padded_buf)
-        padded_loader = padded_tb.make_loader()
-
-        # Recover per-input-dim → output-iter-dim mapping from in_host_coords.
-        # in_host_coords was computed earlier from the original read_dep,
-        # whose iter symbols match the current op.read_writes.
         old_pw = op.data
-        old_iter_syms = list(in_dep.ranges.keys())
-        perm: list[int] = []
-        skip = False
-        for coord in in_host_coords:
-            free = coord.free_symbols
-            picks = [j for j, s in enumerate(old_iter_syms) if s in free]
-            if len(picks) != 1:
-                skip = True
-                break
-            perm.append(picks[0])
-        if skip:
+
+        out_size = [int(concretize_expr(s)) for s in op.get_layout().size]
+        out_stride = [int(concretize_expr(s)) for s in op.get_layout().stride]
+
+        # The output axis corresponding to the input's padded host dim is the
+        # one whose extent matches the input's pre-pad extent at new_stick_dim.
+        # ``op.layout`` already encodes the permutation that mapped input
+        # host axes to output host axes; we just need the index.
+        orig_extent = host_size[new_stick_dim]
+        padded_extent = padded_size[new_stick_dim]
+        out_axis_candidates = [i for i, s in enumerate(out_size) if s == orig_extent]
+        if len(out_axis_candidates) != 1:
             logger.warning(
-                "insert_restickify_padding: could not recover permutation "
-                "from in_host_coords=%s; skipping",
-                in_host_coords,
+                "insert_restickify_padding: could not locate output axis for "
+                "input dim %d (extent=%d, out_size=%s); skipping",
+                new_stick_dim,
+                orig_extent,
+                out_size,
             )
             continue
-        assert len(perm) == len(old_pw.ranges)
+        out_padded_axis = out_axis_candidates[0]
+
+        # Build the view: bump out_size at the padded axis, then recompute
+        # strides in the same axis-order as op.layout (dim_order = axes
+        # sorted by descending stride, outermost first).
+        view_size = list(out_size)
+        view_size[out_padded_axis] = padded_extent
+        dim_order = sorted(range(len(out_stride)), key=lambda i: -out_stride[i])
+        view_stride = [0] * len(view_size)
+        running = 1
+        for ax in reversed(dim_order):
+            view_stride[ax] = running
+            running *= view_size[ax]
+
+        view_layout = FixedLayout(
+            device,
+            dtype,
+            size=view_size,
+            stride=view_stride,
+            offset=0,
+        )
+        view = ReinterpretView(data=padded_buf, layout=view_layout)
+        view_loader = view.make_loader()
 
         new_pw = Pointwise(
             device=old_pw.device,
             dtype=old_pw.dtype,
-            inner_fn=lambda index, _loader=padded_loader, _perm=tuple(perm): (
-                _loader([index[p] for p in _perm])
-            ),
+            inner_fn=lambda index, _loader=view_loader: _loader(index),
             ranges=old_pw.ranges,
         )
         # Announce intent to the codegen-side classifier: after Inductor's
