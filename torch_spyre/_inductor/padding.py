@@ -310,27 +310,11 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
 
 def _within_stick_host_dim(layout: FixedTiledLayout, dep) -> int | None:
-    """Return the host-axis index that ``layout``'s STL places within a stick.
+    """Return the host dim that ``layout``'s STL places within a stick.
 
-    Computes host- and device-side coordinates for ``(layout, dep)`` — which
-    must be the layout and a dep of the same buffer — and asks
-    ``matching_dim`` which host axis carries the within-stick device
-    coordinate (always the last entry of ``device_coords``).  Same idiom as
-    :func:`compute_restickify_target_layout` (``old_sd = matching_dim(ic,
-    idc[-1])``) and ``_pick_stick_dim`` in propagate_layouts.
-
-    Calls ``compute_coordinates`` directly rather than ``device_coordinates``
-    because the latter asserts (via ``_check_stick_expr_supported``) that the
-    stick coord is a single-variable form ``Mod(v, elems_per_stick)``,
-    bare-var, or zero — which is the contract for buffers that survive into
-    codegen.  Restickify's input buffer is precisely the place where the
-    stick coord may not yet be in that canonical form (the whole point of the
-    pass is to insert padding so a downstream restickify can produce one),
-    and we only need ``matching_dim`` here, which doesn't require the
-    canonical form: it returns ``None`` if no host axis matches, which is the
-    correct signal for our predicate to skip.
-
-    Returns ``None`` if the match is not unique.
+    Returns ``None`` if no host dim uniquely matches.  ``compute_coordinates``
+    is used directly instead of ``device_coordinates`` to skip the latter's
+    canonical-form assertion, which need not hold on a restickify input.
     """
     host_coords = host_coordinates(layout, dep)
     stl = layout.device_layout
@@ -342,18 +326,13 @@ def _within_stick_host_dim(layout: FixedTiledLayout, dep) -> int | None:
 
 
 def _restickify_input_dep(op: Operation, graph: GraphLowering):
-    """Return (in_dep, in_buf, in_layout, new_stick_dim) when ``op`` is a
-    ComputedBuffer that restickifies its single input — i.e. a pointwise
-    same-shape copy whose output STL puts a different host axis within the
-    stick than the input's STL does.  Returns ``None`` otherwise.
+    """Return ``(in_dep, in_buf, in_layout, new_stick_dim)`` when ``op`` is a
+    same-shape pointwise copy whose output STL puts a different host dim
+    within the stick than the input's STL does, else ``None``.
 
-    Restricting to ops whose input and output buffers share the same logical
-    host shape is what makes "the input's within-stick host axis" and "the
-    output's within-stick host axis" comparable as the same axis.  This
-    catches both the explicit ``torch.ops.spyre.restickify`` FX op (inserted
-    by ``insert_restickify``) and the fused permute+clone ComputedBuffer that
-    lowers to ReStickifyOpHBM directly, and naturally excludes
-    flatten/slice/reduce ops whose output buffers have a different host shape.
+    The same-host-shape requirement is what makes the input's and output's
+    within-stick host dims comparable as the same dim, and naturally excludes
+    flatten/slice/reduce ops.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -376,10 +355,6 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     if not isinstance(in_layout, FixedTiledLayout):
         return None
 
-    # A stick-swap copy preserves the buffer's logical host shape; only the
-    # device-side stick assignment changes.  Differing shapes (slice, flatten,
-    # reduce, ...) make the within-stick host axes incomparable as the same
-    # axis, so the predicate cannot meaningfully fire.
     in_host_size = [concretize_expr(s) for s in in_layout.size]
     out_host_size = [concretize_expr(s) for s in out_layout.size]
     if in_host_size != out_host_size:
@@ -396,19 +371,20 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
-    """Zero-pad a Restickify's input buffer when the dim that becomes the new
-    stick dim is not a multiple of the stick size.
+    """Zero-pad a Restickify's input along the dim that becomes the new
+    stick dim, when its extent is not a multiple of the stick size.
 
-    Without padding, the codegen widens the SDSC iteration space to a stick
-    boundary (#2112) and reads ceil(N/stick) sticks from the input — the tail
-    of the last stick contains uninitialized HBM, which the Restickify writes
-    into the output's stick layout, producing the mismatch tracked by #1756.
+    Without padding, codegen widens the SDSC iteration space to a stick
+    boundary and reads ceil(N/stick) sticks from the input — the tail of the
+    last stick contains uninitialized HBM, which the Restickify writes into
+    the output's stick layout, producing a value mismatch.
 
     Strategy: insert a stick-aligned, zero-filled copy of the input ahead of
     the Restickify (lower_pad_sequence) and rewrite the Restickify body to
-    load from the padded buffer.  The Restickify's ranges, layout, and
+    load from the padded buffer through a ReinterpretView that mirrors the
+    original output's stride pattern.  The Restickify's ranges, layout, and
     device_layout are NOT touched — they already describe the padded
-    iteration correctly via #2112's ceil-div + backGap path.
+    iteration correctly via the ceil-div + backGap path.
     """
     operations = graph.operations
     for op in list(operations):
@@ -451,63 +427,35 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         for i, o in enumerate(new_ops):
             operations.insert(idx + i, o)
 
-        # Rewire: replace the restickify body with a Pointwise whose loader
-        # reads ``padded_buf`` through a ReinterpretView that mirrors the
-        # original input view's stride pattern.  This is the same idiom
-        # Inductor uses for vanilla slice/transpose: the buffer keeps its
-        # canonical PyTorch strides; the load address pattern is encoded in
-        # the view's non-canonical stride vector resolved via ``make_loader``.
-        # See ``insert_restickify_padding_analysis.md`` §3.
-        #
-        # ``_restickify_input_dep`` guarantees ``in_host_size ==
-        # out_host_size``, so the host axis we padded on the input
-        # (``new_stick_dim``) is the same axis index on the output's view.
-        # We bump that axis's extent from ``host_size[new_stick_dim]`` to
-        # ``padded_size[new_stick_dim]`` and recompute strides.
-        #
-        # ``op.data.ranges`` stays at the user's logical output extent
-        # (== ``op.layout.size``); widening ranges to the stick-padded extent
-        # was tried but inductor's _simplify_loops fuses the widened iter
-        # back, so the OpSpec ends up unwidened anyway.
+        # Replace the restickify body with a Pointwise that reads padded_buf
+        # through a ReinterpretView mirroring the original output's stride
+        # pattern.  Same idiom Inductor uses for slice/transpose: the buffer
+        # keeps its canonical strides; the load address pattern lives in the
+        # view's stride vector resolved via make_loader.
         old_pw = op.data
-
         out_stride = [int(concretize_expr(s)) for s in op.get_layout().stride]
-
-        # ``_restickify_input_dep`` enforces ``in_host_size == out_host_size``,
-        # so the padded shape on ``padded_buf`` is also the view's host shape.
         view_size = list(padded_buf.get_layout().size)
 
-        # Recompute row-major strides in op.layout's axis priority (descending
-        # stride = outermost first).  ``padded_buf``'s own strides mirror the
-        # *input*'s axis arrangement; the view overrides that with the
-        # output's, which is what makes this a restickify-shaped read.
+        # Row-major strides in op.layout's dim priority (descending stride =
+        # outermost first).  padded_buf's own strides mirror the input's dim
+        # arrangement; the view overrides that with the output's.
         dim_order = sorted(range(len(out_stride)), key=lambda i: -out_stride[i])
         view_stride = [0] * len(view_size)
         running = 1
-        for ax in reversed(dim_order):
-            view_stride[ax] = running
-            running *= view_size[ax]
+        for dim in reversed(dim_order):
+            view_stride[dim] = running
+            running *= view_size[dim]
 
-        # The view is a transposed reinterpretation of ``padded_buf``.  Use
-        # FixedTiledLayout (not plain FixedLayout) for type uniformity with the
-        # rest of the post-pre-scheduling graph: every other layout there is
-        # tiled with a concrete device_layout, and any layout-aware downstream
-        # consumer would silently fall back to the wrapped buffer's STL on a
-        # plain FixedLayout view.
-        #
-        # The STL is paired with the *physical* buffer, not with the host
-        # view: address calculation uses the wrapped buffer's strides, and
-        # ``make_loader`` resolves the view's stride pattern against that
-        # physical layout.  ``padded_buf``'s STL was already built by
-        # ``_build_layout_preserving_padded_stl`` to be the input's STL with
-        # the matching device_size entry bumped — exactly what we need.
-        view_stl = padded_buf.get_layout().device_layout
+        # FixedTiledLayout (not FixedLayout) for type uniformity: every other
+        # post-pre-scheduling layout is tiled.  The STL pairs with the
+        # physical buffer, and padded_buf's STL was already bumped by
+        # _build_layout_preserving_padded_stl to match the padded extent.
         view_layout = FixedTiledLayout(
             device,
             dtype,
             size=view_size,
             stride=view_stride,
-            device_layout=view_stl,
+            device_layout=padded_buf.get_layout().device_layout,
         )
         view = ReinterpretView(data=padded_buf, layout=view_layout)
         view_loader = view.make_loader()
