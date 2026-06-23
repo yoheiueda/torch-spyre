@@ -360,9 +360,7 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     out_layout = op.get_layout()
     if not isinstance(out_layout, FixedTiledLayout):
         return None
-    from torch._inductor.ir import Pointwise as _Pointwise
-
-    if not isinstance(op.data, _Pointwise):
+    if not isinstance(op.data, Pointwise):
         return None
 
     rw = op.get_read_writes()
