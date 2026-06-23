@@ -326,9 +326,9 @@ def _within_stick_host_dim(layout: FixedTiledLayout, dep) -> int | None:
 
 
 def _restickify_input_dep(op: Operation, graph: GraphLowering):
-    """Return ``(in_dep, in_buf, in_layout, new_stick_dim)`` when ``op`` is a
-    same-shape pointwise copy whose output STL puts a different host dim
-    within the stick than the input's STL does, else ``None``.
+    """Return ``(in_dep, in_buf, in_layout, host_size, new_stick_dim)`` when
+    ``op`` is a same-shape pointwise copy whose output STL puts a different
+    host dim within the stick than the input's STL does, else ``None``.
 
     The same-host-shape requirement is what makes the input's and output's
     within-stick host dims comparable as the same dim, and naturally excludes
@@ -367,7 +367,7 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
         return None
     if in_stick_dim == out_stick_dim:
         return None
-    return in_dep, in_buf, in_layout, out_stick_dim
+    return in_dep, in_buf, in_layout, in_host_size, out_stick_dim
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
@@ -391,9 +391,8 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         match = _restickify_input_dep(op, graph)
         if match is None:
             continue
-        in_dep, in_buf, in_layout, new_stick_dim = match
+        in_dep, in_buf, in_layout, host_size, new_stick_dim = match
 
-        host_size = [concretize_expr(s) for s in in_layout.size]
         dtype = in_layout.dtype
         n = host_size[new_stick_dim]
         pad = compute_padding(n, dtype)
@@ -446,10 +445,9 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
             view_stride[dim] = running
             running *= view_size[dim]
 
-        # FixedTiledLayout (not FixedLayout) for type uniformity: every other
-        # post-pre-scheduling layout is tiled.  The STL pairs with the
-        # physical buffer, and padded_buf's STL was already bumped by
-        # _build_layout_preserving_padded_stl to match the padded extent.
+        # FixedTiledLayout to match the surrounding tiled-layout invariant.
+        # The STL pairs with the physical buffer; padded_buf's STL was already
+        # bumped by _build_layout_preserving_padded_stl to the padded extent.
         view_layout = FixedTiledLayout(
             device,
             dtype,
