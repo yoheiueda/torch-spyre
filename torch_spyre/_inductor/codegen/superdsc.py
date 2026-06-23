@@ -674,6 +674,49 @@ def _extend_matmul_k_to_padded(
         sdsc_iteration_space[k_sym] = k_padded
 
 
+def _extend_restickify_to_padded(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    """Extend sdsc_iteration_space[stick_sym] to a stick boundary for restickify ops.
+
+    A restickify reshapes a buffer's stick layout, so it has two relevant stick
+    dims: the input's old stick and the output's new stick.  Either may be the
+    iter symbol whose extent is unaligned (e.g. when the user-visible output
+    extent on the new stick dim is not a multiple of the stick size).
+
+    For each arg, identify the iter symbol driving its within-stick coordinate
+    (the only free symbol of ``device_coordinates[-1]`` after symbol_mapping)
+    and round up ``sdsc_iteration_space[stick_sym]`` to the next stick boundary.
+    Running before ``_create_sdsc_tensors`` ensures:
+
+    - The arg whose stick is the unaligned iter has dev_dim_size==it_dim_size on
+      the within-stick axis → backGap branch never fires.
+    - The other arg, which sees the same iter symbol on a *non-stick* device dim
+      (e.g. an outer split) with dev_dim_size already at the padded extent, gets
+      strides computed against the padded extent → no stale-stride mismatch with
+      the post-`_create_sdsc_tensors` widening done by `_get_padded_iteration_space`.
+
+    This is the restickify analogue of `_extend_matmul_k_to_padded`.
+    """
+    for arg in op_spec.args:
+        _, stick_sym = _get_device_dim_order(arg, symbol_mapping)
+        if stick_sym is None or stick_sym not in sdsc_iteration_space:
+            continue
+        stick_size = arg.device_dtype.elems_per_stick()
+        cur = sdsc_iteration_space[stick_sym]
+        padded = ((cur + stick_size - 1) // stick_size) * stick_size
+        if padded > cur:
+            logger.debug(
+                "_extend_restickify_to_padded: extending %s %d -> %d",
+                stick_sym,
+                cur,
+                padded,
+            )
+            sdsc_iteration_space[stick_sym] = padded
+
+
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -729,6 +772,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+    elif op_spec.op == RESTICKIFY_OP:
+        _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,

@@ -48,7 +48,6 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
-    FixedLayout,
     Operation,
     Pointwise,
     Reduction,
@@ -71,7 +70,7 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import matching_dim
-from torch_spyre._C import get_elem_in_stick
+from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 
 logger = get_inductor_logger("padding")
 
@@ -472,12 +471,26 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
             view_stride[ax] = running
             running *= view_size[ax]
 
-        view_layout = FixedLayout(
+        # The view is a transposed reinterpretation of ``padded_buf``.  Use
+        # FixedTiledLayout (not plain FixedLayout) for type uniformity with the
+        # rest of the post-pre-scheduling graph: every other layout there is
+        # tiled with a concrete device_layout, and any layout-aware downstream
+        # consumer would silently fall back to the wrapped buffer's STL on a
+        # plain FixedLayout view.  The STL is derived from (view_size,
+        # view_stride) with dim_order = non-stick host dims in natural order,
+        # within-stick host dim last.  The within-stick host dim is the one
+        # with view stride 1 (mirrors _build_layout_preserving_padded_stl).
+        within_stick_host_dim = next(i for i, s in enumerate(view_stride) if s == 1)
+        view_dim_order = [
+            i for i in range(len(view_size)) if i != within_stick_host_dim
+        ] + [within_stick_host_dim]
+        view_stl = SpyreTensorLayout(view_size, view_stride, dtype, view_dim_order)
+        view_layout = FixedTiledLayout(
             device,
             dtype,
             size=view_size,
             stride=view_stride,
-            offset=0,
+            device_layout=view_stl,
         )
         view = ReinterpretView(data=padded_buf, layout=view_layout)
         view_loader = view.make_loader()
