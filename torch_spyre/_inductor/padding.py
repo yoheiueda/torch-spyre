@@ -61,13 +61,15 @@ from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
     concretize_expr,
+    concretize_index,
     find_reduction_var,
-    identify_matmul_inputs,
     host_coordinates,
+    identify_matmul_inputs,
     lower_pad_preserve_layout,
     lower_pad_sequence,
     replace_computed_buffer_body,
 )
+from .views import compute_coordinates, matching_dim
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 
 logger = get_inductor_logger("padding")
@@ -307,31 +309,36 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _within_stick_host_dim(layout: FixedTiledLayout) -> int | None:
-    """Return the host-axis index that the ``layout``'s STL places within a stick.
+def _within_stick_host_dim(layout: FixedTiledLayout, dep) -> int | None:
+    """Return the host-axis index that ``layout``'s STL places within a stick.
 
-    The C++ ``SpyreTensorLayout`` consumes ``dim_order`` at construction and
-    exposes ``stride_map``: ``stride_map[device_dim]`` equals the host stride
-    of the host dim that maps to ``device_dim``.  The within-stick device dim
-    is the last entry, so the within-stick host axis is the host dim whose
-    host stride matches ``stride_map[-1]``.  Size-1 host dims are skipped to
-    disambiguate the (rare) case where multiple host dims share a stride.
+    Computes host- and device-side coordinates for ``(layout, dep)`` — which
+    must be the layout and a dep of the same buffer — and asks
+    ``matching_dim`` which host axis carries the within-stick device
+    coordinate (always the last entry of ``device_coords``).  Same idiom as
+    :func:`compute_restickify_target_layout` (``old_sd = matching_dim(ic,
+    idc[-1])``) and ``_pick_stick_dim`` in propagate_layouts.
+
+    Calls ``compute_coordinates`` directly rather than ``device_coordinates``
+    because the latter asserts (via ``_check_stick_expr_supported``) that the
+    stick coord is a single-variable form ``Mod(v, elems_per_stick)``,
+    bare-var, or zero — which is the contract for buffers that survive into
+    codegen.  Restickify's input buffer is precisely the place where the
+    stick coord may not yet be in that canonical form (the whole point of the
+    pass is to insert padding so a downstream restickify can produce one),
+    and we only need ``matching_dim`` here, which doesn't require the
+    canonical form: it returns ``None`` if no host axis matches, which is the
+    correct signal for our predicate to skip.
+
     Returns ``None`` if the match is not unique.
     """
+    host_coords = host_coordinates(layout, dep)
     stl = layout.device_layout
-    sm_last = int(stl.stride_map[-1])
-    if sm_last <= 0:
-        return None
-    host_size = [concretize_expr(s) for s in layout.size]
-    host_stride = [concretize_expr(s) for s in layout.stride]
-    candidates = [
-        d
-        for d, st in enumerate(host_stride)
-        if int(st) == sm_last and int(host_size[d]) > 1
-    ]
-    if len(candidates) != 1:
-        return None
-    return candidates[0]
+    device_index = concretize_index(dep.index, set(dep.ranges.keys()))
+    device_coords = compute_coordinates(
+        stl.device_size, stl.stride_map, dep.ranges, device_index
+    )
+    return matching_dim(host_coords, device_coords[-1])
 
 
 def _restickify_input_dep(op: Operation, graph: GraphLowering):
@@ -380,8 +387,9 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     if in_host_size != out_host_size:
         return None
 
-    in_stick_dim = _within_stick_host_dim(in_layout)
-    out_stick_dim = _within_stick_host_dim(out_layout)
+    out_dep = next(iter(rw.writes))
+    in_stick_dim = _within_stick_host_dim(in_layout, in_dep)
+    out_stick_dim = _within_stick_host_dim(out_layout, out_dep)
     if in_stick_dim is None or out_stick_dim is None:
         return None
     if in_stick_dim == out_stick_dim:
