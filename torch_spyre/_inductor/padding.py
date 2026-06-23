@@ -346,6 +346,10 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
 
     in_host_coords = host_coordinates(in_layout, in_dep)
     out_dev_coords = device_coordinates(out_layout.device_layout, in_dep)
+    # No symbolic addressing on either side (e.g. constant-fill broadcast,
+    # 0-D buffer) cannot be a stick-swapping copy.
+    if not in_host_coords or not out_dev_coords:
+        return None
     if in_host_coords[-1].free_symbols == out_dev_coords[-1].free_symbols:
         return None
     return in_dep, in_buf, in_layout
