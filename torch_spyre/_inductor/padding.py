@@ -70,7 +70,7 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates, matching_dim
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import get_elem_in_stick
 
 logger = get_inductor_logger("padding")
 
@@ -473,17 +473,16 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         # back, so the OpSpec ends up unwidened anyway.
         old_pw = op.data
 
-        out_size = [int(concretize_expr(s)) for s in op.get_layout().size]
         out_stride = [int(concretize_expr(s)) for s in op.get_layout().stride]
 
-        padded_extent = padded_size[new_stick_dim]
-        out_padded_axis = new_stick_dim
+        # ``_restickify_input_dep`` enforces ``in_host_size == out_host_size``,
+        # so the padded shape on ``padded_buf`` is also the view's host shape.
+        view_size = list(padded_buf.get_layout().size)
 
-        # Build the view: bump out_size at the padded axis, then recompute
-        # strides in the same axis-order as op.layout (dim_order = axes
-        # sorted by descending stride, outermost first).
-        view_size = list(out_size)
-        view_size[out_padded_axis] = padded_extent
+        # Recompute row-major strides in op.layout's axis priority (descending
+        # stride = outermost first).  ``padded_buf``'s own strides mirror the
+        # *input*'s axis arrangement; the view overrides that with the
+        # output's, which is what makes this a restickify-shaped read.
         dim_order = sorted(range(len(out_stride)), key=lambda i: -out_stride[i])
         view_stride = [0] * len(view_size)
         running = 1
@@ -496,15 +495,15 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         # rest of the post-pre-scheduling graph: every other layout there is
         # tiled with a concrete device_layout, and any layout-aware downstream
         # consumer would silently fall back to the wrapped buffer's STL on a
-        # plain FixedLayout view.  The STL is derived from (view_size,
-        # view_stride) with dim_order = non-stick host dims in natural order,
-        # within-stick host dim last.  The within-stick host dim is the one
-        # with view stride 1 (mirrors _build_layout_preserving_padded_stl).
-        within_stick_host_dim = next(i for i, s in enumerate(view_stride) if s == 1)
-        view_dim_order = [
-            i for i in range(len(view_size)) if i != within_stick_host_dim
-        ] + [within_stick_host_dim]
-        view_stl = SpyreTensorLayout(view_size, view_stride, dtype, view_dim_order)
+        # plain FixedLayout view.
+        #
+        # The STL is paired with the *physical* buffer, not with the host
+        # view: address calculation uses the wrapped buffer's strides, and
+        # ``make_loader`` resolves the view's stride pattern against that
+        # physical layout.  ``padded_buf``'s STL was already built by
+        # ``_build_layout_preserving_padded_stl`` to be the input's STL with
+        # the matching device_size entry bumped — exactly what we need.
+        view_stl = padded_buf.get_layout().device_layout
         view_layout = FixedTiledLayout(
             device,
             dtype,
@@ -521,15 +520,6 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
             inner_fn=lambda index, _loader=view_loader: _loader(index),
             ranges=old_pw.ranges,
         )
-        # Announce intent to the codegen-side classifier: after Inductor's
-        # _apply_loop_reordering runs, the iter-axis ordering of this op may
-        # collapse so input/output device coords share the same free symbol
-        # on the within-stick axis, defeating the structural detection in
-        # spyre_kernel.py. The tag preserves RESTICKIFY_OP classification so
-        # #2112's ceil-div + backGap padded-read path stays gated correctly.
-        # Set BEFORE replace_computed_buffer_body so copy_op_metadata carries
-        # the attribute onto the replacement ComputedBuffer.
-        op._spyre_force_restickify = True
         replace_computed_buffer_body(op, new_pw, operations)
         logger.info(
             "insert_restickify_padding: padded %s dim[%d]: %d -> %d",
