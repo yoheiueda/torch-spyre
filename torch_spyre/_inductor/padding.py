@@ -57,12 +57,10 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_OP
-from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
     concretize_expr,
-    device_coordinates,
     find_reduction_var,
     identify_matmul_inputs,
     host_coordinates,
@@ -70,7 +68,6 @@ from .pass_utils import (
     lower_pad_sequence,
     replace_computed_buffer_body,
 )
-from .views import matching_dim
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 
 logger = get_inductor_logger("padding")
@@ -310,17 +307,46 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _restickify_input_dep(op: Operation, graph: GraphLowering):
-    """Return (in_dep, in_buf, in_layout) when ``op`` is a ComputedBuffer
-    whose layout swaps the stick dimension relative to its single input.
-    Returns None otherwise.
+def _within_stick_host_dim(layout: FixedTiledLayout) -> int | None:
+    """Return the host-axis index that the ``layout``'s STL places within a stick.
 
-    A "restickify" here is identified structurally: a single-input pointwise
-    copy whose input's within-stick host coord uses a different symbol than
-    the output's within-stick device coord.  This catches both the explicit
-    ``torch.ops.spyre.restickify`` FX op (inserted by ``insert_restickify``)
-    and the fused permute+clone ComputedBuffer that lowers to ReStickifyOpHBM
-    directly.
+    The C++ ``SpyreTensorLayout`` consumes ``dim_order`` at construction and
+    exposes ``stride_map``: ``stride_map[device_dim]`` equals the host stride
+    of the host dim that maps to ``device_dim``.  The within-stick device dim
+    is the last entry, so the within-stick host axis is the host dim whose
+    host stride matches ``stride_map[-1]``.  Size-1 host dims are skipped to
+    disambiguate the (rare) case where multiple host dims share a stride.
+    Returns ``None`` if the match is not unique.
+    """
+    stl = layout.device_layout
+    sm_last = int(stl.stride_map[-1])
+    if sm_last <= 0:
+        return None
+    host_size = [concretize_expr(s) for s in layout.size]
+    host_stride = [concretize_expr(s) for s in layout.stride]
+    candidates = [
+        d
+        for d, st in enumerate(host_stride)
+        if int(st) == sm_last and int(host_size[d]) > 1
+    ]
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def _restickify_input_dep(op: Operation, graph: GraphLowering):
+    """Return (in_dep, in_buf, in_layout, new_stick_dim) when ``op`` is a
+    ComputedBuffer that restickifies its single input — i.e. a pointwise
+    same-shape copy whose output STL puts a different host axis within the
+    stick than the input's STL does.  Returns ``None`` otherwise.
+
+    Restricting to ops whose input and output buffers share the same logical
+    host shape is what makes "the input's within-stick host axis" and "the
+    output's within-stick host axis" comparable as the same axis.  This
+    catches both the explicit ``torch.ops.spyre.restickify`` FX op (inserted
+    by ``insert_restickify``) and the fused permute+clone ComputedBuffer that
+    lowers to ReStickifyOpHBM directly, and naturally excludes
+    flatten/slice/reduce ops whose output buffers have a different host shape.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -345,24 +371,22 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     if not isinstance(in_layout, FixedTiledLayout):
         return None
 
-    in_host_coords = host_coordinates(in_layout, in_dep)
-    try:
-        out_dev_coords = device_coordinates(out_layout.device_layout, in_dep)
-    except Unsupported:
-        # The output STL applied to the input dep can synthesize stick
-        # expressions outside the form ``device_coordinates`` accepts (e.g.
-        # ``4*Mod(d0,16)`` when the output's smaller sliced tile groups input
-        # sticks differently, or ``floor(d1/3)`` from a flatten over a
-        # non-contiguous input).  Such ops are not the simple stick-swap
-        # copies this pass targets — leave them for downstream codegen.
+    # A stick-swap copy preserves the buffer's logical host shape; only the
+    # device-side stick assignment changes.  Differing shapes (slice, flatten,
+    # reduce, ...) make the within-stick host axes incomparable as the same
+    # axis, so the predicate cannot meaningfully fire.
+    in_host_size = [concretize_expr(s) for s in in_layout.size]
+    out_host_size = [concretize_expr(s) for s in out_layout.size]
+    if in_host_size != out_host_size:
         return None
-    # No symbolic addressing on either side (e.g. constant-fill broadcast,
-    # 0-D buffer) cannot be a stick-swapping copy.
-    if not in_host_coords or not out_dev_coords:
+
+    in_stick_dim = _within_stick_host_dim(in_layout)
+    out_stick_dim = _within_stick_host_dim(out_layout)
+    if in_stick_dim is None or out_stick_dim is None:
         return None
-    if in_host_coords[-1].free_symbols == out_dev_coords[-1].free_symbols:
+    if in_stick_dim == out_stick_dim:
         return None
-    return in_dep, in_buf, in_layout
+    return in_dep, in_buf, in_layout, out_stick_dim
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
@@ -385,15 +409,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         match = _restickify_input_dep(op, graph)
         if match is None:
             continue
-        in_dep, in_buf, in_layout = match
-
-        out_layout = op.get_layout()
-        in_host_coords = host_coordinates(in_layout, in_dep)
-        out_dev_coords = device_coordinates(out_layout.device_layout, in_dep)
-        # The dim becoming a stick on the output, expressed in input host axes.
-        new_stick_dim = matching_dim(in_host_coords, out_dev_coords[-1])
-        if new_stick_dim is None:
-            continue
+        in_dep, in_buf, in_layout, new_stick_dim = match
 
         host_size = [concretize_expr(s) for s in in_layout.size]
         dtype = in_layout.dtype
