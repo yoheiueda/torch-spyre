@@ -57,6 +57,7 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_OP
+from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
@@ -345,7 +346,16 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
         return None
 
     in_host_coords = host_coordinates(in_layout, in_dep)
-    out_dev_coords = device_coordinates(out_layout.device_layout, in_dep)
+    try:
+        out_dev_coords = device_coordinates(out_layout.device_layout, in_dep)
+    except Unsupported:
+        # The output STL applied to the input dep can synthesize stick
+        # expressions outside the form ``device_coordinates`` accepts (e.g.
+        # ``4*Mod(d0,16)`` when the output's smaller sliced tile groups input
+        # sticks differently, or ``floor(d1/3)`` from a flatten over a
+        # non-contiguous input).  Such ops are not the simple stick-swap
+        # copies this pass targets — leave them for downstream codegen.
+        return None
     # No symbolic addressing on either side (e.g. constant-fill broadcast,
     # 0-D buffer) cannot be a stick-swapping copy.
     if not in_host_coords or not out_dev_coords:
