@@ -1108,15 +1108,9 @@ def _build_padded_stl(
 ) -> SpyreTensorLayout:
     """Build a padded STL that mirrors ``orig_stl``'s dim arrangement.
 
-    Uses the 3-arg ``SpyreTensorLayout`` constructor so synthetic floor
-    splits and custom dim orderings on ``orig_stl`` are carried over
-    verbatim; only the device_size entry for the padded host dim is bumped,
-    and stride_map entries for dims that wrap around the padded dim are
-    rescaled to its new extent.
-
-    The last device dim is always the within-stick element dim, which lets
-    us disambiguate it from host dims that happen to share its stride of 1
-    in contiguous layouts.
+    Bumps the device_size entry for the padded host dim and rescales
+    stride_map entries for dims that wrap around it; everything else
+    (synthetic floor splits, custom dim orderings) is carried over verbatim.
     """
     original_shape = list(arg_fx_node.meta["val"].shape)
     orig_host_stride = [int(s) for s in arg_fx_node.meta["val"].stride()]
@@ -1124,63 +1118,44 @@ def _build_padded_stl(
     for i in range(len(padded_size) - 2, -1, -1):
         padded_host_stride[i] = padded_host_stride[i + 1] * padded_size[i + 1]
 
-    orig_device_size = list(orig_stl.device_size)
+    orig_device_size = orig_stl.device_size
     orig_stride_map = [int(s) for s in orig_stl.stride_map]
 
     # mm_to_bmm_pass occasionally wraps a 2D buffer in a batch=1 view, so
     # the view's rank can exceed the host rank implied by orig_stl's
     # stride_map (device rank = host rank + 1 for the within-stick entry).
-    orig_host_ndim = len(orig_stride_map) - 1
-    n_phantom = len(padded_size) - orig_host_ndim
-    if n_phantom < 0:
-        raise RuntimeError(
-            f"_build_padded_stl: padded rank {len(padded_size)} is smaller "
-            f"than orig_stl host rank {orig_host_ndim} "
-            f"(stride_map={orig_stride_map})"
-        )
+    n_phantom = len(padded_size) - (len(orig_device_size) - 1)
+    assert n_phantom >= 0
 
-    within_stick_device_dim = len(orig_stride_map) - 1
-
-    core_orig_host_stride = orig_host_stride[n_phantom:]
     core_padded_host_stride = padded_host_stride[n_phantom:]
-    stride_to_host_dim: dict[int, int] = {}
-    for h, s in enumerate(core_orig_host_stride):
-        stride_to_host_dim[s] = h  # later index wins (size-1 dim collapse)
+    # Later index wins for repeated strides (size-1 dim collapse).
+    stride_to_host_dim = {s: h for h, s in enumerate(orig_host_stride[n_phantom:])}
 
     new_stride_map: list[int] = []
-    for k, sm in enumerate(orig_stride_map):
-        if k == within_stick_device_dim:
-            new_stride_map.append(sm)
-            continue
+    for sm in orig_stride_map[:-1]:
         host_dim = stride_to_host_dim.get(sm)
         if host_dim is None:
             # Not derived from any current host dim — synthetic constant.
             new_stride_map.append(sm)
-            continue
-        new_stride_map.append(core_padded_host_stride[host_dim])
+        else:
+            new_stride_map.append(core_padded_host_stride[host_dim])
+    new_stride_map.append(orig_stride_map[-1])
 
     # Bump the device_size entry that represents the padded host dim.
-    new_device_size = list(orig_device_size)
     padded_dim_orig_stride = orig_host_stride[dim]
     orig_padded_extent = original_shape[dim]
-    bumped_dim = next(
-        (
-            k
-            for k in range(len(orig_device_size))
-            if k != within_stick_device_dim
-            and orig_stride_map[k] == padded_dim_orig_stride
-            and orig_device_size[k] == orig_padded_extent
-        ),
-        None,
+    bumped_dim = None
+    for k, (sm, ds) in enumerate(zip(orig_stride_map[:-1], orig_device_size[:-1])):
+        if sm == padded_dim_orig_stride and ds == orig_padded_extent:
+            bumped_dim = k
+            break
+    assert bumped_dim is not None, (
+        f"_build_padded_stl: could not find device dim for padded host dim "
+        f"{dim} (orig_stride={padded_dim_orig_stride}, "
+        f"orig_extent={orig_padded_extent}, device_size={orig_device_size}, "
+        f"stride_map={orig_stride_map})"
     )
-    if bumped_dim is None:
-        raise RuntimeError(
-            f"_build_padded_stl: could not find device dim for padded host "
-            f"dim {dim} (orig_stride={padded_dim_orig_stride}, "
-            f"orig_extent={orig_padded_extent}). "
-            f"orig_stl device_size={orig_device_size}, "
-            f"stride_map={orig_stride_map}"
-        )
+    new_device_size = orig_device_size[:]
     new_device_size[bumped_dim] = padded_size[dim]
 
     return SpyreTensorLayout(new_device_size, new_stride_map, orig_stl.device_dtype)
