@@ -679,26 +679,15 @@ def _extend_restickify_to_padded(
     sdsc_iteration_space: dict,
     symbol_mapping: dict,
 ) -> None:
-    """Extend sdsc_iteration_space[stick_sym] to a stick boundary for restickify ops.
+    """Round sdsc_iteration_space[stick_sym] up to a stick boundary for each
+    restickify arg.  Both input (old stick) and output (new stick) may carry
+    the unaligned iter, so we extend per-arg.
 
-    A restickify reshapes a buffer's stick layout, so it has two relevant stick
-    dims: the input's old stick and the output's new stick.  Either may be the
-    iter symbol whose extent is unaligned (e.g. when the user-visible output
-    extent on the new stick dim is not a multiple of the stick size).
-
-    For each arg, identify the iter symbol driving its within-stick coordinate
-    (the only free symbol of ``device_coordinates[-1]`` after symbol_mapping)
-    and round up ``sdsc_iteration_space[stick_sym]`` to the next stick boundary.
-    Running before ``_create_sdsc_tensors`` ensures:
-
-    - The arg whose stick is the unaligned iter has dev_dim_size==it_dim_size on
-      the within-stick axis → backGap branch never fires.
-    - The other arg, which sees the same iter symbol on a *non-stick* device dim
-      (e.g. an outer split) with dev_dim_size already at the padded extent, gets
-      strides computed against the padded extent → no stale-stride mismatch with
-      the post-`_create_sdsc_tensors` widening done by `_get_padded_iteration_space`.
-
-    This is the restickify analogue of `_extend_matmul_k_to_padded`.
+    Running before ``_create_sdsc_tensors`` keeps backGap correct: the
+    unaligned-stick arg gets dev_dim_size==it_dim_size on the within-stick
+    axis (no backGap), and the other arg's outer-split strides are computed
+    against the padded extent (no stale-stride mismatch with the later
+    widening done by ``_get_padded_iteration_space``).
     """
     for arg in op_spec.args:
         _, stick_sym = _get_device_dim_order(arg, symbol_mapping)
