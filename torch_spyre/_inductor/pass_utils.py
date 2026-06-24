@@ -975,8 +975,8 @@ def lower_pad_sequence(
     ensured to be a stick dimension here.
 
     The padded buffer's ``SpyreTensorLayout`` is derived from ``orig_stl`` by
-    :func:`_build_padded_stl`, which mirrors the producer's existing device
-    layout and bumps only the entry for the padded host dim.
+    mirroring the producer's existing device layout and bumping only the
+    entry for the padded host dim.
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
@@ -1108,24 +1108,18 @@ def _build_padded_stl(
 ) -> SpyreTensorLayout:
     """Build a padded STL that mirrors ``orig_stl``'s dim arrangement.
 
-    Uses the 3-arg ``SpyreTensorLayout`` constructor: only the entry that
-    corresponds to the padded host dim is bumped, all other device dims
-    (including synthetic floor splits and the within-stick dim) are
-    preserved verbatim.  This works for both BMM K-padding and restickify
-    input padding because earlier passes (insert_restickify) already place
-    each consumer's input on the layout that consumer expects, so the
-    producer's existing layout is exactly what downstream needs.
+    Uses the 3-arg ``SpyreTensorLayout`` constructor so synthetic floor
+    splits and custom dim orderings on ``orig_stl`` are carried over
+    verbatim; only the device_size entry for the padded host dim is bumped,
+    and stride_map entries for dims that wrap around the padded dim are
+    rescaled to its new extent.
 
-    orig_stl.stride_map[k] is one of:
-      - 1, when device dim k is the within-stick element dim, OR
-      - host_stride_orig[h] for some host dim h, when device dim k carries
-        host dim h (possibly via a synthetic floor split).
-    The within-stick element stride is always 1; the host stride at the
-    within-stick host dim is also 1 for contiguous layouts.  We disambiguate
-    the two roles by index: the last device dim is always within-stick.
+    The last device dim is always the within-stick element dim, which lets
+    us disambiguate it from host dims that happen to share its stride of 1
+    in contiguous layouts.
     """
     original_shape = list(arg_fx_node.meta["val"].shape)
-    orig_host_stride = list(arg_fx_node.meta["val"].stride())
+    orig_host_stride = [int(s) for s in arg_fx_node.meta["val"].stride()]
     padded_host_stride = [1] * len(padded_size)
     for i in range(len(padded_size) - 2, -1, -1):
         padded_host_stride[i] = padded_host_stride[i + 1] * padded_size[i + 1]
@@ -1133,9 +1127,9 @@ def _build_padded_stl(
     orig_device_size = list(orig_stl.device_size)
     orig_stride_map = [int(s) for s in orig_stl.stride_map]
 
-    # Strip phantom leading dims (mm_to_bmm_pass occasionally wraps a 2D
-    # buffer in a batch=1 view).  orig_host_ndim = device dims - 1 because
-    # the within-stick dim is one extra device dim added by sticking.
+    # mm_to_bmm_pass occasionally wraps a 2D buffer in a batch=1 view, so
+    # the view's rank can exceed the host rank implied by orig_stl's
+    # stride_map (device rank = host rank + 1 for the within-stick entry).
     orig_host_ndim = len(orig_stride_map) - 1
     n_phantom = len(padded_size) - orig_host_ndim
     if n_phantom < 0:
@@ -1145,15 +1139,13 @@ def _build_padded_stl(
             f"(stride_map={orig_stride_map})"
         )
 
-    # The last device dim is always within-stick.  Other entries that map to
-    # host dims are remapped via a (orig_stride -> host_dim) lookup.
     within_stick_device_dim = len(orig_stride_map) - 1
 
     core_orig_host_stride = orig_host_stride[n_phantom:]
     core_padded_host_stride = padded_host_stride[n_phantom:]
     stride_to_host_dim: dict[int, int] = {}
     for h, s in enumerate(core_orig_host_stride):
-        stride_to_host_dim[int(s)] = h  # later index wins (size-1 dim collapse)
+        stride_to_host_dim[s] = h  # later index wins (size-1 dim collapse)
 
     new_stride_map: list[int] = []
     for k, sm in enumerate(orig_stride_map):
@@ -1165,25 +1157,23 @@ def _build_padded_stl(
             # Not derived from any current host dim — synthetic constant.
             new_stride_map.append(sm)
             continue
-        new_stride_map.append(int(core_padded_host_stride[host_dim]))
+        new_stride_map.append(core_padded_host_stride[host_dim])
 
     # Bump the device_size entry that represents the padded host dim.
     new_device_size = list(orig_device_size)
-    padded_dim_orig_stride = int(orig_host_stride[dim])
+    padded_dim_orig_stride = orig_host_stride[dim]
     orig_padded_extent = original_shape[dim]
-    new_padded_extent = padded_size[dim]
-    bumped = False
-    for k in range(len(new_device_size)):
-        if k == within_stick_device_dim:
-            continue
-        if (
-            int(orig_stride_map[k]) == padded_dim_orig_stride
-            and int(orig_device_size[k]) == orig_padded_extent
-        ):
-            new_device_size[k] = new_padded_extent
-            bumped = True
-            break
-    if not bumped:
+    bumped_dim = next(
+        (
+            k
+            for k in range(len(orig_device_size))
+            if k != within_stick_device_dim
+            and orig_stride_map[k] == padded_dim_orig_stride
+            and orig_device_size[k] == orig_padded_extent
+        ),
+        None,
+    )
+    if bumped_dim is None:
         raise RuntimeError(
             f"_build_padded_stl: could not find device dim for padded host "
             f"dim {dim} (orig_stride={padded_dim_orig_stride}, "
@@ -1191,6 +1181,7 @@ def _build_padded_stl(
             f"orig_stl device_size={orig_device_size}, "
             f"stride_map={orig_stride_map}"
         )
+    new_device_size[bumped_dim] = padded_size[dim]
 
     return SpyreTensorLayout(new_device_size, new_stride_map, orig_stl.device_dtype)
 
