@@ -60,7 +60,6 @@ from .constants import BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
-    _build_layout_preserving_padded_stl,
     concretize_expr,
     concretize_index,
     find_reduction_var,
@@ -408,9 +407,6 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
         in_fx = _find_arg_fx_node(in_dep.name)
         restick_fx = next(iter(op.origins))
-        padded_stl = _build_layout_preserving_padded_stl(
-            in_fx, padded_size, new_stick_dim, in_layout.device_layout
-        )
         padded_buf, new_ops = lower_pad_sequence(
             in_fx,
             padded_size=padded_size,
@@ -420,7 +416,6 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
             insert_before=restick_fx,
             orig_stl=in_layout.device_layout,
             fill_value=0.0,
-            padded_stl=padded_stl,
         )
 
         # Move pad ops to just before the restickify (lower_pad_sequence appends).
@@ -451,7 +446,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
         # FixedTiledLayout to match the surrounding tiled-layout invariant.
         # The STL pairs with the physical buffer; padded_buf's STL was already
-        # bumped by _build_layout_preserving_padded_stl to the padded extent.
+        # bumped by lower_pad_sequence to the padded extent.
         view_layout = FixedTiledLayout(
             device,
             dtype,
