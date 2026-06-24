@@ -51,7 +51,6 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
-    ReinterpretView,
     TensorBox,
 )
 from torch._inductor.virtualized import V
@@ -380,9 +379,8 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
     Strategy: insert a stick-aligned, zero-filled copy of the input ahead of
     the Restickify (lower_pad_sequence) and rewrite the Restickify body to
-    load from the padded buffer through a ReinterpretView that mirrors the
-    original output's stride pattern.  The Restickify's ranges, layout, and
-    device_layout are NOT touched — they already describe the padded
+    load directly from the padded buffer.  The Restickify's ranges, layout,
+    and device_layout are NOT touched — they already describe the padded
     iteration correctly via the ceil-div + backGap path.
     """
     operations = graph.operations
@@ -426,41 +424,15 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
             operations.insert(idx + i, o)
 
         # Replace the restickify body with a Pointwise that reads padded_buf
-        # through a ReinterpretView mirroring the original output's stride
-        # pattern.  Same idiom Inductor uses for slice/transpose: the buffer
-        # keeps its canonical strides; the load address pattern lives in the
-        # view's stride vector resolved via make_loader.
+        # directly.  op.ranges still iterates over the original host_size, so
+        # padded_buf's indexer naturally addresses the [0:n) prefix along
+        # new_stick_dim using the buffer's own (padded) strides.
         old_pw = op.data
-        out_stride = [int(concretize_expr(s)) for s in op.get_layout().stride]
-        view_size = list(padded_buf.get_layout().size)
-
-        # Contiguous strides that follow op.layout's dim priority (descending
-        # stride = outermost first).  padded_buf's own strides mirror the
-        # input's dim arrangement; the view overrides that with the output's.
-        dim_order = sorted(range(len(out_stride)), key=lambda i: -out_stride[i])
-        view_stride = [0] * len(view_size)
-        running = 1
-        for dim in reversed(dim_order):
-            view_stride[dim] = running
-            running *= view_size[dim]
-
-        # FixedTiledLayout to match the surrounding tiled-layout invariant.
-        # The STL pairs with the physical buffer; padded_buf's STL was already
-        # bumped by lower_pad_sequence to the padded extent.
-        view_layout = FixedTiledLayout(
-            device,
-            dtype,
-            size=view_size,
-            stride=view_stride,
-            device_layout=padded_buf.get_layout().device_layout,
-        )
-        view = ReinterpretView(data=padded_buf, layout=view_layout)
-        view_loader = view.make_loader()
-
+        loader = padded_buf.make_loader()
         new_pw = Pointwise(
             device=old_pw.device,
             dtype=old_pw.dtype,
-            inner_fn=lambda index, _loader=view_loader: _loader(index),
+            inner_fn=lambda index, _loader=loader: _loader(index),
             ranges=old_pw.ranges,
         )
         replace_computed_buffer_body(op, new_pw, operations)
