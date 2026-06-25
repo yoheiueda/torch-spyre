@@ -514,8 +514,13 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         # preservingly from the input and so encodes the input's dim
         # priority, which is wrong for the view.  ``view_dim_order`` puts
         # the within-stick host dim (the one with view stride 1) last, the
-        # rest in natural order — same convention as
-        # ``_build_layout_preserving_padded_stl``.
+        # rest in natural order — same convention as ``_build_padded_stl``.
+        # NOTE: this is NOT necessarily ``out_padded_dim``.  ``out_padded_dim``
+        # is whichever dim ``out_layout``'s STL puts within the stick — for
+        # transpose's output that's the second-innermost host dim, because
+        # ``out_layout`` was built layout-preservingly from the input frame.
+        # ``view_stride`` recanonicalises to descending-stride row-major, so
+        # the within-stick dim shifts to the contiguous one.
         within_stick_host_dim = next(i for i, s in enumerate(view_stride) if s == 1)
         view_dim_order = [
             i for i in range(len(view_size)) if i != within_stick_host_dim
