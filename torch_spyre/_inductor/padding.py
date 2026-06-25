@@ -56,16 +56,15 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_OP
-from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
     concretize_expr,
     concretize_index,
-    device_coordinates,
     find_reduction_var,
     host_coordinates,
     identify_matmul_inputs,
+    is_stick_expr_offset_free,
     lower_pad_sequence,
     replace_computed_buffer_body,
 )
@@ -312,25 +311,41 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 def _within_stick_host_dim(layout: FixedTiledLayout, dep) -> int | None:
     """Return the host dim that ``layout``'s STL places within a stick.
 
-    ``layout`` and ``dep`` must belong to the **same** buffer: the within-
-    stick host dim is the one whose host coord carries the within-stick
-    device coord (always ``device_coords[-1]``).  Returns ``None`` if no
-    host dim uniquely matches.
-
-    Calls ``compute_coordinates`` directly rather than ``device_coordinates``
-    because the latter asserts the stick coord is in canonical form
-    (``Mod(v, elems_per_stick)``, bare-var, or zero) — which is the contract
-    for buffers that survive into codegen.  A restickify's *input* is
-    precisely where the stick coord may not yet be canonical (the whole
-    point of the pass is to insert padding so a downstream restickify can
-    produce one).  ``matching_dim`` doesn't need the canonical form.
+    ``layout`` and ``dep`` must belong to the same buffer.  Returns ``None``
+    if no host dim uniquely matches.  ``compute_coordinates`` is used
+    directly instead of ``device_coordinates`` to skip the latter's
+    canonical-form assertion, which need not hold on a restickify input.
     """
-    host_coords = host_coordinates(layout, dep)
-    stl = layout.device_layout
+    return _project_stick_host_dim(layout, layout, dep)
+
+
+def _project_stick_host_dim(
+    host_layout: FixedTiledLayout, stick_layout: FixedTiledLayout, dep
+) -> int | None:
+    """Return the ``host_layout`` host dim that carries ``stick_layout``'s
+    within-stick coord under ``dep``.
+
+    Generalises ``_within_stick_host_dim``: when the host and stick layouts
+    are the same buffer, this is just the within-stick host dim; when they
+    differ, it projects ``stick_layout``'s STL through ``dep`` to find which
+    ``host_layout`` host dim becomes the within-stick dim under
+    ``stick_layout``.  Uses ``compute_coordinates`` directly rather than
+    ``device_coordinates`` so a non-canonical stick coord doesn't raise —
+    instead, it's filtered via ``is_stick_expr_offset_free``.  Cross-buffer
+    projections (e.g. flatten over a non-contiguous input, sliced-stick
+    views) can synthesize stick coords like ``floor(3*d1/4)`` or
+    ``Mod(d0, 3)`` that ``matching_dim`` alone wouldn't reject.
+    """
+    host_coords = host_coordinates(host_layout, dep)
+    stl = stick_layout.device_layout
     device_index = concretize_index(dep.index, set(dep.ranges.keys()))
     device_coords = compute_coordinates(
         stl.device_size, stl.stride_map, dep.ranges, device_index
     )
+    if not host_coords or not device_coords:
+        return None
+    if not is_stick_expr_offset_free(device_coords[-1], stl.elems_per_stick()):
+        return None
     return matching_dim(host_coords, device_coords[-1])
 
 
@@ -340,23 +355,14 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     different host dim within the stick than the input's does, else
     ``None``.
 
-    ``new_stick_dim`` is expressed in the **input's** host frame: the input
-    dim that becomes the within-stick dim on the output.  Recovered by
-    projecting the output STL through the input dep (so both sides share
-    the input's iteration symbols) and matching ``out_dev_coords[-1]``
-    against ``in_host_coords``.  Same idiom used by every other call site
-    that compares an STL's stick axis against host coords.
-
-    The projection is what makes transpose work: input and output host
-    shapes differ in dim order, but the input's iteration symbols carry
-    enough information to find which input dim becomes the output's stick.
-    Flatten/slice/reduce ops produce non-canonical stick expressions on
-    the projection and raise ``Unsupported`` — those aren't simple
-    stick-swap copies and are filtered out.
-
-    Catches both the explicit ``torch.ops.spyre.restickify`` FX op and the
-    fused permute+clone ComputedBuffer that lowers to ReStickifyOpHBM
-    directly.
+    Both stick dims are recovered in the **input's** host frame, so they
+    are directly comparable: ``in_stick_dim`` from
+    ``_within_stick_host_dim(in_layout, in_dep)`` and ``new_stick_dim`` from
+    ``_project_stick_host_dim(in_layout, out_layout, in_dep)`` — the latter
+    projects the output STL through the input dep so both sides share the
+    input's iteration symbols.  The projection is what makes transpose work
+    (input/output host shapes differ in dim order); flatten/slice/reduce
+    ops drop out via ``matching_dim`` returning ``None``.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -380,18 +386,10 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
         return None
 
     in_stick_dim = _within_stick_host_dim(in_layout, in_dep)
-    if in_stick_dim is None:
+    new_stick_dim = _project_stick_host_dim(in_layout, out_layout, in_dep)
+    if in_stick_dim is None or new_stick_dim is None:
         return None
-
-    in_host_coords = host_coordinates(in_layout, in_dep)
-    try:
-        out_dev_coords = device_coordinates(out_layout.device_layout, in_dep)
-    except Unsupported:
-        return None
-    if not in_host_coords or not out_dev_coords:
-        return None
-    new_stick_dim = matching_dim(in_host_coords, out_dev_coords[-1])
-    if new_stick_dim is None or new_stick_dim == in_stick_dim:
+    if new_stick_dim == in_stick_dim:
         return None
 
     host_size = [concretize_expr(s) for s in in_layout.size]
@@ -455,27 +453,26 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         for i, o in enumerate(new_ops):
             operations.insert(idx + i, o)
 
-        # Rewire: replace the restickify body with a Pointwise that reads
-        # ``padded_buf`` through a permuted index.  ``op.ranges`` iterates
-        # in the output's host frame; ``padded_buf`` is in the input's
-        # frame.  The static perm bridges the two: ``perm[i]`` is the
-        # output iter dim that supplies input host dim ``i``.
+        # Replace the restickify body with a Pointwise that reads
+        # ``padded_buf`` through a permuted index.  ``op.ranges`` iterates in
+        # the output's host frame; ``padded_buf`` is in the input's.  The
+        # static perm bridges the two: ``perm[i]`` is the output iter dim
+        # that supplies input host dim ``i`` — recovered from the lone iter
+        # sym in each ``in_host_coords[i]``.  Multi-symbol coords would
+        # have been filtered out by ``_restickify_input_dep`` via
+        # ``matching_dim`` returning ``None`` (it requires exactly one free
+        # variable in the stick coord).
         #
-        # The perm is recovered from ``in_host_coords`` (per-input-host-dim
-        # coordinate expressions in the op's iter symbols): for input dim
-        # ``i``, exactly one iter sym appears in its free_symbols, and
-        # that sym's positional index in ``op.ranges`` is ``perm[i]``.
-        # Single-symbol-per-coord is guaranteed by the
-        # ``device_coordinates`` filter in ``_restickify_input_dep`` —
-        # ops that produce multi-symbol coords (flatten/reshape) raise
-        # ``Unsupported`` there and never reach this block.
+        # TODO: slice offsets are silently dropped here.  For inputs like
+        # ``x[:, :, 1:66, :].transpose(-2, -1).clone()`` ``in_host_coords``
+        # carries an additive constant (e.g. ``d3 + 1``) that the perm
+        # ignores, so slice data is read from the wrong addresses.  Fix is
+        # on the ``restickify_padding_slice_offset`` branch.
         #
-        # ``op.data.ranges`` stays at the user's logical output extent
-        # (== ``op.layout.size``).  Widening it to the stick-padded extent
-        # was tried but Inductor's ``_simplify_loops`` fuses the widened
-        # iter back via ``can_merge_dims``, so the OpSpec ends up unwidened
-        # anyway.  The widening that actually reaches codegen happens in
-        # superdsc's ``_extend_restickify_to_padded`` instead.
+        # ``op.data.ranges`` stays at the logical output extent; widening it
+        # gets undone by Inductor's ``_simplify_loops``, so codegen-side
+        # widening is done in superdsc's ``_extend_restickify_to_padded``
+        # instead.
         in_host_coords = host_coordinates(in_layout, in_dep)
         old_iter_syms = list(in_dep.ranges.keys())
         perm: list[int] = []
