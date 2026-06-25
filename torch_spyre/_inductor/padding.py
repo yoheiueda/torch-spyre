@@ -51,16 +51,19 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ReinterpretView,
     TensorBox,
 )
 from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_OP
+from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
     concretize_expr,
     concretize_index,
+    device_coordinates,
     find_reduction_var,
     host_coordinates,
     identify_matmul_inputs,
@@ -68,7 +71,7 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates, matching_dim
-from torch_spyre._C import get_elem_in_stick
+from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 
 logger = get_inductor_logger("padding")
 
@@ -325,12 +328,16 @@ def _within_stick_host_dim(layout: FixedTiledLayout, dep) -> int | None:
 
 def _restickify_input_dep(op: Operation, graph: GraphLowering):
     """Return ``(in_dep, in_buf, in_layout, host_size, new_stick_dim)`` when
-    ``op`` is a same-shape pointwise copy whose output STL puts a different
-    host dim within the stick than the input's STL does, else ``None``.
+    ``op`` is a pointwise copy whose output STL puts a different host axis
+    within the stick than the input's STL does, else ``None``.
 
-    The same-host-shape requirement is what makes the input's and output's
-    within-stick host dims comparable as the same dim, and naturally excludes
-    flatten/slice/reduce ops.
+    ``new_stick_dim`` is expressed in the **input's** host frame: the input
+    axis that becomes the within-stick axis on the output.  Computed by
+    projecting the output STL through the input dep so both sides share the
+    input's iteration symbols, then matching against the input's host
+    coordinates.  This stays well-posed for transpose (where input and
+    output host shapes differ in axis order); flatten/slice/reduce ops raise
+    ``Unsupported`` from the projection and are filtered out.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -353,19 +360,23 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     if not isinstance(in_layout, FixedTiledLayout):
         return None
 
-    in_host_size = [concretize_expr(s) for s in in_layout.size]
-    out_host_size = [concretize_expr(s) for s in out_layout.size]
-    if in_host_size != out_host_size:
+    in_stick_dim = _within_stick_host_dim(in_layout, in_dep)
+    if in_stick_dim is None:
         return None
 
-    out_dep = next(iter(rw.writes))
-    in_stick_dim = _within_stick_host_dim(in_layout, in_dep)
-    out_stick_dim = _within_stick_host_dim(out_layout, out_dep)
-    if in_stick_dim is None or out_stick_dim is None:
+    in_host_coords = host_coordinates(in_layout, in_dep)
+    try:
+        out_dev_coords = device_coordinates(out_layout.device_layout, in_dep)
+    except Unsupported:
         return None
-    if in_stick_dim == out_stick_dim:
+    if not in_host_coords or not out_dev_coords:
         return None
-    return in_dep, in_buf, in_layout, in_host_size, out_stick_dim
+    new_stick_dim = matching_dim(in_host_coords, out_dev_coords[-1])
+    if new_stick_dim is None or new_stick_dim == in_stick_dim:
+        return None
+
+    host_size = [concretize_expr(s) for s in in_layout.size]
+    return in_dep, in_buf, in_layout, host_size, new_stick_dim
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
@@ -379,8 +390,9 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
     Strategy: insert a stick-aligned, zero-filled copy of the input ahead of
     the Restickify (lower_pad_sequence) and rewrite the Restickify body to
-    load directly from the padded buffer.  The Restickify's ranges, layout,
-    and device_layout are NOT touched — they already describe the padded
+    load from the padded buffer through a ReinterpretView that mirrors the
+    output's stride pattern.  The Restickify's ranges, layout, and
+    device_layout are NOT touched — they already describe the padded
     iteration correctly via the ceil-div + backGap path.
     """
     operations = graph.operations
@@ -423,16 +435,91 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         for i, o in enumerate(new_ops):
             operations.insert(idx + i, o)
 
-        # Replace the restickify body with a Pointwise that reads padded_buf
-        # directly.  op.ranges still iterates over the original host_size, so
-        # padded_buf's indexer naturally addresses the [0:n) prefix along
-        # new_stick_dim using the buffer's own (padded) strides.
+        # Rewire: replace the restickify body with a Pointwise whose loader
+        # reads ``padded_buf`` through a ReinterpretView mirroring the
+        # original output's stride pattern.  Same idiom Inductor uses for
+        # vanilla slice/transpose: the buffer keeps its canonical strides;
+        # the load address pattern is encoded in the view's stride vector
+        # resolved via ``make_loader``.  This is what makes transpose work:
+        # ``op.ranges`` iterates in the *output* frame, so a loader that
+        # reads ``padded_buf`` directly would mis-address axes whenever the
+        # output reorders them.  The view bridges the two frames.
+        #
+        # The view's host shape bumps the padded axis (``new_stick_dim`` in
+        # the *input* frame) of the output's host shape to the padded extent,
+        # then recomputes strides in op.layout's axis priority (descending
+        # stride = outermost first).
+        #
+        # ``op.data.ranges`` stays at the user's logical output extent
+        # (== ``op.layout.size``); widening ranges to the stick-padded
+        # extent was tried but inductor's _simplify_loops fuses the widened
+        # iter back, so the OpSpec ends up unwidened anyway.
         old_pw = op.data
-        loader = padded_buf.make_loader()
+        out_size = [int(concretize_expr(s)) for s in op.get_layout().size]
+        out_stride = [int(concretize_expr(s)) for s in op.get_layout().stride]
+
+        # The output axis that corresponds to the padded input axis is the
+        # one whose host coord involves the same iter symbol.  For a plain
+        # stick-swap restickify (in_size == out_size) this is the same axis
+        # index; for a transpose it picks up the permutation.
+        in_host_coords = host_coordinates(in_layout, in_dep)
+        new_iter_sym = next(iter(in_host_coords[new_stick_dim].free_symbols))
+        out_layout = op.get_layout()
+        out_dep = next(iter(op.get_read_writes().writes))
+        out_host_coords = host_coordinates(out_layout, out_dep)
+        out_padded_axis = next(
+            (
+                i
+                for i, c in enumerate(out_host_coords)
+                if new_iter_sym in c.free_symbols
+            ),
+            None,
+        )
+        if out_padded_axis is None:
+            continue
+
+        view_size = list(out_size)
+        view_size[out_padded_axis] = padded_size[new_stick_dim]
+        dim_order = sorted(range(len(out_stride)), key=lambda i: -out_stride[i])
+        view_stride = [0] * len(view_size)
+        running = 1
+        for ax in reversed(dim_order):
+            view_stride[ax] = running
+            running *= view_size[ax]
+
+        # FixedTiledLayout (not plain FixedLayout) for type uniformity with
+        # the rest of the post-pre-scheduling graph.  STL is freshly derived
+        # from (view_size, view_stride): dim_order is non-stick host dims in
+        # natural order, within-stick host dim last (the one with view stride
+        # 1; mirrors _build_layout_preserving_padded_stl).
+        within_stick_host_dim = next(i for i, s in enumerate(view_stride) if s == 1)
+        view_dim_order = [
+            i for i in range(len(view_size)) if i != within_stick_host_dim
+        ] + [within_stick_host_dim]
+        view_stl = SpyreTensorLayout(view_size, view_stride, dtype, view_dim_order)
+        view_layout = FixedTiledLayout(
+            device,
+            dtype,
+            size=view_size,
+            stride=view_stride,
+            device_layout=view_stl,
+        )
+        view = ReinterpretView(data=padded_buf, layout=view_layout)
+        view_loader = view.make_loader()
+
         new_pw = Pointwise(
             device=old_pw.device,
             dtype=old_pw.dtype,
-            inner_fn=lambda index, _loader=loader: _loader(index),
+            inner_fn=lambda index, _loader=view_loader: _loader(index),
             ranges=old_pw.ranges,
         )
+        # Announce intent to the codegen-side classifier: after Inductor's
+        # _apply_loop_reordering runs, the iter-axis ordering of this op may
+        # collapse so input/output device coords share the same free symbol
+        # on the within-stick axis, defeating the structural detection in
+        # spyre_kernel.py.  The tag preserves RESTICKIFY_OP classification
+        # so the ceil-div + backGap padded-read path stays gated correctly.
+        # Set BEFORE replace_computed_buffer_body so copy_op_metadata carries
+        # the attribute onto the replacement ComputedBuffer.
+        op._spyre_force_restickify = True
         replace_computed_buffer_body(op, new_pw, operations)
