@@ -56,6 +56,7 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_OP
+from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
@@ -311,19 +312,12 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 def _project_stick_host_dim(
     host_layout: FixedTiledLayout, stick_layout: FixedTiledLayout, dep
 ) -> int | None:
-    """Return the ``host_layout`` host dim that carries ``stick_layout``'s
-    within-stick coord under ``dep``.
+    """Return the host_layout host dim carrying stick_layout's within-stick
+    coord under dep, or None if no unique canonical match exists.
 
-    When ``host_layout is stick_layout`` this is just the within-stick host
-    dim of that buffer; when they differ, it projects ``stick_layout``'s STL
-    through ``dep`` to find which ``host_layout`` host dim becomes the
-    within-stick dim under ``stick_layout``.  Uses ``compute_coordinates``
-    directly rather than ``device_coordinates`` so a non-canonical stick
-    coord doesn't raise — instead, it's filtered via
-    ``is_stick_expr_offset_free``.  Cross-buffer projections (e.g. flatten
-    over a non-contiguous input, sliced-stick views) can synthesize stick
-    coords like ``floor(3*d1/4)`` or ``Mod(d0, 3)`` that ``matching_dim``
-    alone wouldn't reject.
+    When host_layout is stick_layout this is the buffer's own within-stick
+    host dim; when they differ, stick_layout's STL is projected through dep.
+    Returns None unless the stick coord is valid.
     """
     host_coords = host_coordinates(host_layout, dep)
     stl = stick_layout.device_layout
@@ -339,19 +333,15 @@ def _project_stick_host_dim(
 
 
 def _restickify_input_dep(op: Operation, graph: GraphLowering):
-    """Return ``(in_dep, in_buf, in_layout, host_size, new_stick_dim)`` when
-    ``op`` is a single-input pointwise copy whose output STL puts a
-    different host dim within the stick than the input's does, else
-    ``None``.
+    """Return (in_dep, in_buf, in_layout, host_size, new_stick_dim) when op
+    is a single-input pointwise copy whose output STL puts a different host
+    dim within the stick than the input's does, else None.
 
-    Both stick dims are recovered in the **input's** host frame via
-    ``_project_stick_host_dim``, so they are directly comparable:
-    ``in_stick_dim`` is the input's own within-stick host dim;
-    ``new_stick_dim`` projects the output STL through ``in_dep`` so both
-    sides share the input's iteration symbols.  The projection is what
-    makes transpose work (input/output host shapes differ in dim order);
-    flatten/slice/reduce ops drop out via ``matching_dim`` returning
-    ``None``.
+    Both stick dims are recovered in the input's host frame so they are
+    directly comparable; the cross-buffer projection makes transpose work
+    while reduce drops out as non-Pointwise and flatten drops out via the
+    canonical-form filter in _project_stick_host_dim.  Sliced inputs are
+    not filtered here — they raise Unsupported in the perm loop.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -389,18 +379,17 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
     """Zero-pad a Restickify's input along the dim that becomes the new
     stick dim, when its extent is not a multiple of the stick size.
 
-    Without padding, codegen widens the SDSC iteration space to a stick
-    boundary and reads ceil(N/stick) sticks from the input — the tail of the
-    last stick contains uninitialized HBM, which the Restickify writes into
-    the output's stick layout, producing a value mismatch.
+    Without padding, codegen widens the iteration space to a stick boundary
+    and reads past the true extent — those tail elements come from
+    uninitialized HBM and end up in the output, producing a value mismatch.
 
     Strategy: insert a stick-aligned, zero-filled copy of the input ahead of
     the Restickify (lower_pad_sequence) and rewrite the Restickify body to
     load from the padded buffer through a permuted index that maps each
     output iter dim to the corresponding input host dim.  The Restickify's
-    ranges, layout, and device_layout are NOT touched — they already
-    describe the padded iteration correctly via the ceil-div + backGap
-    path.
+    ranges, layout, and device_layout are left untouched; codegen's existing
+    stick-boundary widening reads from the zero-filled tail of the padded
+    buffer instead of uninitialized HBM.
     """
     operations = graph.operations
     for op in list(operations):
@@ -423,14 +412,14 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         padded_size[new_stick_dim] = n + pad
 
         in_fx = _find_arg_fx_node(in_dep.name)
-        restick_fx = next(iter(op.origins))
+        restickify_fx = next(iter(op.origins))
         padded_buf, new_ops = lower_pad_sequence(
             in_fx,
             padded_size=padded_size,
             device=device,
             dtype=dtype,
             dim=new_stick_dim,
-            insert_before=restick_fx,
+            insert_before=restickify_fx,
             orig_stl=in_layout.device_layout,
             fill_value=0.0,
         )
@@ -442,36 +431,31 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         for i, o in enumerate(new_ops):
             operations.insert(idx + i, o)
 
-        # Replace the restickify body with a Pointwise that reads
-        # ``padded_buf`` through a permuted index.  ``op.ranges`` iterates in
-        # the output's host frame; ``padded_buf`` is in the input's.  The
-        # static perm bridges the two: ``perm[i]`` is the output iter dim
-        # that supplies input host dim ``i`` — recovered from the lone iter
-        # sym in each ``in_host_coords[i]``.  Multi-symbol coords would
-        # have been filtered out by ``_restickify_input_dep`` via
-        # ``matching_dim`` returning ``None`` (it requires exactly one free
-        # variable in the stick coord).
-        #
-        # TODO: slice offsets are silently dropped here.  For inputs like
-        # ``x[:, :, 1:66, :].transpose(-2, -1).clone()`` ``in_host_coords``
-        # carries an additive constant (e.g. ``d3 + 1``) that the perm
-        # ignores, so slice data is read from the wrong addresses.  Fix is
-        # on the ``restickify_padding_slice_offset`` branch.
-        #
-        # ``op.data.ranges`` stays at the logical output extent; widening it
-        # gets undone by Inductor's ``_simplify_loops``, so codegen-side
-        # widening is done in superdsc's ``_extend_restickify_to_padded``
-        # instead.
+        # Replace the restickify body with a Pointwise that reads padded_buf
+        # through a permuted index: input host dim i is addressed by output iter
+        # index perm[i], where perm[i] is the lone iter sym in in_host_coords[i].
+        # op.data.ranges stays at the logical output extent; the stick-boundary
+        # widening happens later in superdsc's _extend_restickify_to_padded
+        # (Inductor's _simplify_loops would undo it if done here).
         in_host_coords = host_coordinates(in_layout, in_dep)
         old_iter_syms = list(in_dep.ranges.keys())
         perm: list[int] = []
-        for coord in in_host_coords:
+        for i, coord in enumerate(in_host_coords):
             picks = [j for j, s in enumerate(old_iter_syms) if s in coord.free_symbols]
-            assert len(picks) == 1, (
-                f"insert_restickify_padding: input host coord {coord} for "
-                f"{op.get_name()} has {len(picks)} iter syms, expected 1; "
-                f"_restickify_input_dep should have filtered this op"
-            )
+            assert len(picks) == 1, "_restickify_input_dep should have ensured this"
+            sym = old_iter_syms[picks[0]]
+            iter_extent = concretize_expr(in_dep.ranges[sym])
+            dim_size = concretize_expr(in_layout.size[i])
+            # Slice-detection lives here (not in the predicate): if the predicate
+            # returned None for slices, codegen would silently produce wrong
+            # output.  Raising here makes compilation fail loudly instead.
+            # TODO: support sliced inputs (e.g. ``x[:, :, 1:66, :].transpose(-2, -1)``).
+            if iter_extent != dim_size:
+                raise Unsupported(
+                    f"insert_restickify_padding: sliced input on host dim "
+                    f"{i} of {op.get_name()} (iter range {iter_extent} != "
+                    f"dim size {dim_size}) is not supported"
+                )
             perm.append(picks[0])
         old_pw = op.data
         padded_loader = padded_buf.make_loader()
