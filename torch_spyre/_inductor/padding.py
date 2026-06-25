@@ -468,8 +468,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         # Single-symbol-per-coord is guaranteed by the
         # ``device_coordinates`` filter in ``_restickify_input_dep`` —
         # ops that produce multi-symbol coords (flatten/reshape) raise
-        # ``Unsupported`` there and never reach this block.  The
-        # defensive skip below is for extra safety.
+        # ``Unsupported`` there and never reach this block.
         #
         # ``op.data.ranges`` stays at the user's logical output extent
         # (== ``op.layout.size``).  Widening it to the stick-padded extent
@@ -482,18 +481,20 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         perm: list[int] = []
         for coord in in_host_coords:
             picks = [j for j, s in enumerate(old_iter_syms) if s in coord.free_symbols]
-            if len(picks) != 1:
-                break
-            perm.append(picks[0])
-        else:
-            old_pw = op.data
-            padded_loader = padded_buf.make_loader()
-            new_pw = Pointwise(
-                device=old_pw.device,
-                dtype=old_pw.dtype,
-                inner_fn=lambda index, _loader=padded_loader, _perm=tuple(perm): (
-                    _loader([index[p] for p in _perm])
-                ),
-                ranges=old_pw.ranges,
+            assert len(picks) == 1, (
+                f"insert_restickify_padding: input host coord {coord} for "
+                f"{op.get_name()} has {len(picks)} iter syms, expected 1; "
+                f"_restickify_input_dep should have filtered this op"
             )
-            replace_computed_buffer_body(op, new_pw, operations)
+            perm.append(picks[0])
+        old_pw = op.data
+        padded_loader = padded_buf.make_loader()
+        new_pw = Pointwise(
+            device=old_pw.device,
+            dtype=old_pw.dtype,
+            inner_fn=lambda index, _loader=padded_loader, _perm=tuple(perm): (
+                _loader([index[p] for p in _perm])
+            ),
+            ranges=old_pw.ranges,
+        )
+        replace_computed_buffer_body(op, new_pw, operations)
