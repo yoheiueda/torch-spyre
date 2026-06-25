@@ -308,33 +308,22 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _within_stick_host_dim(layout: FixedTiledLayout, dep) -> int | None:
-    """Return the host dim that ``layout``'s STL places within a stick.
-
-    ``layout`` and ``dep`` must belong to the same buffer.  Returns ``None``
-    if no host dim uniquely matches.  ``compute_coordinates`` is used
-    directly instead of ``device_coordinates`` to skip the latter's
-    canonical-form assertion, which need not hold on a restickify input.
-    """
-    return _project_stick_host_dim(layout, layout, dep)
-
-
 def _project_stick_host_dim(
     host_layout: FixedTiledLayout, stick_layout: FixedTiledLayout, dep
 ) -> int | None:
     """Return the ``host_layout`` host dim that carries ``stick_layout``'s
     within-stick coord under ``dep``.
 
-    Generalises ``_within_stick_host_dim``: when the host and stick layouts
-    are the same buffer, this is just the within-stick host dim; when they
-    differ, it projects ``stick_layout``'s STL through ``dep`` to find which
-    ``host_layout`` host dim becomes the within-stick dim under
-    ``stick_layout``.  Uses ``compute_coordinates`` directly rather than
-    ``device_coordinates`` so a non-canonical stick coord doesn't raise —
-    instead, it's filtered via ``is_stick_expr_offset_free``.  Cross-buffer
-    projections (e.g. flatten over a non-contiguous input, sliced-stick
-    views) can synthesize stick coords like ``floor(3*d1/4)`` or
-    ``Mod(d0, 3)`` that ``matching_dim`` alone wouldn't reject.
+    When ``host_layout is stick_layout`` this is just the within-stick host
+    dim of that buffer; when they differ, it projects ``stick_layout``'s STL
+    through ``dep`` to find which ``host_layout`` host dim becomes the
+    within-stick dim under ``stick_layout``.  Uses ``compute_coordinates``
+    directly rather than ``device_coordinates`` so a non-canonical stick
+    coord doesn't raise — instead, it's filtered via
+    ``is_stick_expr_offset_free``.  Cross-buffer projections (e.g. flatten
+    over a non-contiguous input, sliced-stick views) can synthesize stick
+    coords like ``floor(3*d1/4)`` or ``Mod(d0, 3)`` that ``matching_dim``
+    alone wouldn't reject.
     """
     host_coords = host_coordinates(host_layout, dep)
     stl = stick_layout.device_layout
@@ -355,14 +344,14 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     different host dim within the stick than the input's does, else
     ``None``.
 
-    Both stick dims are recovered in the **input's** host frame, so they
-    are directly comparable: ``in_stick_dim`` from
-    ``_within_stick_host_dim(in_layout, in_dep)`` and ``new_stick_dim`` from
-    ``_project_stick_host_dim(in_layout, out_layout, in_dep)`` — the latter
-    projects the output STL through the input dep so both sides share the
-    input's iteration symbols.  The projection is what makes transpose work
-    (input/output host shapes differ in dim order); flatten/slice/reduce
-    ops drop out via ``matching_dim`` returning ``None``.
+    Both stick dims are recovered in the **input's** host frame via
+    ``_project_stick_host_dim``, so they are directly comparable:
+    ``in_stick_dim`` is the input's own within-stick host dim;
+    ``new_stick_dim`` projects the output STL through ``in_dep`` so both
+    sides share the input's iteration symbols.  The projection is what
+    makes transpose work (input/output host shapes differ in dim order);
+    flatten/slice/reduce ops drop out via ``matching_dim`` returning
+    ``None``.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -385,7 +374,7 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     if not isinstance(in_layout, FixedTiledLayout):
         return None
 
-    in_stick_dim = _within_stick_host_dim(in_layout, in_dep)
+    in_stick_dim = _project_stick_host_dim(in_layout, in_layout, in_dep)
     new_stick_dim = _project_stick_host_dim(in_layout, out_layout, in_dep)
     if in_stick_dim is None or new_stick_dim is None:
         return None
