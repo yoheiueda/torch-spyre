@@ -2982,6 +2982,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d2s2": (2, 128, 192, cached_randn((3, 3, 192))),
             },
         },
+        # All param sets here and in the three reduce_dim* groups below slice
+        # the stick dim at an unaligned offset. Compiled passes via #2595's
+        # restickify; eager now correctly raises (needs alt-layout).
         ("test_slice_stick", "test_slice_cpu"): {
             "ops_dict": {
                 "clone": lambda _, x: torch.clone(x),
@@ -3000,6 +3003,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
+            "expect_fail": [
+                "2d64",
+                "2d128",
+                "3d64_0",
+                "3d64_1",
+                "3d64_01",
+                "3d128_0",
+                "3d128_1",
+                "3d128_01",
+            ],
         },
         ("test_slice_stick_reduce_dim0", "test_slice_cpu"): {
             "ops_dict": {
@@ -3016,6 +3029,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
+            "expect_fail": [
+                "2d64",
+                "2d128",
+                "3d64_0",
+                "3d64_1",
+                "3d64_01",
+                "3d128_0",
+                "3d128_1",
+                "3d128_01",
+            ],
         },
         ("test_slice_stick_reduce_dim1", "test_slice_cpu"): {
             "ops_dict": {
@@ -3032,6 +3055,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
+            "expect_fail": [
+                "2d64",
+                "2d128",
+                "3d64_0",
+                "3d64_1",
+                "3d64_01",
+                "3d128_0",
+                "3d128_1",
+                "3d128_01",
+            ],
         },
         ("test_slice_stick_reduce_dim2", "test_slice_cpu"): {
             "ops_dict": {
@@ -3046,6 +3079,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
+            "expect_fail": [
+                "3d64_0",
+                "3d64_1",
+                "3d64_01",
+                "3d128_0",
+                "3d128_1",
+                "3d128_01",
+            ],
         },
         ("test_slice_synthetic_dims", "test_slice_synthetic_dims_cpu"): {
             "param_sets": {
@@ -4176,6 +4217,78 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        # storage_offset support for graph-input placeholders, non-stick dims.
+        # `slicer` runs after .to("spyre") and before compile, so the offset
+        # lives on the placeholder itself, not an intra-graph slice.
+        ("test_storage_offset_placeholder", "test_storage_offset_placeholder"): {
+            "ops_dict": {
+                "add": lambda x: x + x,
+                "exp": torch.exp,
+                # Asymmetric operands (one fresh clean buffer, one the
+                # offset-bearing placeholder itself) -- regression coverage
+                # for the _multi_arg_pointwise_layouts fallback path, which
+                # doesn't get exercised by symmetric x+x at all.
+                "add_asymmetric": lambda x: x.clone() + x,
+            },
+            "param_sets": {
+                "2d_offset_dim0": (
+                    lambda t: t[1:, :],
+                    cached_randn((5, 128), differentiation="ph_2d_offset0"),
+                ),
+                "3d_offset_dim0": (
+                    lambda t: t[1:, :, :],
+                    cached_randn((5, 4, 128), differentiation="ph_3d_offset0"),
+                ),
+                "3d_offset_dim1": (
+                    lambda t: t[:, 1:, :],
+                    cached_randn((4, 5, 128), differentiation="ph_3d_offset1"),
+                ),
+                "3d_gap_dim1": (
+                    # offset+gap: view [9,192,32] over base [9,256,32]
+                    lambda t: t[:, 32:224, :],
+                    cached_randn((9, 256, 32), differentiation="ph_3d_gap1"),
+                ),
+            },
+        },
+        # Stick dim, unaligned offset: needs alt-layout selection.
+        # Must cleanly fail, not silently misbehave.
+        (
+            "test_storage_offset_placeholder_stick_dim",
+            "test_storage_offset_placeholder_stick_dim_rejected",
+        ): {
+            "param_sets": {
+                "1d_offset": (
+                    lambda t: t[3:],
+                    cached_randn((259,), differentiation="ph_1d_offset"),
+                ),
+                "2d_last_dim_offset": (
+                    lambda t: t[:, 1:],
+                    cached_randn((5, 128), differentiation="ph_2d_last_offset"),
+                ),
+            },
+        },
+        # Stick dim, aligned offset (multiple of 64): works without
+        # alt-layout selection, since Mod(c+64, 64) simplifies to Mod(c, 64).
+        (
+            "test_storage_offset_placeholder_stick_dim_aligned",
+            "test_storage_offset_placeholder",
+        ): {
+            "ops_dict": {
+                "add": lambda x: x + x,
+                "exp": torch.exp,
+                # Asymmetric operands (one fresh clean buffer, one the
+                # offset-bearing placeholder itself) -- regression coverage
+                # for the _multi_arg_pointwise_layouts fallback path, which
+                # doesn't get exercised by symmetric x+x at all.
+                "add_asymmetric": lambda x: x.clone() + x,
+            },
+            "param_sets": {
+                "2d_aligned_stick_offset": (
+                    lambda t: t[:, 64:],
+                    cached_randn((5, 128), differentiation="ph_2d_aligned_stick"),
+                ),
+            },
+        },
         (
             "test_round_trip_to_dtype_implicit",
             "test_round_trip_to_dtype_implicit_cpu",
@@ -4464,6 +4577,82 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             b[tiny_value_mask] = FP16_EPS
 
         self.compare_with_cpu(op, a, b)
+
+    def test_storage_offset_placeholder(self, op, slicer, base):
+        # `slicer` runs after .to("spyre") and before compile, so the offset
+        # lives on the placeholder. Tested in both compiled and eager modes.
+        cpu_view = slicer(base.clone())
+        expected = op(cpu_view).float()
+
+        dev_view = slicer(base.clone().to("spyre"))
+
+        for mode_name, compile_mode in (("compiled", True), ("eager", False)):
+            result = _compile_and_run(op, [dev_view], "spyre", compile=compile_mode)
+            assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+                f"{mode_name}: max abs diff: "
+                f"{(result.float() - expected).abs().max().item()}"
+            )
+
+    def test_storage_offset_placeholder_stick_dim_rejected(self, slicer, base):
+        # No alt-layout selection yet, so this must cleanly fail in
+        # both compiled and eager modes, not misbehave.
+        # Different invalid-shape cases raise through different validation
+        # points, so only the compiled path's message is asserted precisely.
+        def fn(x):
+            return x + x
+
+        dev_view = slicer(base.clone().to("spyre"))
+
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(fn, [dev_view], "spyre", compile=True)
+
+        with pytest.raises(Exception):
+            _compile_and_run(fn, [dev_view], "spyre", compile=False)
+
+    def test_storage_offset_placeholder_vs_internal_equivalence(self):
+        # Placeholder-origin and intra-graph-origin views of the same slice
+        # must produce identical results.
+        def fn_placeholder(x):
+            return x + x
+
+        def fn_intragraph(x):
+            return x[1:] + x[1:]
+
+        t = cached_randn((5, 128), differentiation="ss_ph_equiv")
+        t_dev = t.to("spyre")
+        a_dev = t_dev[1:]
+
+        placeholder_result = _compile_and_run(fn_placeholder, [a_dev], "spyre")
+        intragraph_result = _compile_and_run(fn_intragraph, [t_dev], "spyre")
+
+        assert torch.allclose(
+            placeholder_result.float(), intragraph_result.float(), atol=0.1, rtol=0.1
+        ), (
+            "placeholder-origin and intra-graph-origin views diverged: "
+            f"max abs diff: {(placeholder_result.float() - intragraph_result.float()).abs().max().item()}"
+        )
+
+    def test_storage_offset_placeholder_buffer_reuse(self):
+        # Regression test: make_buffer_reuse must propagate the offset
+        # *delta* between reused buffers, not the old buffer's raw offset
+        # (which double-counts it). `y = x + x` then `y.sum(dim=0)` forces a
+        # differently-shaped buffer to reuse y's offset-carrying allocation
+        # via the reinterpret_tensor_with_layout path.
+        def fn(x):
+            y = x + x
+            return y.sum(dim=0, keepdim=False)
+
+        base = cached_randn((5, 128), differentiation="ph_reuse_offset")
+        dev_view = base.clone().to("spyre")[1:, :]
+        cpu_view = base.clone()[1:, :]
+        expected = fn(cpu_view).float()
+
+        for mode_name, compile_mode in (("compiled", True), ("eager", False)):
+            result = _compile_and_run(fn, [dev_view], "spyre", compile=compile_mode)
+            assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+                f"{mode_name}: max abs diff: "
+                f"{(result.float() - expected).abs().max().item()}"
+            )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_binary_op_cpu(self, op, x, y):
@@ -5688,7 +5877,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(x):
             return op(dim, index, x)
 
-        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+        self.compare_with_cpu(fn, x, clone_inputs=True)
 
     def test_slice_cpu(self, op, dim, start, end, x):
         def fn(x):
@@ -5699,7 +5888,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             elif dim == 2:
                 return op(dim, x[:, :, start:end])
 
-        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+        self.compare_with_cpu(fn, x, clone_inputs=True)
 
     def test_slice_synthetic_dims_cpu(self, x):
         def fn(x):

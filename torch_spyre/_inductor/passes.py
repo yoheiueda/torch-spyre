@@ -62,7 +62,10 @@ from .work_division import (
     work_distribution,
     cost_model_matmul_division,
 )
-from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
+from .pass_utils import (
+    apply_splits_from_index_coeff,
+    iteration_space_from_op,
+)
 from .scratchpad.allocator import (
     StrategyBCoOptimizingAllocator,
     scratchpad_planning,

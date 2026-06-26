@@ -1,4 +1,5 @@
-# Misc shape shard A: tensor factory, copy/clone, and slice/split.
+# Misc shape shard A: tensor factory, copy/clone, slice/split, and
+# storage_offset.
 #
 # Shard C holds cat/pad (split out to reduce per-job CI time).  Shard B
 # covers shape ops, squeeze/unsqueeze, t/transpose, dtype conversion, and
@@ -26,9 +27,10 @@ test_suite_config:
             # copy / clone
             - TestOps::test_clone.*
             - TestOps::test_copy_roundtrip.*
-            # slice / split
+            # slice / split / storage_offset
             - TestOps::test_slice.*
             - TestOps::test_split.*
+            - TestOps::test_storage_offset_placeholder.*
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape

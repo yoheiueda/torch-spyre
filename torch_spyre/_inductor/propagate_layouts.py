@@ -327,8 +327,14 @@ def _single_arg_op_layout(
         and dep.index == output_dep.index
         and same_device_size(in_layout.dtype, output.dtype)
     ):
-        # Input and output tensors are being accessed identically and elem size is the same.
-        # We can simply propagate the device_layout.
+        # Input and output tensors are being accessed identically and elem
+        # size is the same — propagate the device_layout. The size check
+        # rejects pure-gap eager-view inputs (e.g. ``x[:k]`` with offset 0
+        # but smaller extent), where ``in_layout.size`` is the rewritten
+        # base shape and ``output.size`` is the view shape; coord/index
+        # equality alone does not distinguish them because the range info
+        # lives in ``dep.ranges``, not ``dep.index``. Falling through to
+        # the general path re-derives ``device_size`` from ``output.size``.
         stl = SpyreTensorLayout(
             stl.device_size, stl.stride_map, get_device_dtype(output.dtype)
         )
@@ -614,6 +620,18 @@ def _multi_arg_pointwise_layouts(
         can_use_same_layout = False
     else:
         for arg, arg_coors in zip(args, in_coords):
+            # The size check rejects pure-gap eager-view inputs (e.g.
+            # ``x[:k]`` with offset 0 but smaller extent). For those,
+            # ``arg.layout.size`` is the rewritten base shape while
+            # ``output.size`` is the view shape; coord/index equality
+            # alone does not distinguish them because the range info
+            # lives in ``dep.ranges``, not ``dep.index``. Without this
+            # check, ``same_layout`` would propagate the input's
+            # base-shaped ``device_size`` onto the (smaller) output STL,
+            # leaving the output's ``FixedTiledLayout`` with
+            # ``layout.size`` and ``device_layout.device_size``
+            # disagreeing and downstream byte-budget / work-division
+            # calculations off by a base/view ratio.
             if (
                 arg_coors != out_coords
                 or arg.layout.size != output.size
@@ -982,6 +1000,137 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         operations.remove(op)
 
 
+def _eager_view_input_layout(
+    real_input: torch.Tensor,
+    ptl: FixedLayout,
+    name: str,
+) -> FixedLayout | None:
+    """Build a corrected FixedLayout for an eager-mode placeholder view.
+
+    Context: in eager mode each spyre op is its own ``torch.compile``
+    graph, so any view chaining the user did on the host (slice,
+    transpose, compositions) lands at the compiled graph as an input
+    tensor that is **already a view of base storage**. There is no
+    ``aten.slice`` / ``aten.transpose`` node inside the traced graph
+    to attach a ``ReinterpretView`` to — the view-ness is encoded only
+    in ``real_input._base`` / ``real_input.storage_offset()`` /
+    ``real_input.stride()``. Contrast inline views (a slice traced
+    inside the graph), where upstream Inductor builds a
+    ``ReinterpretView`` and ``MemoryDep.index`` naturally carries the
+    offset; that path never reaches this helper.
+
+    Inductor's default behaviour for eager-mode placeholder views is to
+    copy the view's own ``size`` / ``stride`` / ``storage_offset`` onto
+    the placeholder's ``FixedLayout``. For spyre's downstream passes we
+    need ``arg.layout`` to describe **base storage** with the offset
+    woven into ``MemoryDep.index`` (via ``FixedLayout.make_indexer``) —
+    matching the convention upstream Inductor produces for inline
+    ``aten.slice``. This helper decides whether a correction is needed
+    and returns a replacement layout if so; the caller assigns it.
+
+    Whether a view exists (``real_input._base is not None``) is **not**
+    the decision point. What matters is whether the default layout
+    assumption is wrong in some way the downstream code needs corrected.
+    Two independent things can be wrong:
+
+    1. **Size differs from base with stride preserved** (sub-region:
+       slice, gap, narrow). The view walks base storage with base's own
+       stride table but covers a smaller extent. Rewriting size/stride
+       to base normalises the layout to the "layout = base, dep = view"
+       form. Note this fires for pure gaps (``x[:6]``) too — offset 0
+       but size shrunk.
+    2. **storage_offset != 0**. The default layout claims offset 0,
+       which is wrong. The offset must land in ``layout.offset`` so
+       ``make_indexer`` includes it in ``dep.index``.
+
+    These conditions overlap (plain slice triggers both) and separate
+    (pure gap triggers only #1; slice+transpose triggers only #2). The
+    branches handle each:
+
+    +----------------------+---------+--------+-------------------------+
+    | Example              | sub-rgn | off!=0 | Action                  |
+    +======================+=========+========+=========================+
+    | ``x[1:]``            | yes     | yes    | size/stride <- base;    |
+    |                      |         |        | offset = storage_offset |
+    +----------------------+---------+--------+-------------------------+
+    | ``x[:6]``            | yes     | no     | size/stride <- base;    |
+    |                      |         |        | offset = 0              |
+    +----------------------+---------+--------+-------------------------+
+    | ``x[1:].t()``        | no      | yes    | keep view size/stride;  |
+    |                      |         |        | offset = storage_offset |
+    +----------------------+---------+--------+-------------------------+
+    | ``x.t()``            | no      | no     | no rewrite              |
+    +----------------------+---------+--------+-------------------------+
+    | ``x[:1].t()``        | no      | no     | no rewrite              |
+    +----------------------+---------+--------+-------------------------+
+    | contiguous (no view) | no      | no     | no rewrite              |
+    +----------------------+---------+--------+-------------------------+
+
+    Why the sub-region gate uses ``stride preserved AND size differs``:
+    a pure transpose has size differing as a tuple (permuted), but
+    stride is permuted too — rewriting it to ``base.size()`` /
+    ``base.stride()`` would silently strip the permutation. Only
+    sub-region views preserve ``base.stride()`` exactly. For
+    permuted-with-offset views the offset-only branch keeps the
+    permutation intact and just attaches the offset.
+
+    Stick-dim-aligned guard: both rewrite branches require
+    ``storage_offset % elem_in_stick == 0``. Unaligned offsets land
+    partway through a stick and the device-side stick layout has no
+    room to express that without alt-layout selection. Raise
+    ``Unsupported`` here rather than silently miscompute downstream.
+
+    Args:
+        real_input: The actual input tensor passed to the compiled
+            graph. Carries the view metadata we read.
+        ptl: The placeholder's current ``FixedLayout`` (built by
+            Inductor from ``real_input``'s view metadata). Provides
+            device/dtype for the replacement; size/stride/offset are
+            recomputed.
+        name: Graph input name, for the error message only.
+
+    Returns:
+        A new ``FixedLayout`` to assign to the placeholder, or ``None``
+        if no correction is needed.
+
+    Raises:
+        Unsupported: If ``storage_offset`` is not a multiple of
+            ``elem_in_stick`` (stick-dim unaligned).
+    """
+    base = real_input._base
+    storage_offset = real_input.storage_offset()
+    is_sub_region = (
+        base is not None
+        and tuple(real_input.stride()) == tuple(base.stride())
+        and tuple(real_input.size()) != tuple(base.size())
+    )
+    if not (is_sub_region or storage_offset != 0):
+        return None
+
+    elem_in_stick = get_elem_in_stick(ptl.dtype)
+    if storage_offset % elem_in_stick != 0:
+        raise Unsupported(
+            f"graph input {name} has stick-dim unaligned "
+            f"storage_offset={storage_offset} (not a multiple of "
+            f"{elem_in_stick}); not yet supported"
+        )
+
+    if is_sub_region:
+        new_size = list(base.size())
+        new_stride = list(base.stride())
+    else:
+        new_size = list(real_input.size())
+        new_stride = list(real_input.stride())
+
+    return FixedLayout(
+        device=ptl.device,
+        dtype=ptl.dtype,
+        size=new_size,
+        stride=new_stride,
+        offset=sympy.Integer(storage_offset),
+    )
+
+
 def propagate_spyre_tensor_layouts(
     graph: GraphLowering,
 ) -> None:
@@ -1009,6 +1158,9 @@ def propagate_spyre_tensor_layouts(
                 ptl = tb.data.data.layout
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
+                new_layout = _eager_view_input_layout(real_input, ptl, name)
+                if new_layout is not None:
+                    tb.data.data.layout = new_layout
                 tb.layouts = [stl]
 
     # Operations are in topological order (guaranteed by GraphLowering).

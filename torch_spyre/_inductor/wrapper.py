@@ -146,7 +146,15 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             return self.codegen_exact_buffer_reuse(old_name, new_name, del_line)
 
         new_stl = new.get_layout().device_layout
-        reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
+        # reinterpret_tensor_with_layout's offset arg is added to old_name's
+        # *current* runtime storage_offset (see spyre_views.cpp), not treated
+        # as an absolute target. Passing old's offset directly double-counts
+        # it; the delta to new's offset is what actually shifts to the right
+        # place.
+        offset_increment = (new.get_layout().offset or 0) - (
+            old.get_layout().offset or 0
+        )
+        reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, {offset_increment}, {new_stl!r})"
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
 
     def allocate_pool(self):
