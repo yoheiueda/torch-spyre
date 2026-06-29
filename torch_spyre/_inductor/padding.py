@@ -319,7 +319,7 @@ def _project_stick_host_dim(
     host dim; when they differ, stick_layout's STL is projected through dep.
     Returns None unless the stick coord is valid.
     """
-    host_coords = host_coordinates(host_layout, dep)
+    host_coords = host_coordinates(host_layout, dep, None)
     stl = stick_layout.device_layout
     device_index = concretize_index(dep.index, set(dep.ranges.keys()))
     device_coords = compute_coordinates(
@@ -437,7 +437,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         # op.data.ranges stays at the logical output extent; the stick-boundary
         # widening happens later in superdsc's _extend_restickify_to_padded
         # (Inductor's _simplify_loops would undo it if done here).
-        in_host_coords = host_coordinates(in_layout, in_dep)
+        in_host_coords = host_coordinates(in_layout, in_dep, None)
         old_iter_syms = list(in_dep.ranges.keys())
         perm: list[int] = []
         for i, coord in enumerate(in_host_coords):
