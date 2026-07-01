@@ -24,9 +24,12 @@ from .loop_info import copy_op_metadata
 from .pass_utils import copy_fx_custom_meta
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
+    BaseView,
+    Buffer,
     ComputedBuffer,
     FixedLayout,
     InputBuffer,
+    MutableBox,
     MutationLayoutSHOULDREMOVE,
     Operation,
     ReinterpretView,
@@ -331,6 +334,113 @@ def finalize_layouts(graph: GraphLowering) -> None:
             logger.debug("restickify plan: (none)")
 
 
+def _retarget_internal_buf_mutation(
+    graph: GraphLowering,
+    mutation_op: ComputedBuffer,
+    target_name: str,
+    alt_stl: SpyreTensorLayout,
+) -> None:
+    """Retarget an internal-buffer mutation onto the alt-layout buffer.
+
+    *Internal buffer* = a compiler-allocated buffer (a ComputedBuffer such as a
+    torch.cat output built via empty() + sliced mutate_to), as opposed to a
+    graph input (a caller-owned argument). The distinction is the whole point:
+    an internal buffer has no caller-owned address to preserve, so no copy-back
+    is needed.
+
+    For a graph-input target, insert_post_mutation_restickify restickifies the
+    pre-existing data into a temp buffer and copies back to the caller address.
+    An internal buffer has no pre-existing data and no caller address, so
+    neither the pre-restickify nor the copy-back is needed: the buffer itself is
+    committed to alt_stl (FixedTiledLayout) by finalize_layouts.
+
+    Two write-target shapes reach here:
+
+    - The write covers a *sub-region* of the buffer (the common case, e.g. a
+      torch.cat input written through mutate_to(SliceView(output, dim, offset))).
+      The mutation target is then a single-level view whose host FixedLayout
+      carries the slice offset (e.g. +32 columns). That host layout stays valid
+      (finalize keeps the host size/stride and only attaches the device STL), so
+      rebuild the target as a fresh ReinterpretView over the alt-layout buffer
+      with the same host slice layout. The write maps through alt_stl, relocating
+      the offset off the stick dim, and codegen emits a restickify (input/output
+      stick vars differ) that writes the slice at the correct non-stick base
+      address.
+    - The write covers the *whole* buffer (no view). A ReinterpretView would be a
+      pointless identity wrapper, so retarget directly at the buffer.
+
+    The single-level view path is fully general for ReinterpretView chains: a
+    ReinterpretView's layout is absolute w.r.t. its storage, so target.get_layout()
+    already encodes the full offset/stride composition no matter how many slices
+    produced it. SliceView.create folds a slice of realized storage into one such
+    ReinterpretView (its is_storage_and_layout fast path), so the chained
+    SliceView.create calls in lowerings like lower_constant_pad_nd still arrive
+    here as a single ReinterpretView, not a view of a view.
+
+    A genuine multi-level view (a SliceView whose data is another view — only the
+    slow non-storage path of SliceView.create, carrying an opaque reindex closure
+    rather than a layout) is therefore rejected by assert. get_buffer() unwraps
+    every view layer to reach target_buf, but reusing only the outermost
+    target.get_layout() would drop an inner layer's reindex/offset. Re-pointing
+    such a chain would mean walking it and rebinding each layer's closure onto
+    target_buf; no current lowering produces this shape on this path, so we assert
+    (a loud tripwire at the collapse boundary) rather than ship untestable
+    recomposition.
+    """
+    target_buf = graph.get_buffer(target_name)
+    base_layout = target_buf.layout  # FixedTiledLayout(alt_stl) after finalize
+    assert isinstance(base_layout, FixedTiledLayout), (
+        f"internal-buf mutation target {target_name} is {type(base_layout).__name__}, "
+        f"expected FixedTiledLayout"
+    )
+
+    original_layout = mutation_op.layout
+    assert isinstance(original_layout, MutationLayoutSHOULDREMOVE)
+    target = original_layout.target
+
+    if isinstance(target, BaseView):
+        # Single-level view of target_buf: peeling exactly one view layer (plus a
+        # MutableBox/StorageBox wrapper) must land on target_buf itself, not on a
+        # further view. target.get_layout() captures the full composition for a
+        # ReinterpretView (the only shape lowerings produce here, see docstring);
+        # a deeper SliceView closure chain would lose an inner layer, so assert.
+        inner = target.data
+        while isinstance(inner, MutableBox):
+            inner = inner.data
+        # Single-level invariant: peeling exactly one view layer (plus
+        # MutableBox/StorageBox wrappers) must land on the target buffer itself,
+        # not a further view. Compare by buffer name, not object identity: a
+        # mutate_to over a clone()'d base (the lone slice_scatter case) reaches a
+        # distinct ComputedBuffer object with the same name as graph.get_buffer(),
+        # whereas a genuine view-of-a-view leaves a Buffer-less view here.
+        inner_name = inner.get_name() if isinstance(inner, Buffer) else None
+        assert inner_name == target_name, (
+            f"internal-buf mutation target {target_name} is a multi-level view "
+            f"({type(target).__name__} over {type(inner).__name__}); only "
+            f"single-level views are supported"
+        )
+        slice_layout = target.get_layout()
+        new_target = ReinterpretView(data=StorageBox(target_buf), layout=slice_layout)
+    else:
+        # Whole-buffer mutation: target is the buffer (or a box around it), not a
+        # sub-region view. No ReinterpretView needed.
+        assert isinstance(target, (Buffer, MutableBox)), (
+            f"internal-buf mutation target {target_name} has unexpected target type "
+            f"{type(target).__name__}"
+        )
+        new_target = target_buf
+
+    mutation_op.layout = MutationLayoutSHOULDREMOVE(new_target)
+    mutation_op._emit_set_layout = (target_name, alt_stl)
+
+    logger.info(
+        "insert_post_mutation_restickify: internal target %s retargeted via %s "
+        "(alt layout, no copy-back)",
+        target_name,
+        mutation_op.get_name(),
+    )
+
+
 def insert_post_mutation_restickify(graph: GraphLowering) -> None:
     """
     Insert pre/post ops around a slice mutation when the original layout cannot
@@ -372,7 +482,17 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         assert isinstance(mutation_op, ComputedBuffer)
 
         graph_input = graph.graph_inputs.get(target_name)
-        assert graph_input is not None
+        if graph_input is None:
+            # Internal mutation target (e.g. a torch.cat output buffer): there is
+            # no caller-owned address to preserve, so the pre-restickify and
+            # copy-back used for graph inputs are unnecessary. The target buffer
+            # was already committed to alt_stl in propagate_layouts, and
+            # finalize_layouts wrapped it as FixedTiledLayout(alt_stl). Retarget
+            # the mutation into a fresh ReinterpretView slice of that buffer so
+            # the write picks up the alt device layout (moving the slice offset
+            # off the stick dim) while keeping the original host slice offset.
+            _retarget_internal_buf_mutation(graph, mutation_op, target_name, alt_stl)
+            continue
 
         # Create fresh layouts here, since reusing base_layout would overwrite
         # arg0_1's address during memory_planning.
@@ -400,14 +520,6 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         original_layout = mutation_op.layout
         assert isinstance(original_layout, MutationLayoutSHOULDREMOVE)
         slice_layout = original_layout.target.get_layout()
-        # We only reach this pass because the write stick had a non-zero offset,
-        # so the slice layout must carry it.
-        assert slice_layout.offset != 0, (
-            f"slice offset lost while retargeting mutation {mutation_name} "
-            f"(target={type(original_layout.target).__name__}, "
-            f"layout offset={slice_layout.offset!r}); the original slice offset "
-            f"is not carried by the mutation target layout"
-        )
         slice_view_of_buf_tmp = ReinterpretView(
             data=StorageBox(buf_tmp), layout=slice_layout
         )

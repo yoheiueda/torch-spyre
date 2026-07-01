@@ -3060,12 +3060,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "param_sets": {
                 "2d64": (1, 32, 96, cached_randn((128, 256)), cached_randn((128, 64))),
+                # Offset-free sub-stick write into a graph input: start=0 with a
+                # width shorter than the 64-elem stick. Without an alt layout the
+                # write pads to a full stick and zeroes the untouched tail (#2147).
+                "2d_substick_0": (
+                    1,
+                    0,
+                    32,
+                    cached_randn((128, 256)),
+                    cached_randn((128, 32)),
+                ),
                 "2d128": (
                     1,
                     1,
                     129,
                     cached_randn((128, 256)),
                     cached_randn((128, 128)),
+                ),
+                "3d_substick_0": (
+                    2,
+                    0,
+                    32,
+                    cached_randn((128, 192, 256)),
+                    cached_randn((128, 192, 32)),
                 ),
                 "3d64_0": (
                     2,
@@ -3143,6 +3160,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_slice_synthetic_dims", "test_slice_synthetic_dims_cpu"): {
             "param_sets": {
                 "5d": (cached_randn((2, 3, 4, 5, 192), dtype=torch.float16),),
+            },
+        },
+        (
+            "test_slice_scatter_internal_base",
+            "test_slice_scatter_internal_base_cpu",
+        ): {
+            "param_sets": {
+                # Stick (last) dim aligned to a full stick (64).
+                "aligned64": (
+                    3,
+                    0,
+                    64,
+                    cached_randn((1, 8, 1, 128)),
+                    cached_randn((1, 8, 1, 64)),
+                ),
+                # Sub-stick, offset-free (cols 0:32 of a 64-wide stick): the
+                # natural-layout write would pad the stick and zero cols 32:63;
+                # the alt layout relocates the stick dim. Internal base only.
+                "substick_off0": (
+                    3,
+                    0,
+                    32,
+                    cached_randn((1, 8, 1, 64)),
+                    cached_randn((1, 8, 1, 32)),
+                ),
+                # Sub-stick with a non-zero start (cols 32:64): the realized
+                # clone makes SliceView.create carry the +32 offset.
+                "substick_off32": (
+                    3,
+                    32,
+                    64,
+                    cached_randn((1, 8, 1, 64)),
+                    cached_randn((1, 8, 1, 32)),
+                ),
+                # Non-stick (non-last) dim: full sticks written, no substick
+                # relocation needed.
+                "nonstick_dim2": (
+                    2,
+                    1,
+                    3,
+                    cached_randn((1, 8, 4, 64)),
+                    cached_randn((1, 8, 2, 64)),
+                ),
             },
         },
         ("test_rope_fms", "test_rope_cpu"): {
@@ -5877,26 +5937,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             expected[:, :, start:end].copy_(y)
         torch.testing.assert_close(x_spyre.cpu(), expected, atol=0.1, rtol=0.1)
 
-    def test_slice_stick_mutation_no_alt_dim_raises(self):
-        """Test that offset-stick slice mutation raises Unsupported when no alt dim is divisible by stick_size."""
-
-        def fn(x, y):
-            x[:, 32:96].copy_(y)
-            return x.clone()
-
-        x = torch.randn(63, 128, dtype=torch.float16, device="spyre")
-        y = torch.randn(63, 64, dtype=torch.float16, device="spyre")
-
-        compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
-        with pytest.raises(Exception) as exc_info:
-            compiled(x, y)
-        assert "no offset-free alternative stick dim" in str(exc_info.value)
-
     def test_slice_synthetic_dims_cpu(self, x):
         def fn(x):
             return x[:, 1:2, :, :, :] + x[:, :, 2:3, :, :]
 
         self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
+    def test_slice_scatter_internal_base_cpu(self, dim, start, end, x, src):
+        """Functional ``slice_scatter`` into an INTERNAL (non-input) base.
+
+        Exercises the custom ``lower_slice_scatter`` lowering (#2147): the base
+        is derived from a graph input (``x + 1.0``) so the ``clone`` it scatters
+        into is an internal buffer, not a placeholder with copy-back. This is
+        the case the in-tree functional decomposition cannot codegen (it hits
+        the ``index_expr`` wall). Covers aligned (``:64``) and sub-stick
+        offset-free (``:32``) / offset (``32:64``) writes on the stick (last)
+        dim plus a non-last dim.
+        """
+
+        def fn(x, src):
+            base = x + 1.0
+            return torch.slice_scatter(base, src, dim, start, end)
+
+        self.compare_with_cpu(fn, x, src, clone_inputs=True, run_eager=False)
 
     def test_rope_cpu(self, q, freqs):
         def fn(q, freqs):
