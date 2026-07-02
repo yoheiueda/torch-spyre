@@ -49,6 +49,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
+    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -497,6 +498,137 @@ def _pad_restickify_output_middle(
     )
 
 
+def _producer_stick_device_dim(
+    producer: ComputedBuffer, new_stick_dim: int
+) -> int | None:
+    """Return the producer device-size entry index that carries the input host
+    dim ``new_stick_dim`` (the dim the restickify turns into its new stick dim),
+    or None if the producer geometry does not expose it as a bumpable middle
+    device entry.
+
+    The restickify over-reads this dim to the stick boundary; bumping the
+    producer's device_size on the matching entry makes the producer allocate
+    (and its backGap path leave defined) the widened tail, so the over-read
+    lands inside the producer's own buffer instead of uninitialised HBM.
+
+    The entry is located by the write index's host coordinate symbol (mirroring
+    ``_restickify_output_middle_device_dim``), not by extent equality: two host
+    dims can share an extent, and only the symbol match is unambiguous.  The
+    within-stick entry is excluded.
+    """
+    layout = producer.get_layout()
+    pdl = layout.device_layout
+
+    wdep = next(
+        (d for d in producer.get_read_writes().writes if hasattr(d, "name")), None
+    )
+    if wdep is None:
+        return None
+
+    host_coords = host_coordinates(layout, wdep, None)
+    syms = host_coords[new_stick_dim].free_symbols
+    if len(syms) != 1:
+        return None
+    sym = next(iter(syms))
+
+    didx = concretize_index(wdep.index, set(wdep.ranges.keys()))
+    dcoords = compute_coordinates(pdl.device_size, pdl.stride_map, wdep.ranges, didx)
+    return next(
+        (k for k in range(len(dcoords) - 1) if sym in dcoords[k].free_symbols),
+        None,
+    )
+
+
+def _count_consumers(buf_name: str, graph: GraphLowering) -> int:
+    """Number of operations that read ``buf_name``."""
+    count = 0
+    for op in graph.operations:
+        try:
+            reads = op.get_read_writes().reads
+        except Exception:
+            continue
+        if any(getattr(r, "name", None) == buf_name for r in reads):
+            count += 1
+    return count
+
+
+def _fuse_restickify_pad_into_producer(
+    in_buf, new_stick_dim: int, n: int, pad: int, graph: GraphLowering
+) -> bool:
+    """Grow a single-consumer pointwise producer's output to the stick-aligned
+    extent so the restickify reads its widened tail directly, avoiding the
+    ``lower_pad_sequence`` copy (separate buffer + fill + copy + HBM round-trip).
+
+    Mirrors ``_pad_restickify_output_middle``: only the producer's device_size
+    on the entry carrying ``new_stick_dim`` grows (host size/stride and
+    stride_map stay logical); the producer keeps computing its true ``n`` rows,
+    and ``_create_sdsc_tensors``'s ``dev_dim_size > it_dim_size`` backGap path
+    leaves the widened tail defined.  The restickify then over-reads the padded
+    producer instead of uninitialised HBM (the over-read lands in the output's
+    backGap-discarded band, so the tail value never reaches a read position).
+
+    Only qualifies when the producer is an internal (non-output),
+    single-consumer pointwise ``ComputedBuffer`` without a mutation layout;
+    returns False otherwise so the caller falls back to ``lower_pad_sequence``.
+    """
+    if not isinstance(in_buf, ComputedBuffer):
+        return False
+    if not isinstance(in_buf.data, Pointwise):
+        return False
+    if isinstance(in_buf.layout, MutationLayoutSHOULDREMOVE):
+        return False
+    name = in_buf.get_name()
+    if name in graph.get_output_names():
+        return False
+    if _count_consumers(name, graph) != 1:
+        return False
+
+    device_entry = _producer_stick_device_dim(in_buf, new_stick_dim)
+    if device_entry is None:
+        return False
+
+    layout = in_buf.get_layout()
+    pdl = layout.device_layout
+    old_extent = pdl.device_size[device_entry]
+    new_extent = n + pad
+
+    # Bump ONLY the device_size entry; keep stride_map untouched (same rationale
+    # as _pad_restickify_output_middle: rescaling stride_map would desynchronise
+    # the within-stick expression from the logical write index).
+    new_device_size = list(pdl.device_size)
+    new_device_size[device_entry] = new_extent
+    padded_stl = SpyreTensorLayout(
+        new_device_size,
+        list(pdl.stride_map),
+        pdl.device_dtype,
+        pdl.element_arrangement,
+    )
+
+    host_size = [concretize_expr(s) for s in layout.size]
+    host_size[new_stick_dim] = new_extent
+    host_stride = [concretize_expr(s) for s in layout.stride]
+    in_buf.layout = FixedTiledLayout(
+        layout.device,
+        layout.dtype,
+        host_size,
+        host_stride,
+        padded_stl,
+    )
+
+    logger.debug(
+        "insert_restickify_padding: fused pad into producer %s device dim %d "
+        "%d -> %d (host dim %d: %d -> %d)",
+        name,
+        device_entry,
+        old_extent,
+        new_extent,
+        new_stick_dim,
+        n,
+        new_extent,
+    )
+    return True
+
+
 def insert_restickify_padding(graph: GraphLowering) -> None:
     """Zero-pad a Restickify's input along the dim that becomes the new
     stick dim, when its extent is not a multiple of the stick size.
@@ -541,6 +673,14 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         n = host_size[new_stick_dim]
         pad = compute_padding(n, dtype)
         if pad == 0:
+            continue
+
+        # Fuse the pad into a single-consumer pointwise producer when possible:
+        # grow the producer's output to the stick-aligned extent (device_size
+        # bump only) so the restickify over-reads its defined tail directly,
+        # skipping the lower_pad_sequence copy.  Falls back below for graph
+        # inputs, multi-consumer, non-pointwise, or mutation-layout producers.
+        if _fuse_restickify_pad_into_producer(in_buf, new_stick_dim, n, pad, graph):
             continue
 
         padded_size = list(host_size)
