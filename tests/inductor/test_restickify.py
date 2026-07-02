@@ -981,3 +981,100 @@ def test_pad_4d_transpose_1_last_clone(pad_tensors_4d_t1_last):
     """4D transpose(1,-1)+clone: swaps dim-1 and dim-3, new stick dim unaligned."""
     x = pad_tensors_4d_t1_last
     _compare(lambda x: x.transpose(1, -1).clone(), x, check_strides=False)
+
+
+# ------- Restickify input padding fused into a pointwise producer ---------
+#
+# When the restickify's input is an internal single-consumer pointwise
+# ComputedBuffer, insert_restickify_padding grows the producer's output to the
+# stick boundary (device_size bump) instead of emitting a lower_pad_sequence
+# copy.  The producer keeps computing its true rows; the widened tail is left
+# defined by the backGap path and over-read into the restickify's discarded
+# output band.  A graph-input restickify has no producer and falls back to the
+# copy.
+#
+# The materializer must put BOTH binary operands behind a computation so the
+# transposed side (not a bare graph input) is the one restickified — a bare
+# graph-input operand is preferred for restickify and would hit the fallback.
+
+
+def _run_capturing_padding_log(fn, *args):
+    """Run fn on Spyre, returning (result, fused_fire_count, copy_fire_count)
+    captured from insert_restickify_padding's debug log."""
+    import logging
+
+    import torch_spyre._inductor.padding as _padding
+
+    records: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture()
+    prev_level = _padding.logger.level
+    _padding.logger.addHandler(handler)
+    _padding.logger.setLevel(logging.DEBUG)
+    try:
+        result = _compile_and_run(fn, args, DEVICE)
+    finally:
+        _padding.logger.removeHandler(handler)
+        _padding.logger.setLevel(prev_level)
+
+    fused = sum("fused pad into producer" in m for m in records)
+    return result, fused, records
+
+
+RESTICKIFY_FUSE_SIZES = [(67, 67), (2, 67, 67)]
+
+
+@pytest.fixture(params=RESTICKIFY_FUSE_SIZES, ids=lambda p: "x".join(map(str, p)))
+def fuse_tensors(request):
+    shape = request.param
+    x = torch.randn(shape, dtype=torch.float16)
+    y = torch.randn(shape, dtype=torch.float16)
+    return x, y
+
+
+def test_pad_fused_into_producer(fuse_tensors):
+    """Both-computed binary (x*2).T + relu(y): the transposed side is an
+    internal single-consumer pointwise producer, so the input pad fuses into it
+    (no lower_pad_sequence copy).  Both operands unaligned -> input-stick pad
+    AND output-middle pad fire on the same restickify op."""
+    x, y = fuse_tensors
+
+    def fn(x, y):
+        return (x * 2).transpose(-2, -1) + torch.relu(y)
+
+    result, fused, _ = _run_capturing_padding_log(fn, x, y)
+    assert fused >= 1, "expected producer-fusion to fire, but it did not"
+    compare_with_cpu(fn, x, y, target=result, run_eager=False)
+
+
+def test_pad_graph_input_falls_back():
+    """Restickifying a bare graph input has no producer to fuse into; the pass
+    must fall back to the lower_pad_sequence copy and still be correct."""
+    x = torch.randn((67, 67), dtype=torch.float16)
+    y = torch.randn((67, 67), dtype=torch.float16)
+
+    def fn(x, y):
+        return x.transpose(-2, -1) + y
+
+    result, fused, _ = _run_capturing_padding_log(fn, x, y)
+    assert fused == 0, "graph-input restickify should not fuse into a producer"
+    compare_with_cpu(fn, x, y, target=result, run_eager=False)
+
+
+def test_pad_multi_consumer_producer_falls_back():
+    """A producer read by more than one op must not be relayout-fused (the bump
+    would corrupt the other reader's view); it falls back to the copy."""
+    x = torch.randn((67, 128), dtype=torch.float16)
+    z = torch.randn((128, 67), dtype=torch.float16)
+
+    def fn(x, z):
+        p = x * 2  # two consumers: the transpose below and the add
+        return p.transpose(-2, -1) + z + p.sum()
+
+    result, fused, _ = _run_capturing_padding_log(fn, x, z)
+    assert fused == 0, "multi-consumer producer should fall back, not fuse"
+    compare_with_cpu(fn, x, z, target=result, run_eager=False)
