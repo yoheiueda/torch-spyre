@@ -62,7 +62,6 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
-    check_stick_expr_supported,
     concretize_expr,
     concretize_index,
     find_reduction_var,
@@ -332,9 +331,9 @@ def _project_stick_host_dim(
 
     When the two layouts are the same this is the buffer's own within-stick
     host dim; when they differ, stick_source_layout's STL is projected through
-    dep.  Returns None for an offset-free stick coord (a clean Mod(var, N) /
-    bare var / 0) or a harmless non-stick ``var + c`` offset.  Raises Unsupported
-    on a malformed stick expr or a mid-stick ``Mod(var, N) + c`` slice offset.
+    dep.  A mid-stick ``Mod(var, N) + c`` slice offset resolves to the host dim
+    carrying ``var`` (so the caller can tell a plain pointwise slice apart from
+    a restickify); any other non-offset-free expr returns None (declined).
     """
     host_coords = host_coordinates(input_layout, dep, None)
     stl = stick_source_layout.device_layout
@@ -347,14 +346,14 @@ def _project_stick_host_dim(
         return None
     stick_expr = device_coords[-1]
     if not is_stick_expr_offset_free(stick_expr, stl.elems_per_stick()):
-        # check_stick_expr_supported raises on a genuinely malformed expr;
-        # recognized offset variants fall through.
-        check_stick_expr_supported(stick_expr, stl.elems_per_stick())
         # A mid-stick offset is Mod(var, N) + c: the constant is added to the
         # within-stick term, so the input is sliced on what becomes the stick
         # dim at a non-stick-aligned start and the read begins partway into a
-        # stick.  A bare var + c offset instead shifts a whole non-stick device
-        # dim and is harmless.
+        # stick.  Resolve it to the host dim carrying ``var`` and return that:
+        # the caller compares in-stick vs. new-stick dim, so a plain pointwise
+        # slice (offset on the buffer's own stick dim) declines cleanly, while
+        # a genuine restickify/transpose (offset on a *different* dim) proceeds
+        # into the padding path and raises there on the unpaddable slice.
         free_args = [a for a in stick_expr.args if a.free_symbols]
         base = free_args[0] if len(free_args) == 1 else None
         mid_stick = (
@@ -364,17 +363,11 @@ def _project_stick_host_dim(
             and base.args[1] == stl.elems_per_stick()
         )
         if mid_stick:
-            # Unpaddable: declining it (return None) would route the op to
-            # lower_restickify, which silently miscompiles (wrong values,
-            # correct shape).  Raise instead.
-            # TODO: support mid-stick slices on restickify/transpose rather
-            # than raising (the goal is coverage, not a hard error).
-            raise Unsupported(
-                f"insert_restickify_padding: sliced input on the stick dim "
-                f"(mid-stick offset {stick_expr!r}) is not yet supported"
-            )
-        # A non-stick var + c offset compiles correctly; decline padding and
-        # let it lower normally.
+            return matching_dim(host_coords, stick_expr)
+        # Any other non-offset-free expr (a bare var + c shift of a whole
+        # non-stick device dim, or a rescaled modular from an ordinary
+        # pointwise stick-dim slice) compiles correctly when lowered normally;
+        # decline padding.
         return None
     return matching_dim(host_coords, stick_expr)
 
@@ -773,10 +766,11 @@ def _pad_restickify_input_via_copy(
         sym = next(iter(syms))
         iter_range = concretize_expr(in_dep.ranges[sym])
         dim_size = concretize_expr(in_layout.size[i])
-        # Backstop for a slice on any input host dim of a candidate.
-        # _project_stick_host_dim already raises on a mid-stick slice of the
-        # stick dim; this catches a slice on a *non-stick* dim that still
-        # reaches here, so codegen fails loudly instead of over-reading.
+        # Backstop for a slice on any input host dim of a candidate: a genuine
+        # restickify whose (moved) stick dim or any other dim is sliced reaches
+        # here with iter_range < dim_size, and cannot be padded, so fail loudly
+        # instead of over-reading.  A plain pointwise stick-dim slice never gets
+        # here (the candidate matcher declines it: same in-/new-stick dim).
         # TODO: support sliced inputs (e.g. ``x[:, :, 1:66, :].transpose(-2, -1)``).
         if iter_range != dim_size:
             raise Unsupported(
