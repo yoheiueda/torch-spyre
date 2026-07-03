@@ -392,7 +392,7 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     - ``host_size``: the input's concretized host size.
     - ``new_stick_dim``: input host dim that becomes the output's stick dim.
     - ``in_stick_dim``: input host dim that becomes the output's "old-stick"
-      middle dim.
+      non-stick device dim.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -426,16 +426,16 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     return in_dep, in_buf, in_layout, host_size, new_stick_dim, in_stick_dim
 
 
-def _device_dim_carrying_sym(dl: SpyreTensorLayout, wdep, sym) -> int | None:
+def _device_dim_carrying_sym(stl: SpyreTensorLayout, wdep, sym) -> int | None:
     """Return the non-within-stick ``device_size`` dim whose device coordinate
     carries ``sym`` (the free symbol of some host dim), or None if none does.
 
-    The dim is located by symbol match, not extent equality: two host dims can
-    share an extent, and only the symbol is unambiguous.  The within-stick dim
+    The dim is located by symbol match, not dim-size equality: two host dims can
+    share a dim size, and only the symbol is unambiguous.  The within-stick dim
     (the last device coordinate) is excluded.
     """
     didx = concretize_index(wdep.index, set(wdep.ranges.keys()))
-    dcoords = compute_coordinates(dl.device_size, dl.stride_map, wdep.ranges, didx)
+    dcoords = compute_coordinates(stl.device_size, stl.stride_map, wdep.ranges, didx)
     return next(
         (k for k in range(len(dcoords) - 1) if sym in dcoords[k].free_symbols),
         None,
@@ -445,20 +445,20 @@ def _device_dim_carrying_sym(dl: SpyreTensorLayout, wdep, sym) -> int | None:
 def _restickify_output_device_dim(
     op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
 ) -> int | None:
-    """Return the device-size dim index of the output's "old-stick" middle
-    device dim, or None if it is stick-aligned and needs no padding.
+    """Return the device-size dim index of the non-stick device dim that carries
+    the input's old stick dim, or None if it is stick-aligned and needs no
+    padding.
 
-    The output's middle dim is the host dim that carries the iter symbol of
-    the input's old stick dim (``in_stick_dim``).  After the restickify it is a
-    non-stick device dim whose true extent is the (small) old-stick host size.
-    Padding is required whenever that device dim's extent is not a stick
-    multiple, regardless of how many stick blocks the new stick dim spans or
-    where the block axis sits relative to this dim: bumping the dim to a
-    stick boundary widens the physical allocation so every batch plane and stick
-    block lands at the correct offset.
+    That dim is the host dim carrying the iter symbol of the input's old stick
+    dim (``in_stick_dim``).  After the restickify it is a non-stick device dim
+    whose true dim size is the (small) old-stick host size.  Padding is required
+    whenever that device dim's size is not a stick multiple, regardless of how
+    many stick blocks the new stick dim spans or where the block dim sits
+    relative to this dim: bumping the dim to a stick boundary widens the physical
+    allocation so every batch plane and stick block lands at the correct offset.
     """
     out_layout = op.get_layout()
-    odl = out_layout.device_layout
+    stl = out_layout.device_layout
     stick_size = get_elem_in_stick(out_layout.dtype)
 
     wdep = next((d for d in op.get_read_writes().writes if hasattr(d, "name")), None)
@@ -479,80 +479,74 @@ def _restickify_output_device_dim(
     if host_dim is None:
         return None
 
-    device_dim = _device_dim_carrying_sym(odl, wdep, old_sym)
+    device_dim = _device_dim_carrying_sym(stl, wdep, old_sym)
     if device_dim is None:
         return None
-    if odl.device_size[device_dim] % stick_size == 0:
+    if stl.device_size[device_dim] % stick_size == 0:
         return None
     return device_dim
 
 
-def _bump_device_size_dim(
-    dl: SpyreTensorLayout, device_dim: int, new_extent
-) -> SpyreTensorLayout:
-    """Return a copy of ``dl`` with one ``device_size`` dim grown to ``new_extent``.
+def _pad_layout_device_dim(
+    layout: FixedTiledLayout,
+    device_dim: int,
+    new_dim_size,
+    grow_host_dim: int | None = None,
+) -> FixedTiledLayout:
+    """Return a copy of ``layout`` with one ``device_size`` dim grown to
+    ``new_dim_size``, and ``host_size[grow_host_dim]`` grown to match when
+    ``grow_host_dim`` is set (leaving the host size logical when it is None).
 
-    Only ``device_size`` changes; ``stride_map`` is kept untouched because
-    rescaling it would desynchronise the within-stick ``Mod(var, 64)`` stick
-    expression from the logical write index.  Bumping ``device_size`` alone
-    widens the allocation to the stick-aligned geometry while the stick
-    expression stays clean.
+    ``stride_map`` and ``host_stride`` are both left untouched.  A ``stride_map``
+    entry is the *per-step* host stride along a device dim, and growing a dim's
+    extent does not change how far one step moves — the same way a plain slice
+    changes ``device_size`` (its extent) while every ``stride_map`` entry keeps
+    pointing at the same host element spacing.  The identity
+    ``host_offset = dot(device_coordinates, stride_map)`` therefore still maps
+    device coordinates onto the same storage; only the allocation is wider.
     """
-    new_device_size = list(dl.device_size)
-    new_device_size[device_dim] = new_extent
-    return SpyreTensorLayout(
-        new_device_size,
-        list(dl.stride_map),
-        dl.device_dtype,
-        dl.element_arrangement,
+    stl = layout.device_layout
+    new_device_size = list(stl.device_size)
+    new_device_size[device_dim] = new_dim_size
+    padded_stl = SpyreTensorLayout(
+        new_device_size, list(stl.stride_map), stl.device_dtype, stl.element_arrangement
+    )
+
+    host_size = [concretize_expr(s) for s in layout.size]
+    host_stride = [concretize_expr(s) for s in layout.stride]
+    if grow_host_dim is not None:
+        host_size[grow_host_dim] = new_dim_size
+    return FixedTiledLayout(
+        layout.device, layout.dtype, host_size, host_stride, padded_stl
     )
 
 
 def _pad_restickify_output(
     op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
 ) -> None:
-    """Physically pad the restickify output's unaligned middle device dim to a
-    stick boundary so the second+ stick block lands at the correct offset.
+    """Pad the output's unaligned non-stick device dim (the one carrying the
+    input's old stick dim) to a stick boundary so the second+ stick block lands
+    at the correct offset.
 
-    See the caller for why this is needed.  Only the output buffer's device
-    layout grows (middle device-size dim bumped to a stick multiple); the
-    host size/stride stay logical, so the write index — and thus the logical
-    output read by downstream consumers — are unchanged.  The over-allocated
-    tail rows are written by ``_create_sdsc_tensors``'s existing
-    ``dev_dim_size > it_dim_size`` backGap path and never read back.
+    Only the device layout grows (see _pad_layout_device_dim); the tail rows are
+    covered by ``_create_sdsc_tensors``'s backGap path and never read back.
     """
     device_dim = _restickify_output_device_dim(op, in_dep, in_layout, in_stick_dim)
     if device_dim is None:
         return
 
     out_layout = op.get_layout()
-    odl = out_layout.device_layout
+    old_dim_size = out_layout.device_layout.device_size[device_dim]
+    new_dim_size = old_dim_size + compute_padding(old_dim_size, out_layout.dtype)
 
-    old_extent = odl.device_size[device_dim]
-    new_extent = old_extent + compute_padding(old_extent, out_layout.dtype)
-
-    # Bump ONLY the middle device-size dim (see _bump_device_size_dim).  The host
-    # size/stride stay logical, so the write index — and thus the logical output
-    # read by downstream consumers — are unchanged.
-    padded_stl = _bump_device_size_dim(odl, device_dim, new_extent)
-
-    host_size = [concretize_expr(s) for s in out_layout.size]
-    host_stride = [concretize_expr(s) for s in out_layout.stride]
-    padded_layout = FixedTiledLayout(
-        out_layout.device,
-        out_layout.dtype,
-        host_size,
-        host_stride,
-        padded_stl,
-    )
-    op.layout = padded_layout
+    op.layout = _pad_layout_device_dim(out_layout, device_dim, new_dim_size)
 
     logger.debug(
-        "insert_restickify_padding: padded output %s middle device dim %d %d -> %d",
+        "insert_restickify_padding: padded output %s device dim %d %d -> %d",
         op.get_name(),
         device_dim,
-        old_extent,
-        new_extent,
+        old_dim_size,
+        new_dim_size,
     )
 
 
@@ -561,7 +555,7 @@ def _restickify_input_device_dim(
 ) -> int | None:
     """Return the producer device-size dim index that carries the input host
     dim ``new_stick_dim`` (the dim the restickify turns into its new stick dim),
-    or None if the producer geometry does not expose it as a bumpable middle
+    or None if the producer geometry does not expose it as a bumpable non-stick
     device dim.
 
     The restickify over-reads this dim to the stick boundary; bumping the
@@ -570,7 +564,7 @@ def _restickify_input_device_dim(
     lands inside the producer's own buffer instead of uninitialised HBM.
     """
     layout = producer.get_layout()
-    pdl = layout.device_layout
+    stl = layout.device_layout
 
     wdep = next(
         (d for d in producer.get_read_writes().writes if hasattr(d, "name")), None
@@ -584,7 +578,7 @@ def _restickify_input_device_dim(
         return None
     sym = next(iter(syms))
 
-    return _device_dim_carrying_sym(pdl, wdep, sym)
+    return _device_dim_carrying_sym(stl, wdep, sym)
 
 
 def _count_consumers(buf_name: str, graph: GraphLowering) -> int:
@@ -644,16 +638,16 @@ def _pad_restickify_input_via_producer(
     in_buf, new_stick_dim: int, graph: GraphLowering
 ) -> bool:
     """Grow a single-consumer pointwise producer's output to the stick-aligned
-    extent so the restickify reads its widened tail directly, avoiding the
+    dim size so the restickify reads its widened tail directly, avoiding the
     ``lower_pad_sequence`` copy (separate buffer + fill + copy + HBM round-trip).
 
-    Mirrors ``_pad_restickify_output``: only the producer's device_size
-    on the dim carrying ``new_stick_dim`` grows (host size/stride and
-    stride_map stay logical); the producer keeps computing its true ``n`` rows,
-    and ``_create_sdsc_tensors``'s ``dev_dim_size > it_dim_size`` backGap path
-    leaves the widened tail defined.  The restickify then over-reads the padded
-    producer instead of uninitialised HBM (the over-read lands in the output's
-    backGap-discarded band, so the tail value never reaches a read position).
+    Grows the producer's device_size AND host_size on the dim carrying
+    ``new_stick_dim`` to the stick boundary (host_stride and stride_map are
+    unchanged: growing the outermost extent does not alter the per-step strides
+    -- see _pad_layout_device_dim).  The producer then computes the widened tail
+    itself, so the restickify over-reads defined values instead of uninitialised
+    HBM; the tail lands in the output's backGap-discarded band and never reaches
+    a read position.
 
     Only qualifies when the producer is an internal (non-output) pointwise
     ``ComputedBuffer`` without a mutation layout, and either has a single
@@ -680,25 +674,15 @@ def _pad_restickify_input_via_producer(
         return False
 
     layout = in_buf.get_layout()
-    pdl = layout.device_layout
-    old_extent = pdl.device_size[device_dim]
+    old_dim_size = layout.device_layout.device_size[device_dim]
     n = concretize_expr(layout.size[new_stick_dim])
-    new_extent = n + compute_padding(n, layout.dtype)
+    new_dim_size = n + compute_padding(n, layout.dtype)
 
-    # Bump the device_size dim (see _bump_device_size_dim).  Unlike the
-    # output-middle case, the producer's host dim also grows to new_extent so it
-    # actually computes the widened tail.
-    padded_stl = _bump_device_size_dim(pdl, device_dim, new_extent)
-
-    host_size = [concretize_expr(s) for s in layout.size]
-    host_size[new_stick_dim] = new_extent
-    host_stride = [concretize_expr(s) for s in layout.stride]
-    in_buf.layout = FixedTiledLayout(
-        layout.device,
-        layout.dtype,
-        host_size,
-        host_stride,
-        padded_stl,
+    # Bump the device_size dim; unlike the output case the producer's host dim
+    # also grows to new_dim_size (grow_host_dim) so it actually computes the
+    # widened tail (see _pad_layout_device_dim).
+    in_buf.layout = _pad_layout_device_dim(
+        layout, device_dim, new_dim_size, grow_host_dim=new_stick_dim
     )
 
     logger.debug(
@@ -706,11 +690,11 @@ def _pad_restickify_input_via_producer(
         "%d -> %d (host dim %d: %d -> %d)",
         name,
         device_dim,
-        old_extent,
-        new_extent,
+        old_dim_size,
+        new_dim_size,
         new_stick_dim,
         n,
-        new_extent,
+        new_dim_size,
     )
     return True
 
@@ -767,7 +751,7 @@ def _pad_restickify_input_via_copy(
     # than the compressed input-sym order — is what makes size-1 host dims
     # (e.g. the leading-1 / seq=1 dims of a mid-stick torch.cat) work without
     # shifting the non-degenerate dims (See #1094).
-    # op.data.ranges stays at the logical output extent; the stick-boundary
+    # op.data.ranges stays at the logical output size; the stick-boundary
     # widening happens later in superdsc's _extend_restickify_to_padded
     # (Inductor's _simplify_loops would undo it if done here).
     in_host_coords = host_coordinates(in_layout, in_dep, None)
@@ -787,17 +771,17 @@ def _pad_restickify_input_via_copy(
             continue
         assert len(syms) == 1, "_identify_restickify_candidate should have ensured this"
         sym = next(iter(syms))
-        iter_extent = concretize_expr(in_dep.ranges[sym])
+        iter_range = concretize_expr(in_dep.ranges[sym])
         dim_size = concretize_expr(in_layout.size[i])
         # Backstop for a slice on any input host dim of a candidate.
         # _project_stick_host_dim already raises on a mid-stick slice of the
         # stick dim; this catches a slice on a *non-stick* dim that still
         # reaches here, so codegen fails loudly instead of over-reading.
         # TODO: support sliced inputs (e.g. ``x[:, :, 1:66, :].transpose(-2, -1)``).
-        if iter_extent != dim_size:
+        if iter_range != dim_size:
             raise Unsupported(
                 f"insert_restickify_padding: sliced input on host dim "
-                f"{i} of {op.get_name()} (iter range {iter_extent} != "
+                f"{i} of {op.get_name()} (iter range {iter_range} != "
                 f"dim size {dim_size}) is not supported"
             )
         loader_perm.append(sym_to_out_pos[sym])
@@ -824,16 +808,16 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
     - Write side (``_pad_restickify_output``): when the new stick dim spans
       more than one stick block, the output's old-stick host dim becomes a
-      non-stick middle device dim; if its extent is not a stick multiple the
-      second+ block lands at the wrong physical offset.  Always attempted.
-    - Read side: when the new stick dim's extent is not a stick multiple the
-      read runs past the true extent.  ``_pad_restickify_input_via_producer``
+      non-stick device dim; if its dim size is not a stick multiple the second+
+      block lands at the wrong physical offset.  Always attempted.
+    - Read side: when the new stick dim's size is not a stick multiple the read
+      runs past the true dim size.  ``_pad_restickify_input_via_producer``
       grows the producer in place when eligible; otherwise
       ``_pad_restickify_input_via_copy`` inserts a zero-filled padded copy.
 
     The two are orthogonal — e.g. a 128x67 transpose has an aligned input
-    stick dim (128) but an unaligned middle (67), so only the write-side fix
-    fires.
+    stick dim (128) but an unaligned non-stick dim (67), so only the write-side
+    fix fires.
     """
     operations = graph.operations
     for op in list(operations):
