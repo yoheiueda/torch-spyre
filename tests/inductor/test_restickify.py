@@ -870,13 +870,14 @@ def test_pad_restickify_sliced_input_raises():
 
     ``x[:, :, 1:66, :]`` slices dim -2 (which the transpose turns into the new
     stick dim) at a non-stick-aligned start, so the read begins partway into a
-    stick.  This is unpaddable today; the pass must fail loudly rather than
-    route the op to lower_restickify, which silently miscompiles.
+    stick.  This is unpaddable today; the pass must fail loudly (the sliced dim
+    reaches the padding perm loop with iter range < dim size) rather than route
+    the op to lower_restickify, which silently miscompiles.
     """
     x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
     with pytest.raises(
         RuntimeError,
-        match="mid-stick offset",
+        match="sliced input on host dim",
     ):
         _compile_and_run(
             lambda x: x[:, :, 1:66, :].transpose(-2, -1).clone(), (x,), DEVICE
