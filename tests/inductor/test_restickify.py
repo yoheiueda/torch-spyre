@@ -864,20 +864,55 @@ def test_sparse_dense_pointwise_unsupported():
 # ------- Restickify padding: sliced input raises Unsupported ---------
 
 
-@pytest.mark.xfail(
-    reason="Slice detection in insert_restickify_padding not yet implemented",
-    strict=True,
-)
 def test_pad_restickify_sliced_input_raises():
-    """Sliced input to transpose+clone must raise, not silently corrupt output."""
+    """A mid-stick-sliced input to transpose+clone must raise, not silently
+    corrupt output.
+
+    ``x[:, :, 1:66, :]`` slices dim -2 (which the transpose turns into the new
+    stick dim) at a non-stick-aligned start, so the read begins partway into a
+    stick.  This is unpaddable today; the pass must fail loudly rather than
+    route the op to lower_restickify, which silently miscompiles.
+    """
     x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
     with pytest.raises(
         RuntimeError,
-        match="sliced input",
+        match="mid-stick offset",
     ):
         _compile_and_run(
             lambda x: x[:, :, 1:66, :].transpose(-2, -1).clone(), (x,), DEVICE
         )
+
+
+# ------- Restickify padding: offset-variant stick expr classification -------
+
+
+# A sliced transpose whose slice lands on a dim that becomes a NON-stick device
+# dim yields a ``var + c`` output-side stick expr (or a stick-aligned start
+# collapses to offset-free).  Both compile correctly, so the padding pass must
+# decline (not raise) them.  Contrast test_pad_restickify_sliced_input_raises,
+# where the slice lands mid-stick (``Mod(var, 64) + c``) and must raise.
+OFFSET_STICK_OK_MODELS = [
+    # Slice the leading dim (becomes non-stick after transpose): var + c.
+    (lambda x: x[3:67].transpose(0, 1).clone(), (128, 128)),
+    # Same, with an unaligned extent (63): still var + c, still fine.
+    (lambda x: x[3:66].transpose(0, 1).clone(), (128, 128)),
+    # Stick-aligned slice start on the becomes-stick dim: collapses to bare var.
+    (lambda x: x[:, :, 64:128, :].transpose(-2, -1).clone(), (2, 2, 128, 128)),
+]
+
+
+@pytest.mark.parametrize(
+    "fn,shape", OFFSET_STICK_OK_MODELS, ids=lambda p: p if isinstance(p, tuple) else ""
+)
+def test_offset_variant_non_stick_slice_compiles(fn, shape):
+    """A slice whose offset lands off the stick dim compiles correctly.
+
+    Locks in that the padding pass declines (returns None) rather than
+    over-raising on ``var + c`` / offset-free output-side stick exprs.
+    """
+    x = torch.randn(shape, dtype=torch.float16)
+    result = _compile_and_run(fn, (x,), DEVICE)
+    compare_with_cpu(fn, x, target=result, run_eager=False)
 
 
 # ------- Restickify padding (unaligned stick dim) ---------

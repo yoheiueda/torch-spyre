@@ -44,7 +44,7 @@ M=1 (decode phase) correctly.
 """
 
 import torch
-from sympy import Integer
+from sympy import Add, Integer, Mod
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
@@ -62,6 +62,7 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
+    check_stick_expr_supported,
     concretize_expr,
     concretize_index,
     find_reduction_var,
@@ -324,26 +325,58 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
 
 def _project_stick_host_dim(
-    host_layout: FixedTiledLayout, stick_layout: FixedTiledLayout, dep
+    input_layout: FixedTiledLayout, stick_source_layout: FixedTiledLayout, dep
 ) -> int | None:
-    """Return the host_layout host dim carrying stick_layout's within-stick
-    coord under dep, or None if no unique canonical match exists.
+    """Return the input_layout host dim carrying stick_source_layout's
+    within-stick coord under dep, or None if no unique canonical match exists.
 
-    When host_layout is stick_layout this is the buffer's own within-stick
-    host dim; when they differ, stick_layout's STL is projected through dep.
-    Returns None unless the stick coord is valid.
+    When the two layouts are the same this is the buffer's own within-stick
+    host dim; when they differ, stick_source_layout's STL is projected through
+    dep.  Returns None for an offset-free stick coord (a clean Mod(var, N) /
+    bare var / 0) or a harmless non-stick ``var + c`` offset.  Raises Unsupported
+    on a malformed stick expr or a mid-stick ``Mod(var, N) + c`` slice offset.
     """
-    host_coords = host_coordinates(host_layout, dep, None)
-    stl = stick_layout.device_layout
+    host_coords = host_coordinates(input_layout, dep, None)
+    stl = stick_source_layout.device_layout
     device_index = concretize_index(dep.index, set(dep.ranges.keys()))
     device_coords = compute_coordinates(
         stl.device_size, stl.stride_map, dep.ranges, device_index
     )
+    # No coords means a scalar / zero-dim layout: no stick dim to project.
     if not host_coords or not device_coords:
         return None
-    if not is_stick_expr_offset_free(device_coords[-1], stl.elems_per_stick()):
+    stick_expr = device_coords[-1]
+    if not is_stick_expr_offset_free(stick_expr, stl.elems_per_stick()):
+        # check_stick_expr_supported raises on a genuinely malformed expr;
+        # recognized offset variants fall through.
+        check_stick_expr_supported(stick_expr, stl.elems_per_stick())
+        # A mid-stick offset is Mod(var, N) + c: the constant is added to the
+        # within-stick term, so the input is sliced on what becomes the stick
+        # dim at a non-stick-aligned start and the read begins partway into a
+        # stick.  A bare var + c offset instead shifts a whole non-stick device
+        # dim and is harmless.
+        free_args = [a for a in stick_expr.args if a.free_symbols]
+        base = free_args[0] if len(free_args) == 1 else None
+        mid_stick = (
+            isinstance(stick_expr, Add)
+            and isinstance(base, Mod)
+            and len(base.args[0].free_symbols) == 1
+            and base.args[1] == stl.elems_per_stick()
+        )
+        if mid_stick:
+            # Unpaddable: declining it (return None) would route the op to
+            # lower_restickify, which silently miscompiles (wrong values,
+            # correct shape).  Raise instead.
+            # TODO: support mid-stick slices on restickify/transpose rather
+            # than raising (the goal is coverage, not a hard error).
+            raise Unsupported(
+                f"insert_restickify_padding: sliced input on the stick dim "
+                f"(mid-stick offset {stick_expr!r}) is not yet supported"
+            )
+        # A non-stick var + c offset compiles correctly; decline padding and
+        # let it lower normally.
         return None
-    return matching_dim(host_coords, device_coords[-1])
+    return matching_dim(host_coords, stick_expr)
 
 
 def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
@@ -756,9 +789,10 @@ def _pad_restickify_input_via_copy(
         sym = next(iter(syms))
         iter_extent = concretize_expr(in_dep.ranges[sym])
         dim_size = concretize_expr(in_layout.size[i])
-        # Slice-detection lives here (not in the predicate): if the predicate
-        # returned None for slices, codegen would silently produce wrong
-        # output.  Raising here makes compilation fail loudly instead.
+        # Backstop for a slice on any input host dim of a candidate.
+        # _project_stick_host_dim already raises on a mid-stick slice of the
+        # stick dim; this catches a slice on a *non-stick* dim that still
+        # reaches here, so codegen fails loudly instead of over-reading.
         # TODO: support sliced inputs (e.g. ``x[:, :, 1:66, :].transpose(-2, -1)``).
         if iter_extent != dim_size:
             raise Unsupported(
