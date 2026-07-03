@@ -95,6 +95,22 @@ def _patch_env(graph_lowering) -> None:
     graph_lowering.env.update(env)
 
 
+def _move_ops_before(
+    operations: list[Operation], new_ops: list[Operation], anchor: Operation
+) -> None:
+    """Relocate *new_ops* to sit immediately before *anchor* in *operations*.
+
+    ``lower_pad_sequence`` appends new ops at the end of ``operations``; this
+    helper moves them to just before the op that consumes them so topological
+    order is preserved.
+    """
+    for o in new_ops:
+        operations.remove(o)
+    idx = operations.index(anchor)
+    for i, o in enumerate(new_ops):
+        operations.insert(idx + i, o)
+
+
 def _find_arg_fx_node(arg_name: str) -> torch.fx.Node:
     """Return the FX node whose lowered TensorBox has the given buffer name.
 
@@ -294,11 +310,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
         # --- Relocate new ops before the matmul ---
         # run_node appended them at the end of operations; move before op.
-        for new_op in y_new_ops:
-            operations.remove(new_op)
-        op_idx = operations.index(op)
-        for i, new_op in enumerate(y_new_ops):
-            operations.insert(op_idx + i, new_op)
+        _move_ops_before(operations, y_new_ops, op)
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is
@@ -744,11 +756,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         )
 
         # Move pad ops to just before the restickify (lower_pad_sequence appends).
-        for o in new_ops:
-            operations.remove(o)
-        idx = operations.index(op)
-        for i, o in enumerate(new_ops):
-            operations.insert(idx + i, o)
+        _move_ops_before(operations, new_ops, op)
 
         # Replace the restickify body with a Pointwise that reads padded_buf
         # through a permuted index, mapping each input host dim to the output
