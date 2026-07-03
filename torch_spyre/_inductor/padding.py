@@ -443,6 +443,27 @@ def _restickify_output_middle_device_dim(
     return device_entry
 
 
+def _bump_device_size_dim(
+    dl: SpyreTensorLayout, device_dim: int, new_extent
+) -> SpyreTensorLayout:
+    """Return a copy of ``dl`` with one ``device_size`` dim grown to ``new_extent``.
+
+    Only ``device_size`` changes; ``stride_map`` is kept untouched because
+    rescaling it would desynchronise the within-stick ``Mod(var, 64)`` stick
+    expression from the logical write index.  Bumping ``device_size`` alone
+    widens the allocation to the stick-aligned geometry while the stick
+    expression stays clean.
+    """
+    new_device_size = list(dl.device_size)
+    new_device_size[device_dim] = new_extent
+    return SpyreTensorLayout(
+        new_device_size,
+        list(dl.stride_map),
+        dl.device_dtype,
+        dl.element_arrangement,
+    )
+
+
 def _pad_restickify_output_middle(
     op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
 ) -> None:
@@ -468,27 +489,10 @@ def _pad_restickify_output_middle(
     old_extent = odl.device_size[device_entry]
     new_extent = old_extent + compute_padding(old_extent, out_layout.dtype)
 
-    # Bump ONLY the middle device-size entry; keep the stride_map untouched.
-    #
-    # The stride_map drives compute_coordinates, which derives the symbolic
-    # device coordinates (including the within-stick ``Mod(var, 64)`` stick
-    # expression) from the write index.  Rescaling it would desynchronise it
-    # from the logical write index and yield an unsupported stick expression.
-    # device_size, by contrast, is what superdsc's _calculate_device_stride
-    # uses to compute the hardware SDSC strides, and what memory_planning uses
-    # to size the allocation (prod of all but the within-stick entry).  So
-    # bumping device_size alone widens the buffer to the stick-aligned geometry
-    # and recomputes the block stride against the padded middle extent — which
-    # is exactly what makes the second+ stick block land at the right physical
-    # offset — while the stick expression stays clean.
-    new_device_size = list(odl.device_size)
-    new_device_size[device_entry] = new_extent
-    padded_stl = SpyreTensorLayout(
-        new_device_size,
-        list(odl.stride_map),
-        odl.device_dtype,
-        odl.element_arrangement,
-    )
+    # Bump ONLY the middle device-size dim (see _bump_device_size_dim).  The host
+    # size/stride stay logical, so the write index — and thus the logical output
+    # read by downstream consumers — are unchanged.
+    padded_stl = _bump_device_size_dim(odl, device_entry, new_extent)
 
     host_size = [concretize_expr(s) for s in out_layout.size]
     host_stride = [concretize_expr(s) for s in out_layout.stride]
@@ -648,17 +652,10 @@ def _fuse_restickify_pad_into_producer(
     old_extent = pdl.device_size[device_entry]
     new_extent = n + pad
 
-    # Bump ONLY the device_size entry; keep stride_map untouched (same rationale
-    # as _pad_restickify_output_middle: rescaling stride_map would desynchronise
-    # the within-stick expression from the logical write index).
-    new_device_size = list(pdl.device_size)
-    new_device_size[device_entry] = new_extent
-    padded_stl = SpyreTensorLayout(
-        new_device_size,
-        list(pdl.stride_map),
-        pdl.device_dtype,
-        pdl.element_arrangement,
-    )
+    # Bump the device_size dim (see _bump_device_size_dim).  Unlike the
+    # output-middle case, the producer's host dim also grows to new_extent so it
+    # actually computes the widened tail.
+    padded_stl = _bump_device_size_dim(pdl, device_entry, new_extent)
 
     host_size = [concretize_expr(s) for s in layout.size]
     host_size[new_stick_dim] = new_extent
