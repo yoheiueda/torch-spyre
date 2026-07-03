@@ -1066,15 +1066,35 @@ def test_pad_graph_input_falls_back():
 
 
 def test_pad_multi_consumer_producer_falls_back():
-    """A producer read by more than one op must not be relayout-fused (the bump
-    would corrupt the other reader's view); it falls back to the copy."""
+    """A producer with a non-restickify co-reader must fall back to the copy: a
+    plain/reducing reader indexes the producer's logical tail, so growing the
+    shared buffer for the transpose's over-read could leak the bumped tail into
+    that reader.  Here p.sum() is the non-restickify co-reader."""
     x = torch.randn((67, 128), dtype=torch.float16)
     z = torch.randn((128, 67), dtype=torch.float16)
 
     def fn(x, z):
-        p = x * 2  # two consumers: the transpose below and the add
+        p = x * 2  # two consumers: the transpose (restickify) and the sum
         return p.transpose(-2, -1) + z + p.sum()
 
     result, fused, _ = _run_capturing_padding_log(fn, x, z)
-    assert fused == 0, "multi-consumer producer should fall back, not fuse"
+    assert fused == 0, "producer with a non-restickify co-reader should fall back"
     compare_with_cpu(fn, x, z, target=result, run_eager=False)
+
+
+def test_pad_shared_all_restickify_consumers_fuse():
+    """A producer read only by restickify ops fuses even with several consumers.
+    Two transposes of the same producer take different new stick dims, so each
+    bumps a different device entry of the shared buffer; the bumps compose and
+    both restickifies over-read their own defined tails."""
+    x = torch.randn((67, 53, 128), dtype=torch.float16)
+    za = torch.randn((128, 53, 67), dtype=torch.float16)
+    zb = torch.randn((67, 128, 53), dtype=torch.float16)
+
+    def fn(x, za, zb):
+        p = x * 2  # sole consumers are the two transposes below (restickifies)
+        return p.transpose(0, 2) + za, p.transpose(1, 2) + zb
+
+    result, fused, _ = _run_capturing_padding_log(fn, x, za, zb)
+    assert fused >= 1, "all-restickify shared producer should fuse"
+    compare_with_cpu(fn, x, za, zb, target=result, run_eager=False)

@@ -552,6 +552,46 @@ def _count_consumers(buf_name: str, graph: GraphLowering) -> int:
     return count
 
 
+def _is_restickify_op(op: Operation) -> bool:
+    """True when ``op`` is a spyre.restickify ComputedBuffer.
+
+    Detected via the origin FX node's target (cf. propagate_layouts.py), since
+    restickify has no ATen decomposition and _create_restickify_node stamps its
+    synthetic FX node into origins.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    origins = op.origins
+    if not origins:
+        return False
+    return next(iter(origins)).target is torch.ops.spyre.restickify.default
+
+
+def _all_consumers_restickify(buf_name: str, graph: GraphLowering) -> bool:
+    """True when ``buf_name`` has at least one consumer and every consumer is a
+    restickify op.
+
+    Every consumer restickifying the producer means no reader depends on the
+    producer's true (unbumped) tail: each restickify over-reads the widened tail
+    into its own backGap-discarded band, and multiple bumps on one producer
+    compose (idempotent on the same device entry, independent on different
+    entries).  A plain or reducing co-reader is excluded so its result cannot
+    pick up the over-allocated tail.
+    """
+    saw = False
+    for op in graph.operations:
+        try:
+            reads = op.get_read_writes().reads
+        except Exception:
+            continue
+        if not any(getattr(r, "name", None) == buf_name for r in reads):
+            continue
+        if not _is_restickify_op(op):
+            return False
+        saw = True
+    return saw
+
+
 def _fuse_restickify_pad_into_producer(
     in_buf, new_stick_dim: int, n: int, pad: int, graph: GraphLowering
 ) -> bool:
@@ -567,9 +607,11 @@ def _fuse_restickify_pad_into_producer(
     producer instead of uninitialised HBM (the over-read lands in the output's
     backGap-discarded band, so the tail value never reaches a read position).
 
-    Only qualifies when the producer is an internal (non-output),
-    single-consumer pointwise ``ComputedBuffer`` without a mutation layout;
-    returns False otherwise so the caller falls back to ``lower_pad_sequence``.
+    Only qualifies when the producer is an internal (non-output) pointwise
+    ``ComputedBuffer`` without a mutation layout, and either has a single
+    consumer or is read exclusively by restickify ops (so no reader depends on
+    its true tail); returns False otherwise so the caller falls back to
+    ``lower_pad_sequence``.
     """
     if not isinstance(in_buf, ComputedBuffer):
         return False
@@ -580,7 +622,9 @@ def _fuse_restickify_pad_into_producer(
     name = in_buf.get_name()
     if name in graph.get_output_names():
         return False
-    if _count_consumers(name, graph) != 1:
+    if _count_consumers(name, graph) != 1 and not _all_consumers_restickify(
+        name, graph
+    ):
         return False
 
     device_entry = _producer_stick_device_dim(in_buf, new_stick_dim)
