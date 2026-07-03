@@ -1143,3 +1143,50 @@ def test_pad_shared_all_restickify_consumers_fuse():
     result, fused, _ = _run_capturing_padding_log(fn, x, za, zb)
     assert fused >= 1, "all-restickify shared producer should fuse"
     compare_with_cpu(fn, x, za, zb, target=result, run_eager=False)
+
+
+def _restickify_readers_by_source(fn, *args):
+    """Run fn on Spyre and return {producer_name: [restickify buffer names]},
+    a map of every source buffer to the restickify ops that read it, captured
+    from graph.operations right after insert_restickify splices them in."""
+    import torch_spyre._inductor.passes as _passes
+    from torch_spyre._inductor.padding import _is_restickify_op
+
+    insert_restickify = _passes.insert_restickify
+    by_source: dict[str, list[str]] = {}
+
+    def capturing_insert_restickify(graph):
+        insert_restickify(graph)
+        for op in graph.operations:
+            if not _is_restickify_op(op):
+                continue
+            for read in op.get_read_writes().reads:
+                name = getattr(read, "name", None)
+                if name is not None:
+                    by_source.setdefault(name, []).append(op.get_name())
+
+    with patch.object(_passes, "insert_restickify", capturing_insert_restickify):
+        _compile_and_run(fn, args, DEVICE)
+    return by_source
+
+
+def test_shared_producer_gets_two_restickify_nodes():
+    """insert_restickify keys its plan by consumer, not by source, so a producer
+    that fans out to two consumers each wanting a different layout gets a
+    *separate* restickify node per consumer -- both reading the one producer.
+    This is the structural case _all_consumers_restickify exists to permit; here
+    we assert the two-node shape directly rather than via the fusion log."""
+    x = torch.randn((67, 53, 128), dtype=torch.float16)
+    za = torch.randn((128, 53, 67), dtype=torch.float16)
+    zb = torch.randn((67, 128, 53), dtype=torch.float16)
+
+    def fn(x, za, zb):
+        p = x * 2  # sole consumers are the two transposes below (restickifies)
+        return p.transpose(0, 2) + za, p.transpose(1, 2) + zb
+
+    by_source = _restickify_readers_by_source(fn, x, za, zb)
+    shared = [src for src, readers in by_source.items() if len(readers) >= 2]
+    assert shared, (
+        "expected one producer read by >=2 restickify nodes, got "
+        f"{ {s: r for s, r in by_source.items()} }"
+    )
