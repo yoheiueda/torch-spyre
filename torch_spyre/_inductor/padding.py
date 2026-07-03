@@ -322,12 +322,23 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _single_free_sym(expr: Expr):
+    """Return ``expr``'s sole free symbol, or None if it has zero or many."""
+    syms = expr.free_symbols
+    return next(iter(syms)) if len(syms) == 1 else None
+
+
 def _host_dim_carrying_sym(host_coords: list[Expr], sym) -> int | None:
-    """Return the host dim whose coordinate carries ``sym``, or None."""
-    return next(
-        (i for i, c in enumerate(host_coords) if sym in c.free_symbols),
-        None,
-    )
+    """Return the outermost host dim whose coordinate carries ``sym``, or None.
+
+    A loop symbol whose range straddles a tile boundary can appear in several
+    coordinates; the outermost (lowest-index) one is the governing dim, so we
+    return the first match.
+    """
+    for dim, coord in enumerate(host_coords):
+        if sym in coord.free_symbols:
+            return dim
+    return None
 
 
 def _project_stick_host_dim(
@@ -355,10 +366,10 @@ def _project_stick_host_dim(
     # No coords means a scalar / zero-dim layout: no stick dim to project.
     if not host_coords or not device_coords:
         return None
-    syms = device_coords[-1].free_symbols
-    if len(syms) != 1:
+    sym = _single_free_sym(device_coords[-1])
+    if sym is None:
         return None
-    return _host_dim_carrying_sym(host_coords, next(iter(syms)))
+    return _host_dim_carrying_sym(host_coords, sym)
 
 
 def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
@@ -408,20 +419,24 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     return in_dep, in_buf, in_layout, host_size, new_stick_dim, in_stick_dim
 
 
-def _device_dim_carrying_sym(stl: SpyreTensorLayout, wdep, sym) -> int | None:
-    """Return the non-within-stick ``device_size`` dim whose device coordinate
-    carries ``sym`` (the free symbol of some host dim), or None if none does.
+def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | None:
+    """Return the outermost non-within-stick ``device_size`` dim whose device
+    coordinate carries ``sym`` (the free symbol of some host dim), or None.
 
     The dim is located by symbol match, not dim-size equality: two host dims can
-    share a dim size, and only the symbol is unambiguous.  The within-stick dim
-    (the last device coordinate) is excluded.
+    share a dim size, and only the symbol is unambiguous.  A loop symbol whose
+    range straddles a tile boundary can appear in several coordinates; the
+    outermost (lowest-index) one is the governing dim, so we return the first
+    match.  The within-stick dim (the last device coordinate) is excluded.
     """
-    didx = concretize_index(wdep.index, set(wdep.ranges.keys()))
-    dcoords = compute_coordinates(stl.device_size, stl.stride_map, wdep.ranges, didx)
-    return next(
-        (k for k in range(len(dcoords) - 1) if sym in dcoords[k].free_symbols),
-        None,
+    device_index = concretize_index(write_dep.index, set(write_dep.ranges.keys()))
+    device_coords = compute_coordinates(
+        stl.device_size, stl.stride_map, write_dep.ranges, device_index
     )
+    for dim in range(len(device_coords) - 1):
+        if sym in device_coords[dim].free_symbols:
+            return dim
+    return None
 
 
 def _restickify_output_device_dim(
@@ -443,23 +458,27 @@ def _restickify_output_device_dim(
     stl = out_layout.device_layout
     stick_size = get_elem_in_stick(out_layout.dtype)
 
-    wdep = next((d for d in op.get_read_writes().writes if hasattr(d, "name")), None)
-    if wdep is None:
+    write_dep = next(
+        (d for d in op.get_read_writes().writes if hasattr(d, "name")), None
+    )
+    if write_dep is None:
         return None
 
     in_host_coords = host_coordinates(in_layout, in_dep, None)
-    old_syms = in_host_coords[in_stick_dim].free_symbols
-    if len(old_syms) != 1:
+    old_sym = _single_free_sym(in_host_coords[in_stick_dim])
+    if old_sym is None:
         return None
-    old_sym = next(iter(old_syms))
 
-    out_host_coords = host_coordinates(out_layout, wdep, None)
+    # Old stick dim collapsed to a size-1 output host dim (const-0 coord, no
+    # symbol): nothing survives to misalign, so nothing to pad.
+    out_host_coords = host_coordinates(out_layout, write_dep, None)
     if _host_dim_carrying_sym(out_host_coords, old_sym) is None:
         return None
 
-    device_dim = _device_dim_carrying_sym(stl, wdep, old_sym)
+    device_dim = _device_dim_carrying_sym(stl, write_dep, old_sym)
     if device_dim is None:
         return None
+    # Already a stick multiple: stick blocks land aligned, no padding needed.
     if stl.device_size[device_dim] % stick_size == 0:
         return None
     return device_dim
@@ -544,19 +563,18 @@ def _restickify_input_device_dim(
     layout = producer.get_layout()
     stl = layout.device_layout
 
-    wdep = next(
+    write_dep = next(
         (d for d in producer.get_read_writes().writes if hasattr(d, "name")), None
     )
-    if wdep is None:
+    if write_dep is None:
         return None
 
-    host_coords = host_coordinates(layout, wdep, None)
-    syms = host_coords[new_stick_dim].free_symbols
-    if len(syms) != 1:
+    host_coords = host_coordinates(layout, write_dep, None)
+    sym = _single_free_sym(host_coords[new_stick_dim])
+    if sym is None:
         return None
-    sym = next(iter(syms))
 
-    return _device_dim_carrying_sym(stl, wdep, sym)
+    return _device_dim_carrying_sym(stl, write_dep, sym)
 
 
 def _count_consumers(buf_name: str, graph: GraphLowering) -> int:
