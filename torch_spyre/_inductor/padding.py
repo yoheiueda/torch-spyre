@@ -346,19 +346,20 @@ def _project_stick_host_dim(
     return matching_dim(host_coords, device_coords[-1])
 
 
-def _restickify_input_dep(op: Operation, graph: GraphLowering):
-    """Return (in_dep, in_buf, in_layout, host_size, new_stick_dim,
-    in_stick_dim) when op is a single-input pointwise copy whose output STL
-    puts a different host dim within the stick than the input's does, else
-    None.  ``new_stick_dim`` / ``in_stick_dim`` are the input host dims that
-    become, respectively, the output's stick dim and the output's "old-stick"
-    middle dim.
+def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
+    """Identify whether ``op`` is a restickify the padding pass may act on.
 
-    Both stick dims are recovered in the input's host frame so they are
-    directly comparable; the cross-buffer projection makes transpose work
-    while reduce drops out as non-Pointwise and flatten drops out via the
-    canonical-form filter in _project_stick_host_dim.  Sliced inputs are
-    not filtered here — they raise Unsupported in the perm loop.
+    A candidate is a single-input pointwise copy between two FixedTiledLayouts
+    that lands a *different* host dim within the stick.
+
+    Returns None if ``op`` is not a candidate, else the tuple:
+
+    - ``in_dep`` / ``in_buf`` / ``in_layout``: the single input's dep, buffer,
+      and (FixedTiled) layout.
+    - ``host_size``: the input's concretized host size.
+    - ``new_stick_dim``: input host dim that becomes the output's stick dim.
+    - ``in_stick_dim``: input host dim that becomes the output's "old-stick"
+      middle dim.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -408,7 +409,7 @@ def _device_dim_carrying_sym(dl: SpyreTensorLayout, wdep, sym) -> int | None:
     )
 
 
-def _restickify_output_middle_device_dim(
+def _restickify_output_device_dim(
     op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
 ) -> int | None:
     """Return the device-size dim index of the output's "old-stick" middle
@@ -474,7 +475,7 @@ def _bump_device_size_dim(
     )
 
 
-def _pad_restickify_output_middle(
+def _pad_restickify_output(
     op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
 ) -> None:
     """Physically pad the restickify output's unaligned middle device dim to a
@@ -487,9 +488,7 @@ def _pad_restickify_output_middle(
     tail rows are written by ``_create_sdsc_tensors``'s existing
     ``dev_dim_size > it_dim_size`` backGap path and never read back.
     """
-    device_dim = _restickify_output_middle_device_dim(
-        op, in_dep, in_layout, in_stick_dim
-    )
+    device_dim = _restickify_output_device_dim(op, in_dep, in_layout, in_stick_dim)
     if device_dim is None:
         return
 
@@ -524,7 +523,7 @@ def _pad_restickify_output_middle(
     )
 
 
-def _producer_stick_device_dim(
+def _restickify_input_device_dim(
     producer: ComputedBuffer, new_stick_dim: int
 ) -> int | None:
     """Return the producer device-size dim index that carries the input host
@@ -608,14 +607,14 @@ def _all_consumers_restickify(buf_name: str, graph: GraphLowering) -> bool:
     return saw
 
 
-def _fuse_restickify_pad_into_producer(
-    in_buf, new_stick_dim: int, n: int, pad: int, graph: GraphLowering
+def _pad_restickify_input_via_producer(
+    in_buf, new_stick_dim: int, graph: GraphLowering
 ) -> bool:
     """Grow a single-consumer pointwise producer's output to the stick-aligned
     extent so the restickify reads its widened tail directly, avoiding the
     ``lower_pad_sequence`` copy (separate buffer + fill + copy + HBM round-trip).
 
-    Mirrors ``_pad_restickify_output_middle``: only the producer's device_size
+    Mirrors ``_pad_restickify_output``: only the producer's device_size
     on the dim carrying ``new_stick_dim`` grows (host size/stride and
     stride_map stay logical); the producer keeps computing its true ``n`` rows,
     and ``_create_sdsc_tensors``'s ``dev_dim_size > it_dim_size`` backGap path
@@ -643,14 +642,15 @@ def _fuse_restickify_pad_into_producer(
     ):
         return False
 
-    device_dim = _producer_stick_device_dim(in_buf, new_stick_dim)
+    device_dim = _restickify_input_device_dim(in_buf, new_stick_dim)
     if device_dim is None:
         return False
 
     layout = in_buf.get_layout()
     pdl = layout.device_layout
     old_extent = pdl.device_size[device_dim]
-    new_extent = n + pad
+    n = concretize_expr(layout.size[new_stick_dim])
+    new_extent = n + compute_padding(n, layout.dtype)
 
     # Bump the device_size dim (see _bump_device_size_dim).  Unlike the
     # output-middle case, the producer's host dim also grows to new_extent so it
@@ -682,131 +682,140 @@ def _fuse_restickify_pad_into_producer(
     return True
 
 
+def _pad_restickify_input_via_copy(
+    op: ComputedBuffer,
+    operations: list[Operation],
+    in_dep,
+    in_buf,
+    in_layout,
+    new_stick_dim: int,
+) -> None:
+    """Fallback read-side fix: insert a stick-aligned, zero-filled copy of the
+    input ahead of the restickify and rewrite the restickify body to read it.
+
+    Used when the input cannot be padded in place by
+    ``_pad_restickify_input_via_producer`` (graph input, multi-consumer,
+    non-pointwise, or mutation-layout producer).  The copy costs a separate
+    buffer + fill + copy + HBM round-trip, which the producer path avoids.
+    """
+    device = in_buf.get_device()
+    if device is None:
+        return
+
+    dtype = in_layout.dtype
+    padded_size = [concretize_expr(s) for s in in_layout.size]
+    n = padded_size[new_stick_dim]
+    padded_size[new_stick_dim] = n + compute_padding(n, dtype)
+
+    in_fx = _find_arg_fx_node(in_dep.name)
+    restickify_fx = next(iter(op.origins))
+    padded_buf, new_ops = lower_pad_sequence(
+        in_fx,
+        padded_size=padded_size,
+        device=device,
+        dtype=dtype,
+        dim=new_stick_dim,
+        insert_before=restickify_fx,
+        orig_stl=in_layout.device_layout,
+        fill_value=0.0,
+    )
+
+    # Move pad ops to just before the restickify (lower_pad_sequence appends).
+    _move_ops_before(operations, new_ops, op)
+
+    # Replace the restickify body with a Pointwise that reads padded_buf
+    # through a permuted index, mapping each input host dim to the output
+    # iteration position that drives it.  The output Pointwise iterates
+    # op.data.ranges, so the inner_fn ``index`` list is positional over the
+    # *output* host dims; output dim k carries the iter sym in
+    # out_host_coords[k].  An input host dim whose coord carries the same sym
+    # is loaded at index[k]; a degenerate (size-1) input dim carries no sym
+    # and is loaded at constant 0.  Indexing by the output positions — rather
+    # than the compressed input-sym order — is what makes size-1 host dims
+    # (e.g. the leading-1 / seq=1 dims of a mid-stick torch.cat) work without
+    # shifting the non-degenerate dims (See #1094).
+    # op.data.ranges stays at the logical output extent; the stick-boundary
+    # widening happens later in superdsc's _extend_restickify_to_padded
+    # (Inductor's _simplify_loops would undo it if done here).
+    in_host_coords = host_coordinates(in_layout, in_dep, None)
+    write_dep = next(d for d in op.get_read_writes().writes if hasattr(d, "name"))
+    out_host_coords = host_coordinates(op.get_layout(), write_dep, None)
+    sym_to_out_pos = {
+        next(iter(c.free_symbols)): k
+        for k, c in enumerate(out_host_coords)
+        if c.free_symbols
+    }
+    loader_perm: list[int | None] = []
+    for i, coord in enumerate(in_host_coords):
+        syms = coord.free_symbols
+        if not syms:
+            # Degenerate (size-1) input host dim: load at constant 0.
+            loader_perm.append(None)
+            continue
+        assert len(syms) == 1, "_identify_restickify_candidate should have ensured this"
+        sym = next(iter(syms))
+        iter_extent = concretize_expr(in_dep.ranges[sym])
+        dim_size = concretize_expr(in_layout.size[i])
+        # Slice-detection lives here (not in the predicate): if the predicate
+        # returned None for slices, codegen would silently produce wrong
+        # output.  Raising here makes compilation fail loudly instead.
+        # TODO: support sliced inputs (e.g. ``x[:, :, 1:66, :].transpose(-2, -1)``).
+        if iter_extent != dim_size:
+            raise Unsupported(
+                f"insert_restickify_padding: sliced input on host dim "
+                f"{i} of {op.get_name()} (iter range {iter_extent} != "
+                f"dim size {dim_size}) is not supported"
+            )
+        loader_perm.append(sym_to_out_pos[sym])
+    old_pw = op.data
+    padded_loader = padded_buf.make_loader()
+    new_pw = Pointwise(
+        device=old_pw.device,
+        dtype=old_pw.dtype,
+        inner_fn=lambda index, _loader=padded_loader, _perm=tuple(loader_perm): _loader(
+            [Integer(0) if p is None else index[p] for p in _perm]
+        ),
+        ranges=old_pw.ranges,
+    )
+    replace_computed_buffer_body(op, new_pw, operations)
+
+
 def insert_restickify_padding(graph: GraphLowering) -> None:
-    """Zero-pad a Restickify's input along the dim that becomes the new
-    stick dim, when its extent is not a multiple of the stick size.
+    """Pad a restickify's buffers so codegen's stick-boundary widening never
+    touches uninitialized HBM.
 
-    Without padding, codegen widens the iteration space to a stick boundary
-    and reads past the true extent — those tail elements come from
-    uninitialized HBM and end up in the output, producing a value mismatch.
+    A restickify re-tiles a tensor so a different host dim lands within the
+    stick.  Codegen widens both its read and its write to stick boundaries,
+    which exposes two independent hazards, each with its own fix:
 
-    Strategy: insert a stick-aligned, zero-filled copy of the input ahead of
-    the Restickify (lower_pad_sequence) and rewrite the Restickify body to
-    load from the padded buffer through a permuted index that maps each
-    output iter dim to the corresponding input host dim.  The Restickify's
-    ranges, layout, and device_layout are left untouched; codegen's existing
-    stick-boundary widening reads from the zero-filled tail of the padded
-    buffer instead of uninitialized HBM.
+    - Write side (``_pad_restickify_output``): when the new stick dim spans
+      more than one stick block, the output's old-stick host dim becomes a
+      non-stick middle device dim; if its extent is not a stick multiple the
+      second+ block lands at the wrong physical offset.  Always attempted.
+    - Read side: when the new stick dim's extent is not a stick multiple the
+      read runs past the true extent.  ``_pad_restickify_input_via_producer``
+      grows the producer in place when eligible; otherwise
+      ``_pad_restickify_input_via_copy`` inserts a zero-filled padded copy.
+
+    The two are orthogonal — e.g. a 128x67 transpose has an aligned input
+    stick dim (128) but an unaligned middle (67), so only the write-side fix
+    fires.
     """
     operations = graph.operations
     for op in list(operations):
-        match = _restickify_input_dep(op, graph)
+        match = _identify_restickify_candidate(op, graph)
         if match is None:
             continue
         in_dep, in_buf, in_layout, host_size, new_stick_dim, in_stick_dim = match
+        # ComputedBuffer guaranteed by _identify_restickify_candidate
+        assert isinstance(op, ComputedBuffer)
 
-        dtype = in_layout.dtype
-        device = in_buf.get_device()
-        if device is None:
+        _pad_restickify_output(op, in_dep, in_layout, in_stick_dim)
+
+        if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
             continue
 
-        # --- Pad the output's unaligned "old-stick" middle dim (See #1756) ---
-        # When the new stick dim spans more than one stick block, the output's
-        # old-stick host dim becomes a non-stick MIDDLE device dim.  If its
-        # extent is not a stick multiple, the restickify writes the second+
-        # block at the wrong physical offset (the single-axis block stride only
-        # lands correctly when the middle device dim is a stick multiple).  Pad
-        # buf0's middle device dim up to a stick boundary, widening the
-        # restickify's write into the (discarded) tail, and slice the logical
-        # output back out.  This must run independently of input-stick padding:
-        # e.g. a 128x67 transpose has an aligned input stick dim (128) but an
-        # unaligned middle (67).
-        _pad_restickify_output_middle(op, in_dep, in_layout, in_stick_dim)
-
-        n = host_size[new_stick_dim]
-        pad = compute_padding(n, dtype)
-        if pad == 0:
-            continue
-
-        # Fuse the pad into a single-consumer pointwise producer when possible:
-        # grow the producer's output to the stick-aligned extent (device_size
-        # bump only) so the restickify over-reads its defined tail directly,
-        # skipping the lower_pad_sequence copy.  Falls back below for graph
-        # inputs, multi-consumer, non-pointwise, or mutation-layout producers.
-        if _fuse_restickify_pad_into_producer(in_buf, new_stick_dim, n, pad, graph):
-            continue
-
-        padded_size = list(host_size)
-        padded_size[new_stick_dim] = n + pad
-
-        in_fx = _find_arg_fx_node(in_dep.name)
-        restickify_fx = next(iter(op.origins))
-        padded_buf, new_ops = lower_pad_sequence(
-            in_fx,
-            padded_size=padded_size,
-            device=device,
-            dtype=dtype,
-            dim=new_stick_dim,
-            insert_before=restickify_fx,
-            orig_stl=in_layout.device_layout,
-            fill_value=0.0,
-        )
-
-        # Move pad ops to just before the restickify (lower_pad_sequence appends).
-        _move_ops_before(operations, new_ops, op)
-
-        # Replace the restickify body with a Pointwise that reads padded_buf
-        # through a permuted index, mapping each input host dim to the output
-        # iteration position that drives it.  The output Pointwise iterates
-        # op.data.ranges, so the inner_fn ``index`` list is positional over the
-        # *output* host dims; output dim k carries the iter sym in
-        # out_host_coords[k].  An input host dim whose coord carries the same sym
-        # is loaded at index[k]; a degenerate (size-1) input dim carries no sym
-        # and is loaded at constant 0.  Indexing by the output positions — rather
-        # than the compressed input-sym order — is what makes size-1 host dims
-        # (e.g. the leading-1 / seq=1 dims of a mid-stick torch.cat) work without
-        # shifting the non-degenerate dims (See #1094).
-        # op.data.ranges stays at the logical output extent; the stick-boundary
-        # widening happens later in superdsc's _extend_restickify_to_padded
-        # (Inductor's _simplify_loops would undo it if done here).
-        in_host_coords = host_coordinates(in_layout, in_dep, None)
-        write_dep = next(d for d in op.get_read_writes().writes if hasattr(d, "name"))
-        out_host_coords = host_coordinates(op.get_layout(), write_dep, None)
-        sym_to_out_pos = {
-            next(iter(c.free_symbols)): k
-            for k, c in enumerate(out_host_coords)
-            if c.free_symbols
-        }
-        loader_perm: list[int | None] = []
-        for i, coord in enumerate(in_host_coords):
-            syms = coord.free_symbols
-            if not syms:
-                # Degenerate (size-1) input host dim: load at constant 0.
-                loader_perm.append(None)
-                continue
-            assert len(syms) == 1, "_restickify_input_dep should have ensured this"
-            sym = next(iter(syms))
-            iter_extent = concretize_expr(in_dep.ranges[sym])
-            dim_size = concretize_expr(in_layout.size[i])
-            # Slice-detection lives here (not in the predicate): if the predicate
-            # returned None for slices, codegen would silently produce wrong
-            # output.  Raising here makes compilation fail loudly instead.
-            # TODO: support sliced inputs (e.g. ``x[:, :, 1:66, :].transpose(-2, -1)``).
-            if iter_extent != dim_size:
-                raise Unsupported(
-                    f"insert_restickify_padding: sliced input on host dim "
-                    f"{i} of {op.get_name()} (iter range {iter_extent} != "
-                    f"dim size {dim_size}) is not supported"
-                )
-            loader_perm.append(sym_to_out_pos[sym])
-        old_pw = op.data
-        padded_loader = padded_buf.make_loader()
-        new_pw = Pointwise(
-            device=old_pw.device,
-            dtype=old_pw.dtype,
-            inner_fn=lambda index, _loader=padded_loader, _perm=tuple(loader_perm): (
-                _loader([Integer(0) if p is None else index[p] for p in _perm])
-            ),
-            ranges=old_pw.ranges,
-        )
-        replace_computed_buffer_body(op, new_pw, operations)
+        if not _pad_restickify_input_via_producer(in_buf, new_stick_dim, graph):
+            _pad_restickify_input_via_copy(
+                op, operations, in_dep, in_buf, in_layout, new_stick_dim
+            )
