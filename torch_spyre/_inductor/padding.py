@@ -44,7 +44,7 @@ M=1 (decode phase) correctly.
 """
 
 import torch
-from sympy import Add, Integer, Mod
+from sympy import Expr, Integer
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
@@ -67,11 +67,10 @@ from .pass_utils import (
     find_reduction_var,
     host_coordinates,
     identify_matmul_inputs,
-    is_stick_expr_offset_free,
     lower_pad_sequence,
     replace_computed_buffer_body,
 )
-from .views import compute_coordinates, matching_dim
+from .views import compute_coordinates
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 
 logger = get_inductor_logger("padding")
@@ -323,17 +322,29 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _host_dim_carrying_sym(host_coords: list[Expr], sym) -> int | None:
+    """Return the host dim whose coordinate carries ``sym``, or None."""
+    return next(
+        (i for i, c in enumerate(host_coords) if sym in c.free_symbols),
+        None,
+    )
+
+
 def _project_stick_host_dim(
     input_layout: FixedTiledLayout, stick_source_layout: FixedTiledLayout, dep
 ) -> int | None:
     """Return the input_layout host dim carrying stick_source_layout's
-    within-stick coord under dep, or None if no unique canonical match exists.
+    within-stick coord under dep, or None if it has no single free variable.
 
     When the two layouts are the same this is the buffer's own within-stick
-    host dim; when they differ, stick_source_layout's STL is projected through
-    dep.  A mid-stick ``Mod(var, N) + c`` slice offset resolves to the host dim
-    carrying ``var`` (so the caller can tell a plain pointwise slice apart from
-    a restickify); any other non-offset-free expr returns None (declined).
+    host dim; when they differ, stick_source_layout's stick coordinate is
+    projected through dep.  The projection is by free *variable*: the host dim
+    whose coordinate carries the stick coord's symbol.  The caller then reads a
+    restickify off ``in_stick_dim != new_stick_dim`` — the same test codegen
+    uses (``in_coords[-1].free_symbols != out_coords[-1].free_symbols``,
+    spyre_kernel.py).  A constant coefficient or offset from a sliced stick
+    device-dim size (e.g. ``2*(Mod(var, 32)) + 1``) does not change the free
+    variable, so such rescaled coords need no shape special-case.
     """
     host_coords = host_coordinates(input_layout, dep, None)
     stl = stick_source_layout.device_layout
@@ -344,32 +355,10 @@ def _project_stick_host_dim(
     # No coords means a scalar / zero-dim layout: no stick dim to project.
     if not host_coords or not device_coords:
         return None
-    stick_expr = device_coords[-1]
-    if not is_stick_expr_offset_free(stick_expr, stl.elems_per_stick()):
-        # A mid-stick offset is Mod(var, N) + c: the constant is added to the
-        # within-stick term, so the input is sliced on what becomes the stick
-        # dim at a non-stick-aligned start and the read begins partway into a
-        # stick.  Resolve it to the host dim carrying ``var`` and return that:
-        # the caller compares in-stick vs. new-stick dim, so a plain pointwise
-        # slice (offset on the buffer's own stick dim) declines cleanly, while
-        # a genuine restickify/transpose (offset on a *different* dim) proceeds
-        # into the padding path and raises there on the unpaddable slice.
-        free_args = [a for a in stick_expr.args if a.free_symbols]
-        base = free_args[0] if len(free_args) == 1 else None
-        mid_stick = (
-            isinstance(stick_expr, Add)
-            and isinstance(base, Mod)
-            and len(base.args[0].free_symbols) == 1
-            and base.args[1] == stl.elems_per_stick()
-        )
-        if mid_stick:
-            return matching_dim(host_coords, stick_expr)
-        # Any other non-offset-free expr (a bare var + c shift of a whole
-        # non-stick device dim, or a rescaled modular from an ordinary
-        # pointwise stick-dim slice) compiles correctly when lowered normally;
-        # decline padding.
+    syms = device_coords[-1].free_symbols
+    if len(syms) != 1:
         return None
-    return matching_dim(host_coords, stick_expr)
+    return _host_dim_carrying_sym(host_coords, next(iter(syms)))
 
 
 def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
@@ -465,11 +454,7 @@ def _restickify_output_device_dim(
     old_sym = next(iter(old_syms))
 
     out_host_coords = host_coordinates(out_layout, wdep, None)
-    host_dim = next(
-        (i for i, c in enumerate(out_host_coords) if old_sym in c.free_symbols),
-        None,
-    )
-    if host_dim is None:
+    if _host_dim_carrying_sym(out_host_coords, old_sym) is None:
         return None
 
     device_dim = _device_dim_carrying_sym(stl, wdep, old_sym)

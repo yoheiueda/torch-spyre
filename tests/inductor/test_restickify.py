@@ -884,14 +884,17 @@ def test_pad_restickify_sliced_input_raises():
         )
 
 
-# ------- Restickify padding: offset-variant stick expr classification -------
+# ------- Restickify padding: sliced-transpose stick expr classification -------
 
 
-# A sliced transpose whose slice lands on a dim that becomes a NON-stick device
-# dim yields a ``var + c`` output-side stick expr (or a stick-aligned start
-# collapses to offset-free).  Both compile correctly, so the padding pass must
-# decline (not raise) them.  Contrast test_pad_restickify_sliced_input_raises,
-# where the slice lands mid-stick (``Mod(var, 64) + c``) and must raise.
+# A sliced transpose produces an output-side stick expr whose *shape* varies
+# with where the slice lands and its extent: ``var + c`` (slice on a dim that
+# becomes non-stick), a bare var (stick-aligned start), or a rescaled modular
+# such as ``2*(Mod(var, 32)) + 1`` / ``floor(4*(Mod(var, 48))/3)`` (the stick
+# device-dim size shrank).  All carry the same free variable as the unsliced
+# ``Mod(var, 64)``, so ``_project_stick_host_dim`` resolves them to a host dim
+# and the op compiles correctly.  Contrast test_pad_restickify_sliced_input_raises,
+# where the slice lands mid-stick on the *becomes-stick* dim and must raise.
 OFFSET_STICK_OK_MODELS = [
     # Slice the leading dim (becomes non-stick after transpose): var + c.
     (lambda x: x[3:67].transpose(0, 1).clone(), (128, 128)),
@@ -899,17 +902,23 @@ OFFSET_STICK_OK_MODELS = [
     (lambda x: x[3:66].transpose(0, 1).clone(), (128, 128)),
     # Stick-aligned slice start on the becomes-stick dim: collapses to bare var.
     (lambda x: x[:, :, 64:128, :].transpose(-2, -1).clone(), (2, 2, 128, 128)),
+    # Slice on the becomes-stick dim, aligned extent: rescaled 2*(Mod(var,32))+1.
+    (lambda x: x[:, 64:128].transpose(0, 1).clone(), (128, 128)),
+    # Slice on the becomes-stick dim, 1.5-stick extent: rescaled floor modular.
+    (lambda x: x[:, :96].transpose(0, 1).clone(), (128, 128)),
 ]
 
 
 @pytest.mark.parametrize(
     "fn,shape", OFFSET_STICK_OK_MODELS, ids=lambda p: p if isinstance(p, tuple) else ""
 )
-def test_offset_variant_non_stick_slice_compiles(fn, shape):
-    """A slice whose offset lands off the stick dim compiles correctly.
+def test_sliced_transpose_stick_expr_compiles(fn, shape):
+    """A sliced transpose compiles correctly regardless of the stick expr shape.
 
-    Locks in that the padding pass declines (returns None) rather than
-    over-raising on ``var + c`` / offset-free output-side stick exprs.
+    Locks in that ``_project_stick_host_dim`` classifies restickify by the
+    stick coordinate's free variable (matching codegen), so ``var + c`` and
+    slice-rescaled modular coords resolve to a host dim rather than being
+    declined by a shape special-case.
     """
     x = torch.randn(shape, dtype=torch.float16)
     result = _compile_and_run(fn, (x,), DEVICE)
