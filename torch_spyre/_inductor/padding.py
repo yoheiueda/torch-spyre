@@ -392,18 +392,34 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     return in_dep, in_buf, in_layout, host_size, new_stick_dim, in_stick_dim
 
 
+def _device_dim_carrying_sym(dl: SpyreTensorLayout, wdep, sym) -> int | None:
+    """Return the non-within-stick ``device_size`` dim whose device coordinate
+    carries ``sym`` (the free symbol of some host dim), or None if none does.
+
+    The dim is located by symbol match, not extent equality: two host dims can
+    share an extent, and only the symbol is unambiguous.  The within-stick dim
+    (the last device coordinate) is excluded.
+    """
+    didx = concretize_index(wdep.index, set(wdep.ranges.keys()))
+    dcoords = compute_coordinates(dl.device_size, dl.stride_map, wdep.ranges, didx)
+    return next(
+        (k for k in range(len(dcoords) - 1) if sym in dcoords[k].free_symbols),
+        None,
+    )
+
+
 def _restickify_output_middle_device_dim(
     op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
 ) -> int | None:
-    """Return the device-size entry index of the output's "old-stick" middle
+    """Return the device-size dim index of the output's "old-stick" middle
     device dim, or None if it is stick-aligned and needs no padding.
 
     The output's middle dim is the host dim that carries the iter symbol of
     the input's old stick dim (``in_stick_dim``).  After the restickify it is a
-    non-stick device entry whose true extent is the (small) old-stick host size.
-    Padding is required whenever that device entry's extent is not a stick
+    non-stick device dim whose true extent is the (small) old-stick host size.
+    Padding is required whenever that device dim's extent is not a stick
     multiple, regardless of how many stick blocks the new stick dim spans or
-    where the block axis sits relative to this entry: bumping the entry to a
+    where the block axis sits relative to this dim: bumping the dim to a
     stick boundary widens the physical allocation so every batch plane and stick
     block lands at the correct offset.
     """
@@ -429,18 +445,12 @@ def _restickify_output_middle_device_dim(
     if host_dim is None:
         return None
 
-    didx = concretize_index(wdep.index, set(wdep.ranges.keys()))
-    dcoords = compute_coordinates(odl.device_size, odl.stride_map, wdep.ranges, didx)
-
-    device_entry = next(
-        (k for k in range(len(dcoords) - 1) if old_sym in dcoords[k].free_symbols),
-        None,
-    )
-    if device_entry is None:
+    device_dim = _device_dim_carrying_sym(odl, wdep, old_sym)
+    if device_dim is None:
         return None
-    if odl.device_size[device_entry] % stick_size == 0:
+    if odl.device_size[device_dim] % stick_size == 0:
         return None
-    return device_entry
+    return device_dim
 
 
 def _bump_device_size_dim(
@@ -471,28 +481,28 @@ def _pad_restickify_output_middle(
     stick boundary so the second+ stick block lands at the correct offset.
 
     See the caller for why this is needed.  Only the output buffer's device
-    layout grows (middle device-size entry bumped to a stick multiple); the
+    layout grows (middle device-size dim bumped to a stick multiple); the
     host size/stride stay logical, so the write index — and thus the logical
     output read by downstream consumers — are unchanged.  The over-allocated
     tail rows are written by ``_create_sdsc_tensors``'s existing
     ``dev_dim_size > it_dim_size`` backGap path and never read back.
     """
-    device_entry = _restickify_output_middle_device_dim(
+    device_dim = _restickify_output_middle_device_dim(
         op, in_dep, in_layout, in_stick_dim
     )
-    if device_entry is None:
+    if device_dim is None:
         return
 
     out_layout = op.get_layout()
     odl = out_layout.device_layout
 
-    old_extent = odl.device_size[device_entry]
+    old_extent = odl.device_size[device_dim]
     new_extent = old_extent + compute_padding(old_extent, out_layout.dtype)
 
     # Bump ONLY the middle device-size dim (see _bump_device_size_dim).  The host
     # size/stride stay logical, so the write index — and thus the logical output
     # read by downstream consumers — are unchanged.
-    padded_stl = _bump_device_size_dim(odl, device_entry, new_extent)
+    padded_stl = _bump_device_size_dim(odl, device_dim, new_extent)
 
     host_size = [concretize_expr(s) for s in out_layout.size]
     host_stride = [concretize_expr(s) for s in out_layout.stride]
@@ -508,7 +518,7 @@ def _pad_restickify_output_middle(
     logger.debug(
         "insert_restickify_padding: padded output %s middle device dim %d %d -> %d",
         op.get_name(),
-        device_entry,
+        device_dim,
         old_extent,
         new_extent,
     )
@@ -517,20 +527,15 @@ def _pad_restickify_output_middle(
 def _producer_stick_device_dim(
     producer: ComputedBuffer, new_stick_dim: int
 ) -> int | None:
-    """Return the producer device-size entry index that carries the input host
+    """Return the producer device-size dim index that carries the input host
     dim ``new_stick_dim`` (the dim the restickify turns into its new stick dim),
     or None if the producer geometry does not expose it as a bumpable middle
-    device entry.
+    device dim.
 
     The restickify over-reads this dim to the stick boundary; bumping the
-    producer's device_size on the matching entry makes the producer allocate
+    producer's device_size on the matching dim makes the producer allocate
     (and its backGap path leave defined) the widened tail, so the over-read
     lands inside the producer's own buffer instead of uninitialised HBM.
-
-    The entry is located by the write index's host coordinate symbol (mirroring
-    ``_restickify_output_middle_device_dim``), not by extent equality: two host
-    dims can share an extent, and only the symbol match is unambiguous.  The
-    within-stick entry is excluded.
     """
     layout = producer.get_layout()
     pdl = layout.device_layout
@@ -547,12 +552,7 @@ def _producer_stick_device_dim(
         return None
     sym = next(iter(syms))
 
-    didx = concretize_index(wdep.index, set(wdep.ranges.keys()))
-    dcoords = compute_coordinates(pdl.device_size, pdl.stride_map, wdep.ranges, didx)
-    return next(
-        (k for k in range(len(dcoords) - 1) if sym in dcoords[k].free_symbols),
-        None,
-    )
+    return _device_dim_carrying_sym(pdl, wdep, sym)
 
 
 def _count_consumers(buf_name: str, graph: GraphLowering) -> int:
@@ -590,8 +590,8 @@ def _all_consumers_restickify(buf_name: str, graph: GraphLowering) -> bool:
     Every consumer restickifying the producer means no reader depends on the
     producer's true (unbumped) tail: each restickify over-reads the widened tail
     into its own backGap-discarded band, and multiple bumps on one producer
-    compose (idempotent on the same device entry, independent on different
-    entries).  A plain or reducing co-reader is excluded so its result cannot
+    compose (idempotent on the same device dim, independent on different
+    dims).  A plain or reducing co-reader is excluded so its result cannot
     pick up the over-allocated tail.
     """
     saw = False
@@ -616,7 +616,7 @@ def _fuse_restickify_pad_into_producer(
     ``lower_pad_sequence`` copy (separate buffer + fill + copy + HBM round-trip).
 
     Mirrors ``_pad_restickify_output_middle``: only the producer's device_size
-    on the entry carrying ``new_stick_dim`` grows (host size/stride and
+    on the dim carrying ``new_stick_dim`` grows (host size/stride and
     stride_map stay logical); the producer keeps computing its true ``n`` rows,
     and ``_create_sdsc_tensors``'s ``dev_dim_size > it_dim_size`` backGap path
     leaves the widened tail defined.  The restickify then over-reads the padded
@@ -643,19 +643,19 @@ def _fuse_restickify_pad_into_producer(
     ):
         return False
 
-    device_entry = _producer_stick_device_dim(in_buf, new_stick_dim)
-    if device_entry is None:
+    device_dim = _producer_stick_device_dim(in_buf, new_stick_dim)
+    if device_dim is None:
         return False
 
     layout = in_buf.get_layout()
     pdl = layout.device_layout
-    old_extent = pdl.device_size[device_entry]
+    old_extent = pdl.device_size[device_dim]
     new_extent = n + pad
 
     # Bump the device_size dim (see _bump_device_size_dim).  Unlike the
     # output-middle case, the producer's host dim also grows to new_extent so it
     # actually computes the widened tail.
-    padded_stl = _bump_device_size_dim(pdl, device_entry, new_extent)
+    padded_stl = _bump_device_size_dim(pdl, device_dim, new_extent)
 
     host_size = [concretize_expr(s) for s in layout.size]
     host_size[new_stick_dim] = new_extent
@@ -672,7 +672,7 @@ def _fuse_restickify_pad_into_producer(
         "insert_restickify_padding: fused pad into producer %s device dim %d "
         "%d -> %d (host dim %d: %d -> %d)",
         name,
-        device_entry,
+        device_dim,
         old_extent,
         new_extent,
         new_stick_dim,
