@@ -399,6 +399,42 @@ def _project_stick_host_dim(
     return _host_dim_carrying_sym(host_coords, sym)
 
 
+def _output_stick_symbol(op, out_layout):
+    """Return the OUTPUT within-stick iteration symbol, or None if symbol-free.
+
+    The symbol comes from the op's own write dep against the output stl -- a
+    clean single symbol -- unlike a cross-layout projection through the input
+    dep, which composes two stride patterns into a multi-symbol coord whenever
+    both stick dims are sub-64 and alias the same physical region.
+    """
+    write_dep = _named_write_dep(op)
+    stl = out_layout.device_layout
+    out_dev_index = concretize_index(write_dep.index, set(write_dep.ranges.keys()))
+    out_dev_coords = compute_coordinates(
+        stl.device_size, stl.stride_map, write_dep.ranges, out_dev_index
+    )
+    if not out_dev_coords:
+        return None
+    return _single_free_sym(out_dev_coords[-1])
+
+
+def _output_stick_input_host_dim(op, out_layout, in_layout, in_dep) -> int | None:
+    """Return the input host dim carrying the OUTPUT stick's iteration symbol.
+
+    Mirrors codegen (spyre_kernel.py): the output within-stick symbol comes from
+    the output layout's own write dep, then is located among the input's host
+    coords via the read dep.  A symbol-free output stick means a size-1 host dim
+    moved into stick position; fall back to matching the sole size-1 dim.
+    """
+    out_stick_sym = _output_stick_symbol(op, out_layout)
+    in_host_coords = host_coordinates(in_layout, in_dep, None)
+    if not in_host_coords:
+        return None
+    if out_stick_sym is None:  # a size-1 host dim moved into stick position
+        return _unique_size1_dim(list(in_layout.size))
+    return _host_dim_carrying_sym(in_host_coords, out_stick_sym)
+
+
 def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     """Identify whether ``op`` is a restickify the padding pass may act on.
 
@@ -436,8 +472,20 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
         return None
 
     in_stick_dim = _project_stick_host_dim(in_layout, in_layout, in_dep)
-    new_stick_dim = _project_stick_host_dim(in_layout, out_layout, in_dep)
-    if in_stick_dim is None or new_stick_dim is None:
+    new_stick_dim = _output_stick_input_host_dim(op, out_layout, in_layout, in_dep)
+    if in_stick_dim is None:
+        return None
+    if new_stick_dim is None:
+        # The output stick carries a real iteration symbol (so codegen will emit
+        # a restickify, spyre_kernel.py) but no input host dim carries it: the
+        # buffer would reach codegen unpadded and over-read uninitialized stick
+        # lanes.  Fail loudly rather than miscompile.  A symbol-free output stick
+        # (a size-1 dim that found no unique match) is not a restickify we own,
+        # so skip it quietly.
+        if _output_stick_symbol(op, out_layout) is not None:
+            raise Unsupported(
+                "restickify padding: cannot locate input host dim for output stick"
+            )
         return None
     if new_stick_dim == in_stick_dim:
         return None

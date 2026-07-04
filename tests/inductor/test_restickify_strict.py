@@ -105,6 +105,22 @@ def test_strict_nd_transpose_1_last_clone(shape):
     _strict(lambda x: x.transpose(1, -1).clone(), x)
 
 
+# transpose(0, -1).clone() swaps the OUTERMOST dim with the stick dim.  When both
+# the source stick dim and the destination stick dim are sub-64 (e.g. 2 and 7),
+# the restickify-padding candidate scan used to project the output stick coord
+# through the input read dep, which composes the two sub-stick stride patterns
+# into a multi-symbol coord and dropped the candidate -- so no fill was inserted
+# and the restickify over-read uninitialized stick lanes (silent miscompile).
+# Deriving the output stick dim from the output layout's own write dep fixes it.
+SPLIT_T0_LAST = [(7, 67, 2), (7, 65, 2), (5, 3, 2), (7, 67, 63)]
+
+
+@pytest.mark.parametrize("shape", SPLIT_T0_LAST, ids=lambda p: "x".join(map(str, p)))
+def test_strict_transpose_0_last_clone(shape):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(0, -1).clone(), x)
+
+
 # torch.cat shapes drawn from the Q2 target-model failures catalogued in
 # issue #1094 (torch.cat for Ministral / Mistral-Small / gpt-oss-20b / granite).
 # Each entry is (a_shape, b_shape, dim, marks).  These are the concrete shapes
