@@ -327,6 +327,16 @@ def _single_free_sym(expr: Expr):
     return next(iter(syms)) if len(syms) == 1 else None
 
 
+def _named_write_dep(op):
+    """Return ``op``'s sole named write dep.
+
+    Every ComputedBuffer on the restickify path (the candidate itself, or a
+    ComputedBuffer producer) has exactly one named write.  Fetch it loudly: an
+    empty writes set is an invariant violation, not a shape we silently skip.
+    """
+    return next(d for d in op.get_read_writes().writes if hasattr(d, "name"))
+
+
 def _host_dim_carrying_sym(host_coords: list[Expr], sym) -> int | None:
     """Return the outermost host dim whose coordinate carries ``sym``, or None.
 
@@ -453,31 +463,25 @@ def _restickify_output_device_dim(
     relative to this dim: bumping the dim to a stick boundary widens the physical
     allocation so every batch plane and stick block lands at the correct offset.
     """
-    out_layout = op.get_layout()
-    stl = out_layout.device_layout
-    stick_size = get_elem_in_stick(out_layout.dtype)
-
-    write_dep = next(
-        (d for d in op.get_read_writes().writes if hasattr(d, "name")), None
-    )
-    if write_dep is None:
-        return None
-
+    # The old stick dim's host coord carries more than one iter symbol (a fused
+    # host dim): no single symbol to track through to a device dim, so decline.
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     old_sym = _single_free_sym(in_host_coords[in_stick_dim])
     if old_sym is None:
         return None
-
     # Old stick dim collapsed to a size-1 output host dim (const-0 coord, no
     # symbol): nothing survives to misalign, so nothing to pad.
+    out_layout = op.get_layout()
+    write_dep = _named_write_dep(op)
     out_host_coords = host_coordinates(out_layout, write_dep, None)
     if _host_dim_carrying_sym(out_host_coords, old_sym) is None:
         return None
-
+    stl = out_layout.device_layout
     device_dim = _device_dim_carrying_sym(stl, write_dep, old_sym)
     if device_dim is None:
         return None
     # Already a stick multiple: stick blocks land aligned, no padding needed.
+    stick_size = get_elem_in_stick(out_layout.dtype)
     if stl.device_size[device_dim] % stick_size == 0:
         return None
     return device_dim
@@ -507,7 +511,6 @@ def _pad_layout_device_dim(
     padded_stl = SpyreTensorLayout(
         new_device_size, list(stl.stride_map), stl.device_dtype, stl.element_arrangement
     )
-
     host_size = [concretize_expr(s) for s in layout.size]
     host_stride = [concretize_expr(s) for s in layout.stride]
     if grow_host_dim is not None:
@@ -560,19 +563,12 @@ def _restickify_input_device_dim(
     lands inside the producer's own buffer instead of uninitialised HBM.
     """
     layout = producer.get_layout()
-    stl = layout.device_layout
-
-    write_dep = next(
-        (d for d in producer.get_read_writes().writes if hasattr(d, "name")), None
-    )
-    if write_dep is None:
-        return None
-
+    write_dep = _named_write_dep(producer)
     host_coords = host_coordinates(layout, write_dep, None)
     sym = _single_free_sym(host_coords[new_stick_dim])
     if sym is None:
         return None
-
+    stl = layout.device_layout
     return _device_dim_carrying_sym(stl, write_dep, sym)
 
 
@@ -683,7 +679,7 @@ def _restickify_loader_perm(
     in-/new-stick dim).
     """
     in_host_coords = host_coordinates(in_layout, in_dep, None)
-    write_dep = next(d for d in op.get_read_writes().writes if hasattr(d, "name"))
+    write_dep = _named_write_dep(op)
     out_host_coords = host_coordinates(op.get_layout(), write_dep, None)
     sym_to_out_pos = {
         sym: k
