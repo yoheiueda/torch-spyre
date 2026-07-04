@@ -350,6 +350,18 @@ def _host_dim_carrying_sym(host_coords: list[Expr], sym) -> int | None:
     return None
 
 
+def _unique_size1_dim(sizes: list) -> int | None:
+    """Return the index of the sole size-1 entry in ``sizes``, or None.
+
+    A size-1 dim carries no free variable, so symbol-based matching cannot
+    locate it.  When exactly one dim is size-1 the match is still unambiguous
+    (mirroring ``coarse_tile._resize_stl_device_dims``' singleton branch); more
+    than one size-1 dim is ambiguous without a further tiebreak, so decline.
+    """
+    ones = [i for i, s in enumerate(sizes) if concretize_expr(s) == 1]
+    return ones[0] if len(ones) == 1 else None
+
+
 def _project_stick_host_dim(
     input_layout: FixedTiledLayout, stick_source_layout: FixedTiledLayout, dep
 ) -> int | None:
@@ -365,6 +377,12 @@ def _project_stick_host_dim(
     spyre_kernel.py).  A constant coefficient or offset from a sliced stick
     device-dim size (e.g. ``2*(Mod(var, 32)) + 1``) does not change the free
     variable, so such rescaled coords need no shape special-case.
+
+    When the stick coord is symbol-free -- a size-1 host dim occupies the stick
+    (coord collapses to a constant 0) -- there is no symbol to project, so fall
+    back to matching the sole size-1 host dim by size (declining if the match is
+    ambiguous).  This lets a transpose that moves a size-1 dim into stick
+    position be recognised as a restickify.
     """
     host_coords = host_coordinates(input_layout, dep, None)
     stl = stick_source_layout.device_layout
@@ -377,7 +395,7 @@ def _project_stick_host_dim(
         return None
     sym = _single_free_sym(device_coords[-1])
     if sym is None:
-        return None
+        return _unique_size1_dim(list(input_layout.size))
     return _host_dim_carrying_sym(host_coords, sym)
 
 
@@ -561,15 +579,32 @@ def _restickify_input_device_dim(
     producer's device_size on the matching dim makes the producer allocate
     (and its backGap path leave defined) the widened tail, so the over-read
     lands inside the producer's own buffer instead of uninitialised HBM.
+
+    When ``new_stick_dim`` is a size-1 host dim (symbol-free coord), there is no
+    symbol to project onto a device dim, so fall back to the sole size-1
+    (singleton) producer device dim.  Several device dims can be size-1 (the
+    host singleton plus a single-block stick tile-count); disambiguate by the
+    ``stride_map == -1`` marker that ``coarse_tile._resize_stl_device_dims``
+    uses for the singleton being grown, and decline if still ambiguous.
     """
     layout = producer.get_layout()
     write_dep = _named_write_dep(producer)
     host_coords = host_coordinates(layout, write_dep, None)
-    sym = _single_free_sym(host_coords[new_stick_dim])
-    if sym is None:
-        return None
     stl = layout.device_layout
-    return _device_dim_carrying_sym(stl, write_dep, sym)
+    sym = _single_free_sym(host_coords[new_stick_dim])
+    if sym is not None:
+        return _device_dim_carrying_sym(stl, write_dep, sym)
+    # Size-1 host dim: match the singleton producer device dim by size, using
+    # stride_map == -1 to break ties among multiple size-1 device dims.
+    device_size = list(stl.device_size)
+    stride_map = list(stl.stride_map)
+    size1_dims = [
+        d for d in range(len(device_size) - 1) if concretize_expr(device_size[d]) == 1
+    ]
+    grow = [d for d in size1_dims if stride_map[d] == -1]
+    if len(grow) == 1:
+        return grow[0]
+    return size1_dims[0] if len(size1_dims) == 1 else None
 
 
 def _pad_restickify_input_via_producer(
