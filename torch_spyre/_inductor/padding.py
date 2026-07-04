@@ -572,7 +572,9 @@ def _restickify_input_device_dim(
     return _device_dim_carrying_sym(stl, write_dep, sym)
 
 
-def _pad_restickify_input_via_producer(in_buf, new_stick_dim: int) -> bool:
+def _pad_restickify_input_via_producer(
+    in_buf: ComputedBuffer, new_stick_dim: int
+) -> bool:
     """Grow a producer's output to the stick-aligned dim size so the restickify
     reads its widened tail directly, avoiding the ``lower_pad_sequence`` copy
     (separate buffer + fill + copy + HBM round-trip).
@@ -621,10 +623,6 @@ def _pad_restickify_input_via_producer(in_buf, new_stick_dim: int) -> bool:
     output is never restickified in place, since Inductor realizes such a graph
     so the restickify reads the underlying source, not the output buffer.
     """
-    # A graph input arrives as an InputBuffer; its allocation is not ours to
-    # widen, so fall back to the copy path.
-    if not isinstance(in_buf, ComputedBuffer):
-        return False
     name = in_buf.get_name()
 
     device_dim = _restickify_input_device_dim(in_buf, new_stick_dim)
@@ -801,7 +799,13 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
             continue
 
-        if not _pad_restickify_input_via_producer(in_buf, new_stick_dim):
-            _pad_restickify_input_via_copy(
-                op, operations, in_dep, in_buf, in_layout, new_stick_dim
-            )
+        # Grow the producer in place when the input is one we own (a
+        # ComputedBuffer); a graph input's allocation is not ours to widen, so it
+        # takes the zero-filled copy path.
+        if isinstance(in_buf, ComputedBuffer) and _pad_restickify_input_via_producer(
+            in_buf, new_stick_dim
+        ):
+            continue
+        _pad_restickify_input_via_copy(
+            op, operations, in_dep, in_buf, in_layout, new_stick_dim
+        )
