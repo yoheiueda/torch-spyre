@@ -1096,6 +1096,26 @@ def test_pad_fused_into_producer(fuse_tensors):
     compare_with_cpu(fn, x, y, target=result, run_eager=False)
 
 
+def test_pad_fused_into_matmul_producer():
+    """A sliced matmul output (a@b)[:,c:]+z reaches the producer path as a
+    Reduction (batchmatmul), not a Pointwise.  Growing it does not grow its
+    iteration space (a Reduction iterates its K-space reads, not its output), so
+    the matmul's own write leaves the bumped tail unwritten -- but every consumer
+    caps at the logical extent and never reads it, so the fusion is still safe
+    and correct.  Locks in that Reduction producers fuse (no lower_pad_sequence
+    copy) rather than falling back."""
+    a = torch.randn((67, 64), dtype=torch.float16)
+    b = torch.randn((64, 67), dtype=torch.float16)
+    z = torch.randn((67, 64), dtype=torch.float16)
+
+    def fn(a, b, z):
+        return (a @ b)[:, 3:] + z
+
+    result, fused, _ = _run_capturing_padding_log(fn, a, b, z)
+    assert fused >= 1, "matmul (Reduction) producer should fuse, not fall back"
+    compare_with_cpu(fn, a, b, z, target=result, run_eager=False)
+
+
 def test_pad_graph_input_falls_back():
     """Restickifying a bare graph input has no producer to fuse into; the pass
     must fall back to the lower_pad_sequence copy and still be correct."""
@@ -1110,11 +1130,14 @@ def test_pad_graph_input_falls_back():
     compare_with_cpu(fn, x, y, target=result, run_eager=False)
 
 
-def test_pad_multi_consumer_producer_falls_back():
-    """A producer with a non-restickify co-reader must fall back to the copy: a
-    plain/reducing reader indexes the producer's logical tail, so growing the
-    shared buffer for the transpose's over-read could leak the bumped tail into
-    that reader.  Here p.sum() is the non-restickify co-reader."""
+def test_pad_multi_consumer_producer_fuses_with_coreader():
+    """A producer read by a restickify AND a non-restickify co-reader still
+    fuses: growing the shared buffer is safe because every consumer iterates its
+    own it_dim_size, so the co-reader (here p.sum(), a reducing reader) never
+    touches the bumped tail -- the growth lands in the restickify's
+    backGap-discarded band.  A grown buffer also cannot be LX-pinned
+    (device_size > it_dim_size trips the allocator's back-gap gate), so the
+    fusion needs no consumer-kind guard of its own."""
     x = torch.randn((67, 128), dtype=torch.float16)
     z = torch.randn((128, 67), dtype=torch.float16)
 
@@ -1123,7 +1146,7 @@ def test_pad_multi_consumer_producer_falls_back():
         return p.transpose(-2, -1) + z + p.sum()
 
     result, fused, _ = _run_capturing_padding_log(fn, x, z)
-    assert fused == 0, "producer with a non-restickify co-reader should fall back"
+    assert fused >= 1, "producer with a non-restickify co-reader should still fuse"
     compare_with_cpu(fn, x, z, target=result, run_eager=False)
 
 
@@ -1145,12 +1168,25 @@ def test_pad_shared_all_restickify_consumers_fuse():
     compare_with_cpu(fn, x, za, zb, target=result, run_eager=False)
 
 
+def _is_restickify_op(op) -> bool:
+    """True when ``op`` is a spyre.restickify ComputedBuffer, detected via its
+    origin FX node's target (restickify has no ATen decomposition, so
+    _create_restickify_node stamps the synthetic node into origins)."""
+    from torch._inductor.ir import ComputedBuffer
+
+    if not isinstance(op, ComputedBuffer):
+        return False
+    origins = op.origins
+    if not origins:
+        return False
+    return next(iter(origins)).target is torch.ops.spyre.restickify.default
+
+
 def _restickify_readers_by_source(fn, *args):
     """Run fn on Spyre and return {producer_name: [restickify buffer names]},
     a map of every source buffer to the restickify ops that read it, captured
     from graph.operations right after insert_restickify splices them in."""
     import torch_spyre._inductor.passes as _passes
-    from torch_spyre._inductor.padding import _is_restickify_op
 
     insert_restickify = _passes.insert_restickify
     by_source: dict[str, list[str]] = {}
@@ -1174,8 +1210,7 @@ def test_shared_producer_gets_two_restickify_nodes():
     """insert_restickify keys its plan by consumer, not by source, so a producer
     that fans out to two consumers each wanting a different layout gets a
     *separate* restickify node per consumer -- both reading the one producer.
-    This is the structural case _all_consumers_restickify exists to permit; here
-    we assert the two-node shape directly rather than via the fusion log."""
+    We assert the two-node shape directly rather than via the fusion log."""
     x = torch.randn((67, 53, 128), dtype=torch.float16)
     za = torch.randn((128, 53, 67), dtype=torch.float16)
     zb = torch.randn((67, 128, 53), dtype=torch.float16)
