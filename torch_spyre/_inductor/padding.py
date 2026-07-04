@@ -49,7 +49,6 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
-    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -577,93 +576,60 @@ def _restickify_input_device_dim(
     return _device_dim_carrying_sym(stl, write_dep, sym)
 
 
-def _count_consumers(buf_name: str, graph: GraphLowering) -> int:
-    """Number of operations that read ``buf_name``."""
-    count = 0
-    for op in graph.operations:
-        try:
-            reads = op.get_read_writes().reads
-        except Exception:
-            continue
-        if any(getattr(r, "name", None) == buf_name for r in reads):
-            count += 1
-    return count
-
-
-def _is_restickify_op(op: Operation) -> bool:
-    """True when ``op`` is a spyre.restickify ComputedBuffer.
-
-    Detected via the origin FX node's target (cf. propagate_layouts.py), since
-    restickify has no ATen decomposition and _create_restickify_node stamps its
-    synthetic FX node into origins.
-    """
-    if not isinstance(op, ComputedBuffer):
-        return False
-    origins = op.origins
-    if not origins:
-        return False
-    return next(iter(origins)).target is torch.ops.spyre.restickify.default
-
-
-def _all_consumers_restickify(buf_name: str, graph: GraphLowering) -> bool:
-    """True when ``buf_name`` has at least one consumer and every consumer is a
-    restickify op.
-
-    Every consumer restickifying the producer means no reader depends on the
-    producer's true (unbumped) tail: each restickify over-reads the widened tail
-    into its own backGap-discarded band, and multiple bumps on one producer
-    compose (idempotent on the same device dim, independent on different
-    dims).  A plain or reducing co-reader is excluded so its result cannot
-    pick up the over-allocated tail.
-    """
-    saw = False
-    for op in graph.operations:
-        try:
-            reads = op.get_read_writes().reads
-        except Exception:
-            continue
-        if not any(getattr(r, "name", None) == buf_name for r in reads):
-            continue
-        if not _is_restickify_op(op):
-            return False
-        saw = True
-    return saw
-
-
-def _pad_restickify_input_via_producer(
-    in_buf, new_stick_dim: int, graph: GraphLowering
-) -> bool:
-    """Grow a single-consumer pointwise producer's output to the stick-aligned
-    dim size so the restickify reads its widened tail directly, avoiding the
-    ``lower_pad_sequence`` copy (separate buffer + fill + copy + HBM round-trip).
+def _pad_restickify_input_via_producer(in_buf, new_stick_dim: int) -> bool:
+    """Grow a producer's output to the stick-aligned dim size so the restickify
+    reads its widened tail directly, avoiding the ``lower_pad_sequence`` copy
+    (separate buffer + fill + copy + HBM round-trip).
 
     Grows the producer's device_size AND host_size on the dim carrying
     ``new_stick_dim`` to the stick boundary (host_stride and stride_map are
     unchanged: growing the outermost extent does not alter the per-step strides
-    -- see _pad_layout_device_dim).  The producer then computes the widened tail
-    itself, so the restickify over-reads defined values instead of uninitialised
-    HBM; the tail lands in the output's backGap-discarded band and never reaches
-    a read position.
+    -- see _pad_layout_device_dim).  The restickify then over-reads the widened
+    device dim, which now lands inside the producer's own (wider) allocation
+    instead of uninitialised HBM.
 
-    Only qualifies when the producer is an internal (non-output) pointwise
-    ``ComputedBuffer`` without a mutation layout, and either has a single
-    consumer or is read exclusively by restickify ops (so no reader depends on
-    its true tail); returns False otherwise so the caller falls back to
-    ``lower_pad_sequence``.
+    The grow is layout-only (device_size + host_size on one dim), so it does not
+    branch on the producer's op kind.  The producer may be a Pointwise or a
+    Reduction (e.g. a sliced matmul output); the two differ in what the grown
+    tail contains, but both are safe:
+
+    - Pointwise: iteration_space follows the output (write.ranges), so growing
+      host_size grows the iteration space and the producer writes real values
+      into the widened tail.
+    - Reduction (matmul): iteration_space follows the input (read.ranges, the
+      K-space), so growing the output dim does NOT grow the iteration space --
+      the producer's own write gets dev_dim_size > it_dim_size and its
+      write-side backGap leaves the tail unwritten (garbage).
+
+    Either way the tail never reaches a read position: every consumer iterates
+    its own it_dim_size, capped at the producer's logical extent, so a plain,
+    reducing, or restickifying co-reader stops before the bumped tail (the same
+    per-consumer bound that lets the restickify output discard its own padded
+    rows).  A grown buffer also cannot be LX-pinned -- device_size > it_dim_size
+    trips the allocator's back-gap gate (_would_produce_lx_back_gap), which the
+    backend supports on HBM but not LX -- so the fusion needs no consumer guard.
+
+    The one invariant the grow relies on is that the producer carries a
+    ``FixedTiledLayout``: the caller (_identify_restickify_candidate) requires it
+    here, and codegen's store() requires it again downstream.  This is the real
+    precondition, not the op kind -- an op-kind guard would be both narrower than
+    needed (Scatter is a Pointwise subclass, the *Reduction variants subclass
+    Reduction) and a false precondition (Scan/Sort would trip it though the
+    layout-only grow stays correct).
+
+    Two producer kinds need no guard because the caller never reaches them: the
+    caller already requires the input's layout to be a ``FixedTiledLayout``
+    (_identify_restickify_candidate), so a mutation-layout producer never
+    arrives here (and would be discarded anyway, since propagate_mutation_layouts
+    reassigns such layouts after this pass); and a producer that is also a graph
+    output is never restickified in place, since Inductor realizes such a graph
+    so the restickify reads the underlying source, not the output buffer.
     """
+    # A graph input arrives as an InputBuffer; its allocation is not ours to
+    # widen, so fall back to the copy path.
     if not isinstance(in_buf, ComputedBuffer):
         return False
-    if not isinstance(in_buf.data, Pointwise):
-        return False
-    if isinstance(in_buf.layout, MutationLayoutSHOULDREMOVE):
-        return False
     name = in_buf.get_name()
-    if name in graph.get_output_names():
-        return False
-    if _count_consumers(name, graph) != 1 and not _all_consumers_restickify(
-        name, graph
-    ):
-        return False
 
     device_dim = _restickify_input_device_dim(in_buf, new_stick_dim)
     if device_dim is None:
@@ -707,9 +673,10 @@ def _pad_restickify_input_via_copy(
     input ahead of the restickify and rewrite the restickify body to read it.
 
     Used when the input cannot be padded in place by
-    ``_pad_restickify_input_via_producer`` (graph input, multi-consumer,
-    non-pointwise, or mutation-layout producer).  The copy costs a separate
-    buffer + fill + copy + HBM round-trip, which the producer path avoids.
+    ``_pad_restickify_input_via_producer`` (graph input, non-pointwise producer
+    such as a matmul/reduction, or a mutation-layout producer).  The copy costs
+    a separate buffer + fill + copy + HBM round-trip, which the producer path
+    avoids.
     """
     device = in_buf.get_device()
     if device is None:
@@ -830,7 +797,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
             continue
 
-        if not _pad_restickify_input_via_producer(in_buf, new_stick_dim, graph):
+        if not _pad_restickify_input_via_producer(in_buf, new_stick_dim):
             _pad_restickify_input_via_copy(
                 op, operations, in_dep, in_buf, in_layout, new_stick_dim
             )
