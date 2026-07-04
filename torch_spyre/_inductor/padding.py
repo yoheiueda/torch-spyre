@@ -661,6 +661,55 @@ def _pad_restickify_input_via_producer(in_buf, new_stick_dim: int) -> bool:
     return True
 
 
+def _restickify_loader_perm(
+    op: ComputedBuffer, in_dep, in_layout: FixedTiledLayout
+) -> list[int | None]:
+    """Map each input host dim to the output iteration position that drives it.
+
+    The rewritten restickify body iterates ``op.data.ranges``, so its inner_fn
+    ``index`` list is positional over the *output* host dims; output dim k
+    carries the iter sym in ``out_host_coords[k]``.  This returns a permutation
+    ``perm`` where input host dim i is loaded at ``index[perm[i]]``, or at
+    constant 0 when ``perm[i]`` is None (a degenerate size-1 input dim carries no
+    sym).  Indexing by the output positions -- rather than the compressed
+    input-sym order -- is what makes size-1 host dims (e.g. the leading-1 / seq=1
+    dims of a mid-stick torch.cat) work without shifting the non-degenerate dims
+    (see #1094).
+
+    Raises Unsupported when any input host dim is sliced (iter range < dim size):
+    a genuine restickify whose moved stick dim or any other dim is sliced cannot
+    be padded, so fail loudly instead of over-reading.  A plain pointwise
+    stick-dim slice never gets here (the candidate matcher declines it: same
+    in-/new-stick dim).
+    """
+    in_host_coords = host_coordinates(in_layout, in_dep, None)
+    write_dep = next(d for d in op.get_read_writes().writes if hasattr(d, "name"))
+    out_host_coords = host_coordinates(op.get_layout(), write_dep, None)
+    sym_to_out_pos = {
+        sym: k
+        for k, c in enumerate(out_host_coords)
+        if (sym := _single_free_sym(c)) is not None
+    }
+    perm: list[int | None] = []
+    for i, coord in enumerate(in_host_coords):
+        sym = _single_free_sym(coord)
+        if sym is None:
+            # Degenerate (size-1) input host dim: load at constant 0.
+            perm.append(None)
+            continue
+        iter_range = concretize_expr(in_dep.ranges[sym])
+        dim_size = concretize_expr(in_layout.size[i])
+        # TODO: support sliced inputs (e.g. ``x[:, :, 1:66, :].transpose(-2, -1)``).
+        if iter_range != dim_size:
+            raise Unsupported(
+                f"insert_restickify_padding: sliced input on host dim "
+                f"{i} of {op.get_name()} (iter range {iter_range} != "
+                f"dim size {dim_size}) is not supported"
+            )
+        perm.append(sym_to_out_pos[sym])
+    return perm
+
+
 def _pad_restickify_input_via_copy(
     op: ComputedBuffer,
     operations: list[Operation],
@@ -673,10 +722,9 @@ def _pad_restickify_input_via_copy(
     input ahead of the restickify and rewrite the restickify body to read it.
 
     Used when the input cannot be padded in place by
-    ``_pad_restickify_input_via_producer`` (graph input, non-pointwise producer
-    such as a matmul/reduction, or a mutation-layout producer).  The copy costs
-    a separate buffer + fill + copy + HBM round-trip, which the producer path
-    avoids.
+    ``_pad_restickify_input_via_producer`` (a graph input, or a producer with no
+    stick-carrying device dim to grow).  The copy costs a separate buffer + fill
+    + copy + HBM round-trip, which the producer path avoids.
     """
     device = in_buf.get_device()
     if device is None:
@@ -703,52 +751,12 @@ def _pad_restickify_input_via_copy(
     # Move pad ops to just before the restickify (lower_pad_sequence appends).
     _move_ops_before(operations, new_ops, op)
 
-    # Replace the restickify body with a Pointwise that reads padded_buf
-    # through a permuted index, mapping each input host dim to the output
-    # iteration position that drives it.  The output Pointwise iterates
-    # op.data.ranges, so the inner_fn ``index`` list is positional over the
-    # *output* host dims; output dim k carries the iter sym in
-    # out_host_coords[k].  An input host dim whose coord carries the same sym
-    # is loaded at index[k]; a degenerate (size-1) input dim carries no sym
-    # and is loaded at constant 0.  Indexing by the output positions — rather
-    # than the compressed input-sym order — is what makes size-1 host dims
-    # (e.g. the leading-1 / seq=1 dims of a mid-stick torch.cat) work without
-    # shifting the non-degenerate dims (See #1094).
-    # op.data.ranges stays at the logical output size; the stick-boundary
-    # widening happens later in superdsc's _extend_restickify_to_padded
-    # (Inductor's _simplify_loops would undo it if done here).
-    in_host_coords = host_coordinates(in_layout, in_dep, None)
-    write_dep = next(d for d in op.get_read_writes().writes if hasattr(d, "name"))
-    out_host_coords = host_coordinates(op.get_layout(), write_dep, None)
-    sym_to_out_pos = {
-        next(iter(c.free_symbols)): k
-        for k, c in enumerate(out_host_coords)
-        if c.free_symbols
-    }
-    loader_perm: list[int | None] = []
-    for i, coord in enumerate(in_host_coords):
-        syms = coord.free_symbols
-        if not syms:
-            # Degenerate (size-1) input host dim: load at constant 0.
-            loader_perm.append(None)
-            continue
-        assert len(syms) == 1, "_identify_restickify_candidate should have ensured this"
-        sym = next(iter(syms))
-        iter_range = concretize_expr(in_dep.ranges[sym])
-        dim_size = concretize_expr(in_layout.size[i])
-        # Backstop for a slice on any input host dim of a candidate: a genuine
-        # restickify whose (moved) stick dim or any other dim is sliced reaches
-        # here with iter_range < dim_size, and cannot be padded, so fail loudly
-        # instead of over-reading.  A plain pointwise stick-dim slice never gets
-        # here (the candidate matcher declines it: same in-/new-stick dim).
-        # TODO: support sliced inputs (e.g. ``x[:, :, 1:66, :].transpose(-2, -1)``).
-        if iter_range != dim_size:
-            raise Unsupported(
-                f"insert_restickify_padding: sliced input on host dim "
-                f"{i} of {op.get_name()} (iter range {iter_range} != "
-                f"dim size {dim_size}) is not supported"
-            )
-        loader_perm.append(sym_to_out_pos[sym])
+    # Replace the restickify body with a Pointwise that reads padded_buf through
+    # a permuted index (see _restickify_loader_perm).  op.data.ranges stays at
+    # the logical output size; the stick-boundary widening happens later in
+    # superdsc's _extend_restickify_to_padded (Inductor's _simplify_loops would
+    # undo it if done here).
+    loader_perm = _restickify_loader_perm(op, in_dep, in_layout)
     old_pw = op.data
     padded_loader = padded_buf.make_loader()
     new_pw = Pointwise(
