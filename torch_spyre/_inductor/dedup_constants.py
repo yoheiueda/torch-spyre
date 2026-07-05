@@ -18,8 +18,8 @@ from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.virtualized import V
 
 from .ir import SpyreConstantFallback
-from .insert_restickify import NameSwapHandler
 from .logging_utils import get_inductor_logger
+from .pass_utils import NameSwapHandler
 
 logger = get_inductor_logger("dedup_constants")
 
