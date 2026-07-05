@@ -154,6 +154,23 @@ def test_size1_input_stick_transpose_0_last_clone(shape):
     torch.testing.assert_close(spyre.cpu(), fn(x), atol=1e-2, rtol=1e-2)
 
 
+# The bare clone (no .exp()) drives the same size-1 stick elision through the
+# GRAPH-INPUT fallback: the restickify input is a graph input, so
+# insert_restickify_padding takes the zero-filled copy path
+# (_pad_restickify_input_via_copy) and rebuilds the restickify body via
+# replace_computed_buffer_body -- which must carry the _size1_stick_alloc_dim tag
+# onto the replacement buffer, or the scheduler grows nothing and the descriptor
+# writes 64 planes into a 1-plane allocation (all but the first plane garbage).
+# The copy path preserves the input bit-for-bit, so this asserts exact equality
+# on a distinct ramp (unlike the .exp() fast path above).
+@pytest.mark.parametrize(
+    "shape", SIZE1_INPUT_STICK, ids=lambda p: "x".join(map(str, p))
+)
+def test_size1_input_stick_transpose_0_last_clone_graph_input(shape):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(0, -1).clone(), x)
+
+
 # torch.cat shapes drawn from the Q2 target-model failures catalogued in
 # issue #1094 (torch.cat for Ministral / Mistral-Small / gpt-oss-20b / granite).
 # Each entry is (a_shape, b_shape, dim, marks).  These are the concrete shapes

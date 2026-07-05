@@ -1036,6 +1036,8 @@ def replace_computed_buffer_body(
     new_buf.operation_name = op.operation_name
     new_buf.origins = op.origins
     new_buf.origin_node = op.origin_node
+    if hasattr(op, "_size1_stick_alloc_dim"):
+        new_buf._size1_stick_alloc_dim = op._size1_stick_alloc_dim
     copy_op_metadata(op, new_buf)
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
 
