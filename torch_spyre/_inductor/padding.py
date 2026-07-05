@@ -586,6 +586,38 @@ def _pad_layout_device_dim(
     )
 
 
+def _restickify_output_size1_device_dim(
+    op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
+) -> int | None:
+    """Return the collapsed old-stick output device dim when the input's old
+    stick host dim is size 1, or None when it does not apply / is ambiguous.
+
+    Companion to ``_restickify_output_device_dim`` for the case that function
+    declines with ``old_sym is None``: a size-1 input old-stick host dim carries
+    no symbol to project, so the output dim it collapses to is a size-1 singleton
+    (``device_size == 1``) marked ``stride_map == -1``.  Mirrors the input-side
+    ``_restickify_input_device_dim`` tiebreak; declines if still ambiguous.
+
+    Unlike the aligned path this dim cannot be grown in place here: growing a
+    size-1 device dim before ``align_tensors`` yields a fractional coordinate
+    (``7*c0/64``) that ``normalize_coordinates`` rejects.  The scheduler grows it
+    after align instead (see ``_grow_size1_stick_allocations``); this function
+    only locates the dim to tag.
+    """
+    in_host_coords = host_coordinates(in_layout, in_dep, None)
+    if _single_free_sym(in_host_coords[in_stick_dim]) is not None:
+        return None  # not a size-1 old-stick dim; aligned path owns it
+    out_layout = op.get_layout()
+    stl = out_layout.device_layout
+    device_size = [concretize_expr(s) for s in stl.device_size]
+    stride_map = list(stl.stride_map)
+    size1 = [d for d in range(len(device_size) - 1) if device_size[d] == 1]
+    grow = [d for d in size1 if stride_map[d] == -1]
+    if len(grow) == 1:
+        return grow[0]
+    return size1[0] if len(size1) == 1 else None
+
+
 def _pad_restickify_output(
     op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
 ) -> None:
@@ -595,9 +627,24 @@ def _pad_restickify_output(
 
     Only the device layout grows (see _pad_layout_device_dim); the tail rows are
     covered by ``_create_sdsc_tensors``'s backGap path and never read back.
+
+    When the input old-stick host dim is size 1 the output dim collapses to a
+    size-1 singleton whose in-place grow would break ``align_tensors``; tag it
+    with ``_size1_stick_alloc_dim`` for the scheduler to grow after align.
     """
     device_dim = _restickify_output_device_dim(op, in_dep, in_layout, in_stick_dim)
     if device_dim is None:
+        size1_dim = _restickify_output_size1_device_dim(
+            op, in_dep, in_layout, in_stick_dim
+        )
+        if size1_dim is not None:
+            op._size1_stick_alloc_dim = size1_dim
+            logger.debug(
+                "insert_restickify_padding: tagged size-1 output %s device dim %d "
+                "for scheduler-window alloc grow",
+                op.get_name(),
+                size1_dim,
+            )
         return
 
     out_layout = op.get_layout()
