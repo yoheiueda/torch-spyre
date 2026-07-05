@@ -121,6 +121,39 @@ def test_strict_transpose_0_last_clone(shape):
     _strict(lambda x: x.transpose(0, -1).clone(), x)
 
 
+# Size-1 input-stick shapes ((7, 67, 1) etc.) are a distinct failure: upstream
+# Inductor elides the size-1 source-stick dim (no loop symbol), so the
+# restickify's input operand collapses to a 2-dim iteration space with no KERNEL
+# data-stage and the backend aborts (dxp_standalone SIGABRT).  Two rewrites make
+# N=1 match N>=2: superdsc._restore_elided_restickify_stick restores the elided
+# stick as a fresh size-64 symbol so the SDSC descriptor is 3-dim, and the
+# scheduler grows the output's collapsed size-1 device dim to a full stick so
+# the physical allocation matches the 64-plane descriptor write
+# (scheduler._grow_size1_stick_allocations).  Without the second fix the
+# descriptor writes 64 planes into a 1-plane buffer and all but the first plane
+# come back garbage.
+#
+# The .exp() makes the restickify input an internal ComputedBuffer, so
+# insert_restickify_padding grows the producer in place (the fast path) rather
+# than the zero-filled graph-input copy fallback.  A cheap arithmetic producer
+# would be constant-folded away and never materialize the collapsed layout, so a
+# transcendental is used; its last-ULP host/device drift means this asserts
+# allclose rather than the exact torch.equal the ramp-based tests use.
+SIZE1_INPUT_STICK = [(7, 67, 1), (7, 65, 1), (5, 3, 1)]
+
+
+@pytest.mark.parametrize(
+    "shape", SIZE1_INPUT_STICK, ids=lambda p: "x".join(map(str, p))
+)
+def test_size1_input_stick_transpose_0_last_clone(shape):
+    def fn(x):
+        return x.exp().transpose(0, -1).clone()
+
+    x = torch.ones(*shape, dtype=torch.float16)
+    spyre = _compile_and_run(fn, (x,), DEVICE)
+    torch.testing.assert_close(spyre.cpu(), fn(x), atol=1e-2, rtol=1e-2)
+
+
 # torch.cat shapes drawn from the Q2 target-model failures catalogued in
 # issue #1094 (torch.cat for Ministral / Mistral-Small / gpt-oss-20b / granite).
 # Each entry is (a_shape, b_shape, dim, marks).  These are the concrete shapes
