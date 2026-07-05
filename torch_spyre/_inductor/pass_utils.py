@@ -30,6 +30,7 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
 )
+from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
@@ -1043,6 +1044,80 @@ def replace_computed_buffer_body(
 
     op_idx = operations.index(op)
     operations[op_idx] = new_buf
+    return new_buf
+
+
+class NameSwapHandler(WrapperHandler):
+    """Patch an inner_fn's ``load`` calls to read renamed buffers.
+
+    Used after inserting a producer upstream (e.g. a restickify or an identity
+    clone) that supersedes an existing input: the consumer's inner_fn still
+    names the old buffer, so wrap it to remap each ``load(old_name, ...)`` to
+    ``load(new_name, ...)``.
+
+    This is the canonical WrapperHandler wrapping pattern for compiler passes:
+    wrap, never rebuild index expressions from scratch (they go stale — see
+    CLAUDE.md "Compiler Pass Conventions" and issue #2797).
+    """
+
+    def __init__(self, inner, name_map: dict[str, str]):
+        super().__init__(inner)
+        self._name_map = name_map
+
+    def load(self, name, index):
+        return super().load(self._name_map.get(name, name), index)
+
+
+def redirect_computed_buffer_reads(
+    op: ComputedBuffer,
+    name_map: dict[str, str],
+    operations: list[Operation],
+) -> ComputedBuffer:
+    """Redirect ``op``'s reads through ``name_map`` and reconstruct the buffer.
+
+    Wraps ``op.data.inner_fn`` with ``NameSwapHandler`` so every ``load`` of a
+    remapped buffer resolves to its replacement, then reconstructs the frozen
+    ``ComputedBuffer`` so the instance-keyed ``get_default_sizes_body`` cache is
+    cleanly invalidated (the reconstruct is the reason both this helper and
+    ``replace_computed_buffer_body`` rebuild rather than mutate in place).
+
+    Carries every metadata field downstream passes depend on, including
+    ``_size1_stick_alloc_dim`` — the scheduler's size-1 stick-allocation grow
+    tag, which would otherwise be dropped by the reconstruct and leave the
+    descriptor writing a full stick into a one-plane allocation.
+
+    Returns the replacement ComputedBuffer.
+    """
+    orig_inner = op.data.inner_fn
+
+    def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
+        with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
+            return _orig_inner(*args)
+
+    object.__setattr__(op.data, "inner_fn", new_inner_fn)
+
+    new_buf = ComputedBuffer(
+        name=op.get_name(),
+        layout=op.layout,
+        data=op.data,
+        _split_size=op._split_size,
+        _original_inner_fn=op._original_inner_fn,
+        _original_ranges=op._original_ranges,
+        _original_reduction_ranges=op._original_reduction_ranges,
+    )
+    new_buf.operation_name = op.operation_name
+    new_buf.origins = op.origins
+    new_buf.origin_node = op.origin_node
+    if hasattr(op, "_size1_stick_alloc_dim"):
+        new_buf._size1_stick_alloc_dim = op._size1_stick_alloc_dim
+    copy_op_metadata(op, new_buf)
+
+    op_idx = operations.index(op)
+    operations[op_idx] = new_buf
+    V.graph.name_to_buffer[new_buf.get_name()] = new_buf
+
+    # Clear AFTER patching inner_fn so the recompute picks up the wrapped body.
+    ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
     return new_buf
 
 

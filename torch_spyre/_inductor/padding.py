@@ -44,7 +44,7 @@ M=1 (decode phase) correctly.
 """
 
 import torch
-from sympy import Expr, Integer
+from sympy import Expr
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
@@ -67,6 +67,7 @@ from .pass_utils import (
     host_coordinates,
     identify_matmul_inputs,
     lower_pad_sequence,
+    redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates
@@ -785,53 +786,102 @@ def _pad_restickify_input_via_producer(
     return True
 
 
-def _restickify_loader_perm(
-    op: ComputedBuffer, in_dep, in_layout: FixedTiledLayout
-) -> list[int | None]:
-    """Map each input host dim to the output iteration position that drives it.
+def lower_identity_clone(
+    arg_fx_node: torch.fx.Node,
+    host_size: list[int],
+    device: torch.device,
+    dtype: torch.dtype,
+    orig_stl: SpyreTensorLayout,
+    insert_before: torch.fx.Node,
+) -> tuple[ComputedBuffer, list[Operation]]:
+    """Lower an identity ``aten.clone`` of ``arg_fx_node`` (peer to
+    ``lower_pad_sequence``).
 
-    The rewritten restickify body iterates ``op.data.ranges``, so its inner_fn
-    ``index`` list is positional over the *output* host dims; output dim k
-    carries the iter sym in ``out_host_coords[k]``.  This returns a permutation
-    ``perm`` where input host dim i is loaded at ``index[perm[i]]``, or at
-    constant 0 when ``perm[i]`` is None (a degenerate size-1 input dim carries no
-    sym).  Indexing by the output positions -- rather than the compressed
-    input-sym order -- is what makes size-1 host dims (e.g. the leading-1 / seq=1
-    dims of a mid-stick torch.cat) work without shifting the non-degenerate dims
-    (see #1094).
+    Unlike ``lower_pad_sequence`` this allocates a buffer at the ORIGINAL
+    unpadded ``host_size`` and emits a single copy op -- no fill constant, no
+    fill-region mutation.  The clone's host geometry is identical to the input,
+    so its ``SpyreTensorLayout`` mirrors ``orig_stl`` verbatim; the caller bumps
+    ``device_size`` on the stick-carrying dim afterwards (keeping this helper
+    generic).
 
-    Raises Unsupported when any input host dim is sliced (iter range < dim size):
-    a genuine restickify whose moved stick dim or any other dim is sliced cannot
-    be padded, so fail loudly instead of over-reading.  A plain pointwise
-    stick-dim slice never gets here (the candidate matcher declines it: same
-    in-/new-stick dim).
+    ``insert_restickify_padding`` runs after ``propagate_spyre_tensor_layouts``,
+    so a ``run_node``-lowered op keeps a ``FlexibleLayout`` unless a
+    ``FixedTiledLayout`` is assigned immediately -- done here.
+
+    Returns ``(clone_buf, new_ops)`` where ``clone_buf`` is the single new
+    ComputedBuffer and ``new_ops`` is the (length-1) list of new IR operations.
+    """
+    graph_lowering = V.graph
+    fx_graph = graph_lowering.graph
+
+    ops_before = len(graph_lowering.operations)
+
+    with fx_graph.inserting_before(insert_before):
+        clone_fx = fx_graph.create_node(
+            "call_function", torch.ops.aten.clone.default, args=(arg_fx_node,)
+        )
+        clone_fx.meta["val"] = torch.empty(host_size, dtype=dtype, device=device)
+
+    clone_tb = graph_lowering.run_node(clone_fx)
+    graph_lowering.env[clone_fx] = clone_tb
+
+    # aten.clone lowers to an identity Pointwise; force realization so it becomes
+    # a named ComputedBuffer (mirrors lower_restickify at lowering.py) rather than
+    # inlining into the consumer.
+    clone_tb.data.realize()
+    new_ops = graph_lowering.operations[ops_before:]
+    assert len(new_ops) == 1 and isinstance(new_ops[0], ComputedBuffer), (
+        f"lower_identity_clone: expected exactly one ComputedBuffer, got "
+        f"{[type(o).__name__ for o in new_ops]}"
+    )
+    clone_buf = new_ops[0]
+
+    host_layout = clone_buf.layout
+    clone_stl = SpyreTensorLayout(
+        list(orig_stl.device_size),
+        list(orig_stl.stride_map),
+        orig_stl.device_dtype,
+        orig_stl.element_arrangement,
+    )
+    clone_buf.layout = FixedTiledLayout(
+        host_layout.device,
+        host_layout.dtype,
+        host_layout.size,
+        host_layout.stride,
+        clone_stl,
+    )
+
+    # LX planning reads origin_node directly on the ComputedBuffer.
+    object.__setattr__(clone_buf, "origin_node", clone_fx)
+    assert clone_buf.origins, "lower_identity_clone: clone buffer has no origins"
+
+    return clone_buf, new_ops
+
+
+def _assert_input_not_sliced(op: ComputedBuffer, in_dep, in_layout) -> None:
+    """Raise ``Unsupported`` when any input host dim is sliced (iter range < dim
+    size).
+
+    The unified copy path redirects the restickify to read an identity clone of
+    the input verbatim -- it does not re-index -- so a sliced input would
+    silently over-read the untouched dim.  A genuine restickify whose moved
+    stick dim or any other dim is sliced cannot be padded this way, so fail
+    loudly instead.  A plain pointwise stick-dim slice never reaches here (the
+    candidate matcher declines it: same in-/new-stick dim).
     """
     in_host_coords = host_coordinates(in_layout, in_dep, None)
-    write_dep = _named_write_dep(op)
-    out_host_coords = host_coordinates(op.get_layout(), write_dep, None)
-    sym_to_out_pos = {
-        sym: k
-        for k, c in enumerate(out_host_coords)
-        if (sym := _single_free_sym(c)) is not None
-    }
-    perm: list[int | None] = []
     for i, coord in enumerate(in_host_coords):
         sym = _single_free_sym(coord)
-        if sym is None:
-            # Degenerate (size-1) input host dim: load at constant 0.
-            perm.append(None)
+        if sym is None:  # degenerate size-1 host dim, nothing to slice
             continue
         iter_range = concretize_expr(in_dep.ranges[sym])
         dim_size = concretize_expr(in_layout.size[i])
-        # TODO: support sliced inputs (e.g. ``x[:, :, 1:66, :].transpose(-2, -1)``).
         if iter_range != dim_size:
             raise Unsupported(
                 f"insert_restickify_padding: sliced input on host dim "
                 f"{i} of {op.get_name()} (iter range {iter_range} != "
                 f"dim size {dim_size}) is not supported"
             )
-        perm.append(sym_to_out_pos[sym])
-    return perm
 
 
 def _pad_restickify_input_via_copy(
@@ -842,56 +892,63 @@ def _pad_restickify_input_via_copy(
     in_layout,
     new_stick_dim: int,
 ) -> None:
-    """Fallback read-side fix: insert a stick-aligned, zero-filled copy of the
-    input ahead of the restickify and rewrite the restickify body to read it.
+    """Fallback read-side fix: insert an identity clone of the input ahead of the
+    restickify and redirect the restickify to read it.
 
-    Used when the input cannot be padded in place by
-    ``_pad_restickify_input_via_producer`` (a graph input, or a producer with no
-    stick-carrying device dim to grow).  The copy costs a separate buffer + fill
-    + copy + HBM round-trip, which the producer path avoids.
+    Used when the input cannot be grown in place by
+    ``_pad_restickify_input_via_producer`` (a graph input, whose allocation is
+    not ours to widen).  The clone mirrors the producer path: it has the input's
+    exact host geometry with ``device_size`` bumped to the stick boundary on the
+    new-stick dim, so the restickify's over-read lands inside the clone's own
+    allocation.  The bumped tail is written by neither a fill nor the clone's
+    store (the identity copy iterates only the real rows), and is only ever read
+    into the output's backGap-discarded stick band -- so its contents are
+    don't-care, exactly as in the producer path.
+
+    Only one copy op is emitted (no zero-fill), and the redirect reuses the
+    canonical ``NameSwapHandler`` rather than rewriting the restickify body.
     """
     device = in_buf.get_device()
     if device is None:
         return
 
+    # Redirect reads the input verbatim; a sliced input would over-read.
+    _assert_input_not_sliced(op, in_dep, in_layout)
+
     dtype = in_layout.dtype
-    padded_size = [concretize_expr(s) for s in in_layout.size]
-    n = padded_size[new_stick_dim]
-    padded_size[new_stick_dim] = n + compute_padding(n, dtype)
+    host_size = [concretize_expr(s) for s in in_layout.size]
 
     in_fx = _find_arg_fx_node(in_dep.name)
     restickify_fx = next(iter(op.origins))
-    padded_buf, new_ops = lower_pad_sequence(
+    clone_buf, new_ops = lower_identity_clone(
         in_fx,
-        padded_size=padded_size,
+        host_size=host_size,
         device=device,
         dtype=dtype,
-        dim=new_stick_dim,
-        insert_before=restickify_fx,
         orig_stl=in_layout.device_layout,
-        fill_value=0.0,
+        insert_before=restickify_fx,
     )
 
-    # Move pad ops to just before the restickify (lower_pad_sequence appends).
+    # Bump the clone's device_size on the dim carrying the new stick dim to the
+    # stick boundary (device_size only; host size/stride/stride_map unchanged).
+    # The clone is a ComputedBuffer we own, so its stick-carrying device dim is
+    # located the same way as a producer's.
+    device_dim = _restickify_input_device_dim(clone_buf, new_stick_dim)
+    assert device_dim is not None, (
+        f"_pad_restickify_input_via_copy: no device dim carrying new stick dim "
+        f"{new_stick_dim} for clone {clone_buf.get_name()}"
+    )
+    n = host_size[new_stick_dim]
+    new_dim_size = n + compute_padding(n, dtype)
+    clone_buf.layout = _pad_layout_device_dim(
+        clone_buf.get_layout(), device_dim, new_dim_size, grow_host_dim=None
+    )
+
+    # Move the clone op to just before the restickify (run_node appends).
     _move_ops_before(operations, new_ops, op)
 
-    # Replace the restickify body with a Pointwise that reads padded_buf through
-    # a permuted index (see _restickify_loader_perm).  op.data.ranges stays at
-    # the logical output size; the stick-boundary widening happens later in
-    # superdsc's _extend_restickify_to_padded (Inductor's _simplify_loops would
-    # undo it if done here).
-    loader_perm = _restickify_loader_perm(op, in_dep, in_layout)
-    old_pw = op.data
-    padded_loader = padded_buf.make_loader()
-    new_pw = Pointwise(
-        device=old_pw.device,
-        dtype=old_pw.dtype,
-        inner_fn=lambda index, _loader=padded_loader, _perm=tuple(loader_perm): _loader(
-            [Integer(0) if p is None else index[p] for p in _perm]
-        ),
-        ranges=old_pw.ranges,
-    )
-    replace_computed_buffer_body(op, new_pw, operations)
+    # Redirect the restickify to read the clone (wrap-not-reconstruct).
+    redirect_computed_buffer_reads(op, {in_dep.name: clone_buf.get_name()}, operations)
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
@@ -909,7 +966,8 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
     - Read side: when the new stick dim's size is not a stick multiple the read
       runs past the true dim size.  ``_pad_restickify_input_via_producer``
       grows the producer in place when eligible; otherwise
-      ``_pad_restickify_input_via_copy`` inserts a zero-filled padded copy.
+      ``_pad_restickify_input_via_copy`` inserts a device-size-bumped identity
+      clone and redirects the restickify to read it.
 
     The two are orthogonal — e.g. a 128x67 transpose has an aligned input
     stick dim (128) but an unaligned non-stick dim (67), so only the write-side
@@ -931,7 +989,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
         # Grow the producer in place when the input is one we own (a
         # ComputedBuffer); a graph input's allocation is not ours to widen, so it
-        # takes the zero-filled copy path.
+        # takes the identity-clone copy path.
         if isinstance(in_buf, ComputedBuffer) and _pad_restickify_input_via_producer(
             in_buf, new_stick_dim
         ):
