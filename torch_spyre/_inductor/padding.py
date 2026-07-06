@@ -351,16 +351,22 @@ def _host_dim_carrying_sym(host_coords: list[Expr], sym) -> int | None:
     return None
 
 
-def _unique_size1_dim(sizes: list) -> int | None:
-    """Return the index of the sole size-1 entry in ``sizes``, or None.
+def _host_dim_for_stick_sym(host_coords: list[Expr], sym, sizes: list) -> int | None:
+    """Return the input host dim carrying stick symbol ``sym``, or None.
 
-    A size-1 dim carries no free variable, so symbol-based matching cannot
-    locate it.  When exactly one dim is size-1 the match is still unambiguous
-    (mirroring ``coarse_tile._resize_stl_device_dims``' singleton branch); more
-    than one size-1 dim is ambiguous without a further tiebreak, so decline.
+    Shared tail of the two stick-projection helpers: once a within-stick symbol
+    has been isolated (from either the source layout's device coord or the op's
+    own write dep), the input host dim carrying it is the same lookup.  A
+    symbol-free stick (``sym is None``) means a size-1 host dim occupies the
+    stick, so fall back to matching the sole size-1 dim by size.
     """
-    ones = [i for i, s in enumerate(sizes) if concretize_expr(s) == 1]
-    return ones[0] if len(ones) == 1 else None
+    if sym is None:
+        # Exactly one size-1 dim is an unambiguous match (mirroring
+        # ``coarse_tile._resize_stl_device_dims``' singleton branch); more than
+        # one is ambiguous without a further tiebreak, so decline.
+        ones = [i for i, s in enumerate(sizes) if concretize_expr(s) == 1]
+        return ones[0] if len(ones) == 1 else None
+    return _host_dim_carrying_sym(host_coords, sym)
 
 
 def _project_stick_host_dim(
@@ -395,9 +401,7 @@ def _project_stick_host_dim(
     if not host_coords or not device_coords:
         return None
     sym = _single_free_sym(device_coords[-1])
-    if sym is None:
-        return _unique_size1_dim(list(input_layout.size))
-    return _host_dim_carrying_sym(host_coords, sym)
+    return _host_dim_for_stick_sym(host_coords, sym, list(input_layout.size))
 
 
 def _output_stick_symbol(op, out_layout):
@@ -431,9 +435,7 @@ def _output_stick_input_host_dim(op, out_layout, in_layout, in_dep) -> int | Non
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     if not in_host_coords:
         return None
-    if out_stick_sym is None:  # a size-1 host dim moved into stick position
-        return _unique_size1_dim(list(in_layout.size))
-    return _host_dim_carrying_sym(in_host_coords, out_stick_sym)
+    return _host_dim_for_stick_sym(in_host_coords, out_stick_sym, list(in_layout.size))
 
 
 def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
