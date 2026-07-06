@@ -358,14 +358,21 @@ def _host_dim_for_stick_sym(host_coords: list[Expr], sym, sizes: list) -> int | 
     has been isolated (from either the source layout's device coord or the op's
     own write dep), the input host dim carrying it is the same lookup.  A
     symbol-free stick (``sym is None``) means a size-1 host dim occupies the
-    stick, so fall back to matching the sole size-1 dim by size.
+    stick, so fall back to a size-1 host dim (see the branch comment for why any
+    one is safe when several are size-1).
     """
     if sym is None:
-        # Exactly one size-1 dim is an unambiguous match (mirroring
-        # ``coarse_tile._resize_stl_device_dims``' singleton branch); more than
-        # one is ambiguous without a further tiebreak, so decline.
+        # A symbol-free stick means a size-1 host dim moved into stick position.
+        # With >=2 size-1 host dims the choice is ambiguous by symbol, but it is
+        # a zero-extent relabel: size-1 dims must not contribute to the device
+        # layout (tensors_and_layouts.md canonical-form rule), so every size-1
+        # dim maps to host_size 1 and the physical dim to pad is re-derived from
+        # device-side markers, not from this host index (see
+        # _restickify_input_device_dim / _restickify_output_device_dim).  So any
+        # size-1 dim yields the same device layout -- pick the first.  A genuine
+        # device-level ambiguity (>=2 size-1 device dims) still declines there.
         ones = [i for i, s in enumerate(sizes) if concretize_expr(s) == 1]
-        return ones[0] if len(ones) == 1 else None
+        return ones[0] if ones else None
     return _host_dim_carrying_sym(host_coords, sym)
 
 
@@ -513,11 +520,11 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
         # skip only if codegen will NOT restickify (identical in/out stick
         # symbols -> IDENTITY, no over-read).  If codegen WILL restickify, the
         # buffer reaches codegen unpadded and over-reads uninitialized stick
-        # lanes -- so fail loudly rather than miscompile.  Two ways to reach
-        # here with a real restickify: the output stick carries an iteration
-        # symbol no input dim matches, or it moved a size-1 host dim into stick
-        # position but >=2 size-1 dims left the placement ambiguous (we cannot
-        # tell which dim to pad; guessing would relabel/pad the wrong dim).
+        # lanes -- so fail loudly rather than miscompile.  Reaching here with a
+        # real restickify means the output stick carries an iteration symbol that
+        # no input host dim carries (e.g. a fused multi-symbol coord); a size-1
+        # output stick always resolves to a host dim (_host_dim_for_stick_sym
+        # picks the first size-1 dim), so it does not land here.
         if _codegen_will_restickify(op, out_layout, in_layout, in_dep):
             raise Unsupported(
                 "restickify padding: cannot locate input host dim for output stick"

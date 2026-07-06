@@ -171,6 +171,41 @@ def test_size1_input_stick_transpose_0_last_clone_graph_input(shape):
     _strict(lambda x: x.transpose(0, -1).clone(), x)
 
 
+# >=2 size-1 host dims with a size-1 dim in the input stick.  The stick-dim
+# projection (_host_dim_for_stick_sym) has no free symbol to match, so it takes
+# the size-1 fallback -- and with several size-1 dims present that fallback picks
+# the FIRST one rather than declining.  This is safe because size-1 dims do not
+# contribute to the Spyre device layout (tensors_and_layouts.md canonical form):
+# every size-1 host dim maps to host_size 1 and the physical dim to grow is
+# re-derived from device-side stride_map markers, not this host index, so any
+# size-1 dim yields the same layout.  These shapes assert that "pick the first"
+# is byte-correct; the interleaved variants (size-1 dims not adjacent, a real dim
+# between them) confirm the choice is independent of size-1 dim placement.  A
+# genuine device-level ambiguity (>=2 size-1 *device* dims) still declines in
+# _restickify_input_device_dim, so this fallback never masks a real hazard.
+#
+# Each entry is (shape, transpose_dims): the transpose must swap the size-1
+# input-stick dim with a real dim, and the two dims not touched must both be
+# size-1 (so >=2 size-1 dims and pick-first is exercised).
+SIZE1_MULTI_STICK = [
+    ((1, 1, 64, 1), (0, -1)),  # three size-1 dims (0, 1, 3)
+    ((1, 1, 67, 1), (0, -1)),  # three size-1 dims, unaligned stick
+    ((1, 5, 67, 1), (0, -1)),  # interleaved: size-1 at 0 and 3, real 5/67 between
+    ((7, 1, 64, 1), (1, 3)),  # interleaved: size-1 at 1 and 3, real 7/64 between
+    ((5, 1, 67, 1), (1, 3)),  # interleaved: size-1 at 1 and 3, real 5/67 between
+]
+
+
+@pytest.mark.parametrize(
+    "shape,dims",
+    SIZE1_MULTI_STICK,
+    ids=[f"{'x'.join(map(str, s))}_t{d}" for s, d in SIZE1_MULTI_STICK],
+)
+def test_size1_multi_input_stick_transpose_clone(shape, dims):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(*dims).clone(), x)
+
+
 # torch.cat shapes drawn from the Q2 target-model failures catalogued in
 # issue #1094 (torch.cat for Ministral / Mistral-Small / gpt-oss-20b / granite).
 # Each entry is (a_shape, b_shape, dim, marks).  These are the concrete shapes
