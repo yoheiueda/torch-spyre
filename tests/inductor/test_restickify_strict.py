@@ -270,6 +270,38 @@ def test_size1_extra_dim_transpose_clone(shape, dims):
     _strict(lambda x: x.transpose(*dims).clone(), x)
 
 
+# A size-1 input stick whose NEW stick dim spans >=2 stick blocks (host size
+# > 64).  The elided size-1 old stick is restored by superdsc as a fresh 64-wide
+# symbol; when the new stick is multi-block it splits into a tile-count device
+# dim (floor(new_stick / 64)) that occupies the new stick's input rank, so the
+# restored old stick must land one slot EARLIER (immediately outer to the block
+# dim).  Inserting it at the block dim's slot gave the grown size-1 alloc a
+# stride that collided with the block/batch host mapping and mis-placed the 2nd+
+# stick block, so even a stick-ALIGNED multi-block new stick ([1,128,1]) came
+# back wrong (max_diff=127).  Single-block new sticks are unaffected (their
+# floor(.) slot is a degenerate extent-1 dim).  Distinct-ramp + torch.equal.
+SIZE1_MULTI_BLOCK = [
+    ((1, 128, 1), (1, 2)),  # 2 aligned blocks, no batch (was md=127)
+    ((1, 192, 1), (1, 2)),  # 3 aligned blocks, no batch (was md=191)
+    ((1, 67, 1), (1, 2)),  # 2 unaligned blocks, no batch (was md=66)
+    ((4, 128, 1), (1, 2)),  # 2 aligned blocks + batch 4 (was md=511)
+    ((2, 128, 1), (1, 2)),  # 2 aligned blocks + batch 2
+    ((4, 67, 1), (1, 2)),  # 2 unaligned blocks + batch (was md=267)
+    ((4, 192, 1), (1, 2)),  # 3 blocks + batch
+    ((2, 3, 67, 1), (2, 3)),  # 2 unaligned blocks + leading batch nest (md=401)
+]
+
+
+@pytest.mark.parametrize(
+    "shape,dims",
+    SIZE1_MULTI_BLOCK,
+    ids=[f"{'x'.join(map(str, s))}_t{d}" for s, d in SIZE1_MULTI_BLOCK],
+)
+def test_size1_multi_block_transpose_clone(shape, dims):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(*dims).clone(), x)
+
+
 # torch.cat shapes drawn from the Q2 target-model failures catalogued in
 # issue #1094 (torch.cat for Ministral / Mistral-Small / gpt-oss-20b / granite).
 # Each entry is (a_shape, b_shape, dim, marks).  These are the concrete shapes
