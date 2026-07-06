@@ -492,6 +492,39 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
         return None
 
     host_size = [concretize_expr(s) for s in in_layout.size]
+
+    # No over-read when the output stick aliases the input's OWN stick.  Projecting
+    # the output stick coord through the input read dep (the pre-3ddc683 method)
+    # lands back on ``in_stick_dim``: the restickified read stays inside the input's
+    # already-initialized stick, so no padding is needed -- and padding it would
+    # relabel a tracked named dim (see test_permute_matmul_distinct_lqlk, a permuted
+    # matmul input whose full D=64 stick re-tiles to a sub-64 Lk output stick).
+    # This is distinct from the 3ddc683 sub-stick->sub-stick hazard, where the
+    # projection composes two sub-64 stride patterns into a multi-symbol coord and
+    # returns None: that case must stay a candidate, so gate on "not None".  A
+    # genuine unaligned transpose projects onto a *different* host dim
+    # (projection != in_stick_dim), so it is kept and padded.
+    projected = _project_stick_host_dim(in_layout, out_layout, in_dep)
+    if projected is not None and projected == in_stick_dim:
+        return None
+
+    # The read-side padding paths (producer-grow, identity-clone copy) read the
+    # input verbatim, so they can only own a restickify whose read is a pure
+    # permutation.  A host dim iterated with a range wider than its size is a
+    # broadcast (e.g. the qkv rope size-2 dim read 128x): there is no unique
+    # input dim to grow and no verbatim read to redirect.  Decline quietly and
+    # leave it to codegen, as before the output-write-dep derivation promoted it
+    # to a candidate.  A genuine transpose reads every dim over its full size, so
+    # this never drops a real hazard; a narrowing slice (iter range < dim size)
+    # still falls through to the copy path's loud guard.
+    in_host_coords = host_coordinates(in_layout, in_dep, None)
+    for i, coord in enumerate(in_host_coords):
+        sym = _single_free_sym(coord)
+        if sym is None:  # degenerate size-1 host dim, nothing to iterate
+            continue
+        if concretize_expr(in_dep.ranges[sym]) > concretize_expr(in_layout.size[i]):
+            return None
+
     return in_dep, in_buf, in_layout, host_size, new_stick_dim, in_stick_dim
 
 
