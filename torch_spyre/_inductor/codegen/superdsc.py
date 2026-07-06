@@ -759,6 +759,20 @@ def _restore_elided_restickify_stick(op_spec: OpSpec) -> OpSpec:
     # dim labels resolve to [mb, ...] (matching the N>=2 descriptor).
     new_iteration_space = {sym: (stick_size, 1), **op_spec.iteration_space}
 
+    # The output's within-stick coordinate carries the NEW stick symbol (the
+    # transpose target).  The restored old stick must land in the output's
+    # middle coords at the same rank the new stick occupies among the input's
+    # coords -- see the OUTPUT rewrite below.
+    new_stick_syms = out_arg.device_coordinates[-1].free_symbols
+    new_stick_pos = next(
+        (
+            i
+            for i, c in enumerate(in_arg.device_coordinates)
+            if c.free_symbols & new_stick_syms
+        ),
+        None,
+    )
+
     # INPUT: rebind the outer-split and within-stick coordinate slots (currently
     # the constant 0) to carry the restored symbol as this operand's stick dim.
     in_coords = list(in_arg.device_coordinates)
@@ -779,9 +793,15 @@ def _restore_elided_restickify_stick(op_spec: OpSpec) -> OpSpec:
     new_in = dataclasses.replace(in_arg, device_coordinates=in_coords)
 
     # OUTPUT: the elided dim collapsed to a (size-1, constant-0) slot; drop it
-    # and insert the restored symbol as a padded-64 pass-through non-stick dim
-    # immediately before the within-stick coordinate, matching the N>=2 output
-    # layout ([..., x, mb, within-stick] rather than [..., 0, x, within-stick]).
+    # and insert the restored symbol as a padded-64 pass-through non-stick dim.
+    #
+    # Position matters when a batch/spatial dim survives between the old and new
+    # sticks.  In the N>=2 descriptor the old stick lands in the middle coords at
+    # the rank the NEW stick occupies among the INPUT's coords (transpose swaps
+    # the two sticks' slots; every surviving dim keeps its place).  Reproduce
+    # that rank instead of always sitting adjacent to the within-stick coord --
+    # the latter mis-strides the surviving batch dim and zeroes its non-first
+    # planes (see test_size1_input_stick_surviving_batch_transpose_clone).
     out_coords = list(out_arg.device_coordinates)
     out_size = list(out_arg.device_size)
     elided_out = [
@@ -797,7 +817,7 @@ def _restore_elided_restickify_stick(op_spec: OpSpec) -> OpSpec:
     out_idx = elided_out[0]
     del out_coords[out_idx]
     del out_size[out_idx]
-    insert_at = len(out_coords) - 1
+    insert_at = new_stick_pos if new_stick_pos is not None else len(out_coords) - 1
     out_coords.insert(insert_at, sym)
     out_size.insert(insert_at, stick_size)
     new_out = dataclasses.replace(

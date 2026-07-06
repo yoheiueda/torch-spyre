@@ -206,6 +206,40 @@ def test_size1_multi_input_stick_transpose_clone(shape, dims):
     _strict(lambda x: x.transpose(*dims).clone(), x)
 
 
+# A size-1 input-stick transpose where a real batch/leading dim (extent > 1)
+# survives OUTSIDE both the old (size-1) and new sticks -- e.g. (4, 64, 1)
+# transpose(1, 2), whose batch dim 0 stays leading while dims 1 and 2 swap.
+# _restore_elided_restickify_stick used to reinsert the restored old stick
+# immediately before the within-stick coord, but in the N>=2 descriptor the old
+# stick lands at the rank the NEW stick occupies among the INPUT's coords -- the
+# transpose swaps the two sticks' slots and every surviving dim keeps its place.
+# When a batch dim sits between the two sticks those ranks differ, so the fixed
+# "adjacent to within-stick" position mis-strided the batch dim and its non-first
+# planes came back zeroed (all but batch plane 0 was garbage).  Deriving the
+# insert position from the new stick's rank in the input coords fixes it.
+#
+# The new (destination) stick must be a full 64 here: an unaligned destination
+# (e.g. 67) additionally needs output-middle stick padding, a separate path not
+# covered by this restore-position fix.  Each entry is (shape, transpose_dims).
+SIZE1_SURVIVING_BATCH = [
+    ((4, 64, 1), (1, 2)),  # batch dim 0 = 4 survives; new stick = dim 1
+    ((2, 64, 1), (1, 2)),  # smaller batch
+    ((3, 5, 64, 1), (2, 3)),  # batch 3 + spatial 5 both survive; new stick dim 2
+    ((2, 2, 64, 1), (2, 3)),  # two leading dims survive
+    ((2, 3, 4, 64, 1), (3, 4)),  # deep batch nest
+]
+
+
+@pytest.mark.parametrize(
+    "shape,dims",
+    SIZE1_SURVIVING_BATCH,
+    ids=[f"{'x'.join(map(str, s))}_t{d}" for s, d in SIZE1_SURVIVING_BATCH],
+)
+def test_size1_input_stick_surviving_batch_transpose_clone(shape, dims):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(*dims).clone(), x)
+
+
 # torch.cat shapes drawn from the Q2 target-model failures catalogued in
 # issue #1094 (torch.cat for Ministral / Mistral-Small / gpt-oss-20b / granite).
 # Each entry is (a_shape, b_shape, dim, marks).  These are the concrete shapes
