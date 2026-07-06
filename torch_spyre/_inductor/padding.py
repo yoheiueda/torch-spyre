@@ -423,6 +423,36 @@ def _output_stick_symbol(op, out_layout):
     return _single_free_sym(out_dev_coords[-1])
 
 
+def _stick_free_symbols(layout: FixedTiledLayout, dep) -> frozenset:
+    """Return the free symbols of ``layout``'s within-stick device coord under
+    ``dep``, or an empty set if the layout has no device coords.
+    """
+    stl = layout.device_layout
+    device_index = concretize_index(dep.index, set(dep.ranges.keys()))
+    device_coords = compute_coordinates(
+        stl.device_size, stl.stride_map, dep.ranges, device_index
+    )
+    if not device_coords:
+        return frozenset()
+    return frozenset(device_coords[-1].free_symbols)
+
+
+def _codegen_will_restickify(op, out_layout, in_layout, in_dep) -> bool:
+    """Return whether codegen will emit a RESTICKIFY (vs IDENTITY) for ``op``.
+
+    Mirrors the store-side test in spyre_kernel.py exactly: codegen restickifies
+    iff the input and output within-stick coords carry different free symbols.
+    The pass MUST agree with this predicate -- a restickify codegen emits on an
+    unpadded, unaligned buffer over-reads uninitialized stick lanes.  So the pass
+    only returns None ("carry on unpadded") when this is False; when it is True
+    the op is either padded or refused loudly, never silently skipped.
+    """
+    in_syms = _stick_free_symbols(in_layout, in_dep)
+    out_write_dep = _named_write_dep(op)
+    out_syms = _stick_free_symbols(out_layout, out_write_dep)
+    return in_syms != out_syms
+
+
 def _output_stick_input_host_dim(op, out_layout, in_layout, in_dep) -> int | None:
     """Return the input host dim carrying the OUTPUT stick's iteration symbol.
 
@@ -479,13 +509,16 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     if in_stick_dim is None:
         return None
     if new_stick_dim is None:
-        # The output stick carries a real iteration symbol (so codegen will emit
-        # a restickify, spyre_kernel.py) but no input host dim carries it: the
-        # buffer would reach codegen unpadded and over-read uninitialized stick
-        # lanes.  Fail loudly rather than miscompile.  A symbol-free output stick
-        # (a size-1 dim that found no unique match) is not a restickify we own,
-        # so skip it quietly.
-        if _output_stick_symbol(op, out_layout) is not None:
+        # No input host dim was located for the output stick.  This is safe to
+        # skip only if codegen will NOT restickify (identical in/out stick
+        # symbols -> IDENTITY, no over-read).  If codegen WILL restickify, the
+        # buffer reaches codegen unpadded and over-reads uninitialized stick
+        # lanes -- so fail loudly rather than miscompile.  Two ways to reach
+        # here with a real restickify: the output stick carries an iteration
+        # symbol no input dim matches, or it moved a size-1 host dim into stick
+        # position but >=2 size-1 dims left the placement ambiguous (we cannot
+        # tell which dim to pad; guessing would relabel/pad the wrong dim).
+        if _codegen_will_restickify(op, out_layout, in_layout, in_dep):
             raise Unsupported(
                 "restickify padding: cannot locate input host dim for output stick"
             )
