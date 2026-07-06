@@ -818,6 +818,26 @@ def _restore_elided_restickify_stick(op_spec: OpSpec) -> OpSpec:
     del out_coords[out_idx]
     del out_size[out_idx]
     insert_at = new_stick_pos if new_stick_pos is not None else len(out_coords) - 1
+    # A multi-block new stick (host size > 64) splits into a tile-count device
+    # dim carrying floor(new_stick / 64) plus the within-stick Mod term.  That
+    # tile-count dim already occupies new_stick_pos (the new stick's input rank),
+    # so the restored old stick belongs one slot EARLIER -- immediately outer to
+    # the block dim, reproducing the N>=2 sibling's [.., old_stick, block, ..]
+    # device order.  Inserting at new_stick_pos itself would land the old stick
+    # AFTER the block dim, giving the grown size-1 alloc a stride that collides
+    # with the block/batch host mapping in get_dim_map and mis-places the 2nd+
+    # stick block (see test_size1_multi_block_transpose_clone).  A single-block
+    # new stick has no real tile-count dim (its floor(.) slot is degenerate,
+    # extent 1), so new_stick_pos is already correct and the surviving-batch rule
+    # above stands unchanged.
+    multi_block = any(
+        out_size[i] >= 2
+        and out_coords[i].has(floor)
+        and (out_coords[i].free_symbols & new_stick_syms)
+        for i in range(len(out_coords) - 1)  # exclude within-stick
+    )
+    if multi_block and insert_at > 0:
+        insert_at -= 1
     out_coords.insert(insert_at, sym)
     out_size.insert(insert_at, stick_size)
     new_out = dataclasses.replace(
