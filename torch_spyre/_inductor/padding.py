@@ -679,6 +679,24 @@ def _restickify_output_size1_device_dim(
     (``7*c0/64``) that ``normalize_coordinates`` rejects.  The scheduler grows it
     after align instead (see ``_grow_size1_stick_allocations``); this function
     only locates the dim to tag.
+
+    When the input has a SECOND size-1 host dim (a leading/middle extra size-1
+    dim alongside the real innermost stick), the output has two-or-more device
+    dims that are size-1 with ``stride_map == -1``, and the sole ``-1`` marker no
+    longer isolates the collapsed old stick.  Only one of them is the demoted old
+    stick; the other(s) are incidental input size-1 dims that never carried stick
+    data.  They are told apart by geometry: the batch / preserved axes (the
+    "plane" dims the transpose leaves in place) carry an iteration symbol
+    (range > 1), while the old stick and the incidental size-1 dims are
+    symbol-free.  In the device row-major ordering the demoted old stick lands at
+    the slot FARTHEST from the plane axes -- adjacent to the stick block when the
+    batch nest is outer, or at the outermost slot when the batch nest is inner --
+    whereas an incidental size-1 dim sits among the batch axes.  Picking the
+    ``-1`` candidate that maximises its minimum distance to any plane dim
+    therefore recovers the same dim the N>=2 sibling (extra size-1 dim grown to
+    size 2) marks as its sole ``-1``.  This is also the dim
+    ``_grow_size1_stick_allocations`` grows with per-step stride
+    ``prod(host_size)`` -- the outermost-varying non-stick axis.
     """
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     if _single_free_sym(in_host_coords[in_stick_dim]) is not None:
@@ -691,7 +709,26 @@ def _restickify_output_size1_device_dim(
     grow = [d for d in size1 if stride_map[d] == -1]
     if len(grow) == 1:
         return grow[0]
-    return size1[0] if len(size1) == 1 else None
+    if not grow:
+        return size1[0] if len(size1) == 1 else None
+    # Two-or-more collapsed size-1 device dims: the demoted old stick is the one
+    # farthest from the plane (batch/preserved) dims.  Plane dims are the
+    # non-stick device dims whose coordinate carries a free iteration symbol.
+    write_dep = _named_write_dep(op)
+    dev_index = concretize_index(write_dep.index, set(write_dep.ranges.keys()))
+    dev_coords = compute_coordinates(
+        device_size, stride_map, write_dep.ranges, dev_index
+    )
+    plane = [
+        d
+        for d in range(len(device_size) - 1)
+        if _single_free_sym(dev_coords[d]) is not None
+    ]
+    if not plane:
+        # All-ones batch (e.g. [1,1,64,1]): no plane to measure against, and every
+        # candidate is a zero-extent relabel, so pick-first stays byte-correct.
+        return grow[0]
+    return max(grow, key=lambda g: (min(abs(g - p) for p in plane), -g))
 
 
 def _pad_restickify_output(

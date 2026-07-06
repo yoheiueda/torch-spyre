@@ -240,6 +240,36 @@ def test_size1_input_stick_surviving_batch_transpose_clone(shape, dims):
     _strict(lambda x: x.transpose(*dims).clone(), x)
 
 
+# A size-1 input stick PLUS a second (leading or middle) size-1 host dim.  The
+# transpose moves a real dim into the stick and demotes the size-1 stick to a
+# collapsed non-stick device dim; the incidental extra size-1 dim ALSO collapses
+# to a stride_map==-1 singleton, so the sole-``-1`` marker no longer isolates the
+# old stick and _restickify_output_size1_device_dim must disambiguate by distance
+# from the batch/preserved ("plane") dims (leading extra -> innermost grow dim,
+# middle extra -> outermost).  Without that the collapsed old-stick alloc is
+# never grown to a full stick and non-first batch planes come back zeroed
+# (max_diff=255).  Baselines before the fix: the leading and batch-inner shapes
+# below miscompiled; the middle / batch-outer ones already passed (kept as
+# lock-in).  Distinct-ramp + torch.equal catches a mis-placed plane exactly.
+SIZE1_EXTRA = [
+    ((1, 4, 64, 1), (2, 3)),  # leading extra size-1 (dim0); old stick -> dim3
+    ((4, 1, 64, 1), (2, 3)),  # middle extra size-1 (dim1); old stick -> dim0
+    ((1, 4, 1, 64, 1), (3, 4)),  # two extra size-1, batch outer
+    ((4, 1, 1, 64, 1), (3, 4)),  # two extra size-1, batch/size-1 interleaved
+    ((1, 1, 4, 64, 1), (3, 4)),  # two extra size-1, batch inner
+]
+
+
+@pytest.mark.parametrize(
+    "shape,dims",
+    SIZE1_EXTRA,
+    ids=[f"{'x'.join(map(str, s))}_t{d}" for s, d in SIZE1_EXTRA],
+)
+def test_size1_extra_dim_transpose_clone(shape, dims):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(*dims).clone(), x)
+
+
 # torch.cat shapes drawn from the Q2 target-model failures catalogued in
 # issue #1094 (torch.cat for Ministral / Mistral-Small / gpt-oss-20b / granite).
 # Each entry is (a_shape, b_shape, dim, marks).  These are the concrete shapes
