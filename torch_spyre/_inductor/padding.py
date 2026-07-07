@@ -944,21 +944,41 @@ def lower_identity_clone(
     return clone_buf, new_ops
 
 
-def _assert_input_not_sliced(op: ComputedBuffer, in_dep, in_layout) -> None:
-    """Raise ``Unsupported`` when any input host dim is sliced (iter range < dim
-    size).
+def _assert_input_not_sliced(
+    op: ComputedBuffer, in_dep, in_layout, new_stick_dim: int
+) -> None:
+    """Raise ``Unsupported`` for restickify inputs whose slice this copy path
+    cannot carry.
 
-    The unified copy path redirects the restickify to read an identity clone of
-    the input verbatim -- it does not re-index -- so a sliced input would
-    silently over-read the untouched dim.  A genuine restickify whose moved
-    stick dim or any other dim is sliced cannot be padded this way, so fail
-    loudly instead.  A plain pointwise stick-dim slice never reaches here (the
-    candidate matcher declines it: same in-/new-stick dim).
+    The copy path redirects the restickify to read an identity clone of the
+    input verbatim, then grows the clone's device_size on the dim carrying
+    ``new_stick_dim`` to the stick boundary.  Two slice shapes are unpaddable:
+
+    - A slice on the **new-stick dim** starts the read partway into a stick, so
+      the stick-boundary grow reads the wrong lanes -- fail loudly.
+    - A **strided** (step > 1) read of any host dim (coord ``k*var``, k != 1)
+      picks non-contiguous rows, but codegen's offset/gap primitive masks a
+      *contiguous* tail (``backGap = dev_dim_size - it_dim_size``), so a stride
+      would silently read the wrong rows -- fail loudly.
+
+    A **contiguous offset** on a non-stick host dim (coord ``var + c``) is fine:
+    the clone copies the full base buffer (offset region included) and the read
+    dep's index is preserved verbatim, so codegen's general offset/gap primitive
+    (``dev_dim_size > it_dim_size``) emits the correct offset and backGap.
     """
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     for i, coord in enumerate(in_host_coords):
         sym = _single_free_sym(coord)
         if sym is None:  # degenerate size-1 host dim, nothing to slice
+            continue
+        # A step > 1 read (k*var) is not carried by codegen's contiguous-tail
+        # backGap, on any dim.
+        if concretize_expr(coord.coeff(sym)) != 1:
+            raise Unsupported(
+                f"insert_restickify_padding: strided input on host dim "
+                f"{i} of {op.get_name()} (coord {coord}) is not supported"
+            )
+        if i != new_stick_dim:
             continue
         iter_range = concretize_expr(in_dep.ranges[sym])
         dim_size = concretize_expr(in_layout.size[i])
@@ -1003,8 +1023,9 @@ def _pad_restickify_input(
     if device is None:
         return
 
-    # Redirect reads the input verbatim; a sliced input would over-read.
-    _assert_input_not_sliced(op, in_dep, in_layout)
+    # Redirect reads the input verbatim; a slice on the new-stick dim would
+    # over-read.  A non-stick offset/gap is carried through by codegen.
+    _assert_input_not_sliced(op, in_dep, in_layout, new_stick_dim)
 
     dtype = in_layout.dtype
     host_size = [concretize_expr(s) for s in in_layout.size]

@@ -302,6 +302,44 @@ def test_size1_multi_block_transpose_clone(shape, dims):
     _strict(lambda x: x.transpose(*dims).clone(), x)
 
 
+# A contiguous OFFSET on a NON-stick host dim of a restickify input (#1333): the
+# difference between an STL device-dim size and the corresponding iteration
+# range.  A restickify whose new-stick dim is unaligned (67) routes through the
+# input-padding clone path, which used to refuse ANY sliced input host dim.  A
+# contiguous offset (coord ``var + c``) on a non-stick dim is fine -- the clone
+# copies the full base buffer and codegen's general offset/gap primitive
+# (dev_dim_size > it_dim_size) carries the offset and backGap.  Each fn below
+# RAISED before the guard was narrowed; distinct-ramp + torch.equal catches a
+# misplaced plane exactly.
+OFFSET_NONSTICK_INPUT = [
+    # Graph-input leading-dim offset (rows 1..2 of 4), unaligned new stick (67).
+    (lambda x: x[1:3].transpose(1, 2).clone(), (4, 67, 128)),
+    # Offset on a middle (non-leading, non-stick) dim.
+    (lambda x: x[:, 1:3].transpose(2, 3).clone(), (2, 4, 67, 128)),
+]
+
+
+@pytest.mark.parametrize(
+    "fn,shape",
+    OFFSET_NONSTICK_INPUT,
+    ids=["x".join(map(str, s)) for _, s in OFFSET_NONSTICK_INPUT],
+)
+def test_offset_nonstick_input_transpose_clone(fn, shape):
+    x = _arange(*shape)
+    _strict(fn, x)
+
+
+# A STRIDED (step > 1) read of a restickify input is NOT carried by codegen's
+# contiguous-tail backGap -- the clone would read the wrong (non-adjacent) rows.
+# The input-padding guard must fail loudly rather than miscompile.  ``x[::2]``
+# on the leading dim yields coord ``2*d0``; the unaligned new stick (67) routes
+# it through the clone path.
+def test_strided_input_transpose_clone_raises():
+    x = _arange(4, 67, 128)
+    with pytest.raises(RuntimeError, match="strided input on host dim"):
+        _compile_and_run(lambda x: x[::2].transpose(1, 2).clone(), (x,), DEVICE)
+
+
 # torch.cat shapes drawn from the Q2 target-model failures catalogued in
 # issue #1094 (torch.cat for Ministral / Mistral-Small / gpt-oss-20b / granite).
 # Each entry is (a_shape, b_shape, dim, marks).  These are the concrete shapes
