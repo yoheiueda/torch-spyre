@@ -313,6 +313,26 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     return host_coordinates(op.get_layout(), output_dep, indirect_sizes_from_op(op))
 
 
+def is_restickify(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
+    """Return whether a single-input pointwise copy is a RESTICKIFY (vs IDENTITY).
+
+    The one authoritative restickify test, shared by the codegen store side
+    (``SpyreKernel.store`` in spyre_kernel.py) and the padding pass's candidate
+    matcher (``_codegen_will_restickify`` in padding.py) so the two cannot drift
+    apart -- a disagreement would let the pass skip an op codegen then
+    restickifies on an unpadded buffer, over-reading uninitialized stick lanes.
+
+    ``in_coords`` / ``out_coords`` are the two operands' device-space coordinate
+    expressions.  It is a restickify iff a *different* host dim lands within the
+    stick, i.e. the within-stick (last) coords carry different free symbols --
+    except for a broadcast (an all-zero input expanding to a non-scalar output),
+    which is a plain identity fill, not a re-tiling.
+    """
+    if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
+        return False  # broadcast: scalar input expanding to non-scalar output
+    return in_coords[-1].free_symbols != out_coords[-1].free_symbols
+
+
 def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
     """Return names of deps whose loaded values are used as indices in scatter output_indexer.
 

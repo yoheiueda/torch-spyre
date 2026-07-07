@@ -66,6 +66,7 @@ from .pass_utils import (
     find_reduction_var,
     host_coordinates,
     identify_matmul_inputs,
+    is_restickify,
     lower_pad_sequence,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
@@ -469,30 +470,26 @@ def _output_stick_symbol(op, out_layout):
     return _single_free_sym(out_dev_coords[-1])
 
 
-def _stick_free_symbols(layout: FixedTiledLayout, dep) -> frozenset:
-    """Return the free symbols of ``layout``'s within-stick device coord under
-    ``dep``, or an empty set if the layout has no device coords.
-    """
-    device_coords = _device_coords(layout.device_layout, dep)
-    if not device_coords:
-        return frozenset()
-    return frozenset(device_coords[-1].free_symbols)
-
-
 def _codegen_will_restickify(op, out_layout, in_layout, in_dep) -> bool:
     """Return whether codegen will emit a RESTICKIFY (vs IDENTITY) for ``op``.
 
-    Mirrors the store-side test in spyre_kernel.py exactly: codegen restickifies
-    iff the input and output within-stick coords carry different free symbols.
-    The pass MUST agree with this predicate -- a restickify codegen emits on an
-    unpadded, unaligned buffer over-reads uninitialized stick lanes.  So the pass
-    only returns None ("carry on unpadded") when this is False; when it is True
-    the op is either padded or refused loudly, never silently skipped.
+    Delegates to the shared ``is_restickify`` predicate (pass_utils) that codegen
+    itself calls, so the pass and the store side cannot drift apart.  The pass
+    MUST agree with codegen: a restickify codegen emits on an unpadded, unaligned
+    buffer over-reads uninitialized stick lanes.  So the pass only returns None
+    ("carry on unpadded") when this is False; when it is True the op is either
+    padded or refused loudly, never silently skipped.
+
+    The pass supplies the two operands' device coords via ``_device_coords`` (the
+    padding-local peer that omits ``check_stick_expr_supported`` -- only the free
+    symbols matter here); codegen supplies the concrete ``device_coordinates`` of
+    its tensor args.  Both feed the same predicate.
     """
-    in_syms = _stick_free_symbols(in_layout, in_dep)
-    out_write_dep = _named_write_dep(op)
-    out_syms = _stick_free_symbols(out_layout, out_write_dep)
-    return in_syms != out_syms
+    in_coords = _device_coords(in_layout.device_layout, in_dep)
+    out_coords = _device_coords(out_layout.device_layout, _named_write_dep(op))
+    if not in_coords or not out_coords:
+        return False
+    return is_restickify(in_coords, out_coords)
 
 
 def _output_stick_input_host_dim(op, out_layout, in_layout, in_dep) -> int | None:
