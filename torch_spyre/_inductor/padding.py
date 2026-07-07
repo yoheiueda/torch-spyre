@@ -328,6 +328,25 @@ def _single_free_sym(expr: Expr):
     return next(iter(syms)) if len(syms) == 1 else None
 
 
+def _device_coords(stl: SpyreTensorLayout, dep) -> list[Expr]:
+    """Return device-space coordinate expressions for ``dep`` against ``stl``.
+
+    A padding-pass-local peer of ``pass_utils.host_coordinates`` /
+    ``device_coordinates``: it shares the concretize-index + compute_coordinates
+    core but deliberately omits ``check_stick_expr_supported``.  The pass
+    projects an OUTPUT stick coord through an INPUT dep (cross-layout, see
+    ``_project_stick_host_dim``), which composes two stride patterns into
+    intermediate stick exprs like ``Mod(d2, 32)`` or ``2*(Mod(d1, 32)) + 1``
+    that are perfectly valid for the pass's free-*variable* analysis but are not
+    codegen-legal stick forms.  Only the free symbols matter here, so the
+    codegen validation would wrongly reject a real restickify candidate.
+
+    Returns ``[]`` for a scalar / zero-dim layout (empty ``device_size``).
+    """
+    index = concretize_index(dep.index, set(dep.ranges.keys()))
+    return compute_coordinates(stl.device_size, stl.stride_map, dep.ranges, index)
+
+
 def _named_write_dep(op):
     """Return ``op``'s sole named write dep.
 
@@ -399,11 +418,7 @@ def _project_stick_host_dim(
     position be recognised as a restickify.
     """
     host_coords = host_coordinates(input_layout, dep, None)
-    stl = stick_source_layout.device_layout
-    device_index = concretize_index(dep.index, set(dep.ranges.keys()))
-    device_coords = compute_coordinates(
-        stl.device_size, stl.stride_map, dep.ranges, device_index
-    )
+    device_coords = _device_coords(stick_source_layout.device_layout, dep)
     # No coords means a scalar / zero-dim layout: no stick dim to project.
     if not host_coords or not device_coords:
         return None
@@ -420,11 +435,7 @@ def _output_stick_symbol(op, out_layout):
     both stick dims are sub-64 and alias the same physical region.
     """
     write_dep = _named_write_dep(op)
-    stl = out_layout.device_layout
-    out_dev_index = concretize_index(write_dep.index, set(write_dep.ranges.keys()))
-    out_dev_coords = compute_coordinates(
-        stl.device_size, stl.stride_map, write_dep.ranges, out_dev_index
-    )
+    out_dev_coords = _device_coords(out_layout.device_layout, write_dep)
     if not out_dev_coords:
         return None
     return _single_free_sym(out_dev_coords[-1])
@@ -434,11 +445,7 @@ def _stick_free_symbols(layout: FixedTiledLayout, dep) -> frozenset:
     """Return the free symbols of ``layout``'s within-stick device coord under
     ``dep``, or an empty set if the layout has no device coords.
     """
-    stl = layout.device_layout
-    device_index = concretize_index(dep.index, set(dep.ranges.keys()))
-    device_coords = compute_coordinates(
-        stl.device_size, stl.stride_map, dep.ranges, device_index
-    )
+    device_coords = _device_coords(layout.device_layout, dep)
     if not device_coords:
         return frozenset()
     return frozenset(device_coords[-1].free_symbols)
@@ -580,10 +587,7 @@ def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | No
     outermost (lowest-index) one is the governing dim, so we return the first
     match.  The within-stick dim (the last device coordinate) is excluded.
     """
-    device_index = concretize_index(write_dep.index, set(write_dep.ranges.keys()))
-    device_coords = compute_coordinates(
-        stl.device_size, stl.stride_map, write_dep.ranges, device_index
-    )
+    device_coords = _device_coords(stl, write_dep)
     for dim in range(len(device_coords) - 1):
         if sym in device_coords[dim].free_symbols:
             return dim
@@ -715,10 +719,7 @@ def _restickify_output_size1_device_dim(
     # farthest from the plane (batch/preserved) dims.  Plane dims are the
     # non-stick device dims whose coordinate carries a free iteration symbol.
     write_dep = _named_write_dep(op)
-    dev_index = concretize_index(write_dep.index, set(write_dep.ranges.keys()))
-    dev_coords = compute_coordinates(
-        device_size, stride_map, write_dep.ranges, dev_index
-    )
+    dev_coords = _device_coords(stl, write_dep)
     plane = [
         d
         for d in range(len(device_size) - 1)
