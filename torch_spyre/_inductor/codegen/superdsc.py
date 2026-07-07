@@ -880,7 +880,7 @@ def _restore_elided_producer_stick(op_spec: OpSpec) -> OpSpec:
     Inductor never emits a within-stick iteration variable and every operand's
     within-stick coordinate collapses to the constant ``0``.
 
-    ``insert_restickify_padding`` (``_pad_restickify_input_via_producer``)
+    ``insert_restickify_padding`` (``_pad_restickify_input``, producer grow)
     already grows the producer OUTPUT's device stick slot to the padded 64, so
     physically the buffer holds a full stick -- but with no iteration symbol
     only lane 0 is written, and the restickify (forced to the N>=2 3-symbol form
