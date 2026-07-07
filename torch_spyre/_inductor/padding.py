@@ -947,24 +947,27 @@ def lower_identity_clone(
 def _assert_input_not_sliced(
     op: ComputedBuffer, in_dep, in_layout, new_stick_dim: int
 ) -> None:
-    """Raise ``Unsupported`` for restickify inputs whose slice this copy path
-    cannot carry.
+    """Raise ``Unsupported`` for restickify inputs whose slice neither input-pad
+    path can carry.
 
-    The copy path redirects the restickify to read an identity clone of the
-    input verbatim, then grows the clone's device_size on the dim carrying
-    ``new_stick_dim`` to the stick boundary.  Two slice shapes are unpaddable:
+    Both input-pad paths grow the read buffer's device_size on the dim carrying
+    ``new_stick_dim`` to the stick boundary; neither can re-base a read that
+    begins partway into a stick.  Two slice shapes are unpaddable:
 
     - A slice on the **new-stick dim** starts the read partway into a stick, so
-      the stick-boundary grow reads the wrong lanes -- fail loudly.
+      the stick-boundary grow reads the wrong lanes -- fail loudly.  This holds
+      for *both* the producer-grow and the identity-clone paths: the slice sits
+      on the read feeding the restickify regardless of which buffer we grow, so
+      the displacement (``Mod(v + c, 64)``) survives into codegen either way.
     - A **strided** (step > 1) read of any host dim (coord ``k*var``, k != 1)
       picks non-contiguous rows, but codegen's offset/gap primitive masks a
       *contiguous* tail (``backGap = dev_dim_size - it_dim_size``), so a stride
       would silently read the wrong rows -- fail loudly.
 
     A **contiguous offset** on a non-stick host dim (coord ``var + c``) is fine:
-    the clone copies the full base buffer (offset region included) and the read
-    dep's index is preserved verbatim, so codegen's general offset/gap primitive
-    (``dev_dim_size > it_dim_size``) emits the correct offset and backGap.
+    the offset region is included and the read dep's index is preserved verbatim,
+    so codegen's general offset/gap primitive (``dev_dim_size > it_dim_size``)
+    emits the correct offset and backGap.
     """
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     for i, coord in enumerate(in_host_coords):
@@ -1008,12 +1011,23 @@ def _pad_restickify_input(
       (cheap: no extra buffer, no copy, no HBM round-trip).
     - When it is a graph input whose allocation is not ours to widen, insert an
       identity clone ahead of the restickify, grow the clone, and redirect the
-      restickify to read it.  The clone reads the input verbatim, so a sliced
-      input is refused loudly (``_assert_input_not_sliced``).
+      restickify to read it.
 
     The clone's grow is device_size-only (``grow_host_dim=None``) while the
     producer's also grows host_size -- see ``_grow_input_stick_dim`` for why.
+
+    A slice the grow cannot carry (mid-stick start on the new-stick dim, or a
+    strided read) is refused loudly (``_assert_input_not_sliced``) up front,
+    before either branch: the slice sits on the read feeding the restickify, so
+    growing the producer we own does not undo it any more than growing a clone
+    would.  The producer branch is grown in place with no separate read, so the
+    guard is the only thing standing between it and a silent miscompile.
     """
+    # Guard both branches: the offending slice is on the restickify's read, not
+    # on the buffer we grow, so it defeats the producer-grow path just as it
+    # defeats the clone path.
+    _assert_input_not_sliced(op, in_dep, in_layout, new_stick_dim)
+
     if isinstance(in_buf, ComputedBuffer) and _grow_input_stick_dim(
         in_buf, new_stick_dim, grow_host_dim=new_stick_dim
     ):
@@ -1022,10 +1036,6 @@ def _pad_restickify_input(
     device = in_buf.get_device()
     if device is None:
         return
-
-    # Redirect reads the input verbatim; a slice on the new-stick dim would
-    # over-read.  A non-stick offset/gap is carried through by codegen.
-    _assert_input_not_sliced(op, in_dep, in_layout, new_stick_dim)
 
     dtype = in_layout.dtype
     host_size = [concretize_expr(s) for s in in_layout.size]

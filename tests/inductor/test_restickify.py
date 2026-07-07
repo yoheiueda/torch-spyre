@@ -884,6 +884,26 @@ def test_pad_restickify_sliced_input_raises():
         )
 
 
+def test_pad_restickify_sliced_producer_raises():
+    """A mid-stick slice fed by a *producer* must also raise, not miscompile.
+
+    Same geometry as test_pad_restickify_sliced_input_raises, but the ``+ 1``
+    makes the sliced tensor a produced ComputedBuffer, so the input-pad grows
+    the producer in place rather than inserting a clone.  The slice still lands
+    on the read feeding the restickify (``Mod(v + 1, 64)``), so it is equally
+    unpaddable -- the guard must cover the producer branch too, otherwise this
+    path silently returns wrong data.
+    """
+    x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
+    with pytest.raises(
+        RuntimeError,
+        match="sliced input on host dim",
+    ):
+        _compile_and_run(
+            lambda x: (x + 1)[:, :, 1:66, :].transpose(-2, -1).clone(), (x,), DEVICE
+        )
+
+
 # ------- Restickify padding: sliced-transpose stick expr classification -------
 
 
