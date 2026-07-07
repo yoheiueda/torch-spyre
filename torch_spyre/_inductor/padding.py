@@ -814,60 +814,60 @@ def _restickify_input_device_dim(
     return _size1_alloc_dim(stl)
 
 
-def _pad_restickify_input_via_producer(
-    in_buf: ComputedBuffer, new_stick_dim: int
+def _grow_input_stick_dim(
+    buf: ComputedBuffer, new_stick_dim: int, grow_host_dim: int | None
 ) -> bool:
-    """Grow a producer's output to the stick-aligned dim size so the restickify
-    reads its widened tail directly, avoiding the ``lower_pad_sequence`` copy
-    (separate buffer + fill + copy + HBM round-trip).
+    """Grow ``buf``'s device_size on the dim carrying ``new_stick_dim`` up to the
+    stick boundary, so the restickify's stick-aligned over-read lands inside
+    ``buf``'s own (wider) allocation instead of uninitialised HBM.
 
-    Grows the producer's device_size AND host_size on the dim carrying
-    ``new_stick_dim`` to the stick boundary (host_stride and stride_map are
-    unchanged: growing the outermost extent does not alter the per-step strides
-    -- see _pad_layout_device_dim).  The restickify then over-reads the widened
-    device dim, which now lands inside the producer's own (wider) allocation
-    instead of uninitialised HBM.
+    The single read-side grow, shared by both input-padding entry points: the
+    producer we own (``buf`` is the input) and the identity clone of a graph
+    input (``buf`` is the clone).  Returns False if the geometry does not expose a
+    bumpable device dim (only the producer can fail this; a clone always exposes
+    one, so its caller asserts the result).
 
-    The grow is layout-only (device_size + host_size on one dim), so it does not
-    branch on the producer's op kind.  A Pointwise producer's iteration space
-    follows its output, so it writes real values into the widened tail; a
-    Reduction (matmul) producer's iteration space follows its input, so the tail
-    is left unwritten (garbage).  Both are safe: the tail never reaches a read
-    position, since every consumer iterates its own logical extent and stops
-    before the bumped tail (the same bound that lets the restickify output
-    discard its own padded rows).
+    ``grow_host_dim`` selects the two cases, and it is load-bearing:
 
-    The one precondition is a ``FixedTiledLayout`` producer, which the caller
-    (_identify_restickify_candidate) already requires -- not the op kind.
+    - **Producer** (``grow_host_dim = new_stick_dim``): grow host_size too, so the
+      producer's own iteration space computes the widened tail.  A Pointwise
+      producer then writes real values into it; a Reduction (matmul) producer
+      leaves it garbage.  Both are safe -- the tail never reaches a read position
+      (every consumer iterates its logical extent and stops before it, the same
+      bound that discards the restickify output's padded rows).
+    - **Identity clone** (``grow_host_dim = None``): device_size only.  The clone
+      is a pure copy that reads the *unpadded* graph input, so growing its host
+      would make the clone itself over-read that input -- the very hazard we are
+      fixing.  Its allocation is wider than its iteration; the restickify's
+      over-read into the clone tail is don't-care.
+
+    In both cases stride_map and host_stride are unchanged (see
+    ``_pad_layout_device_dim``).
     """
-    name = in_buf.get_name()
-
-    device_dim = _restickify_input_device_dim(in_buf, new_stick_dim)
+    device_dim = _restickify_input_device_dim(buf, new_stick_dim)
     if device_dim is None:
         return False
 
-    layout = in_buf.get_layout()
+    layout = buf.get_layout()
     old_dim_size = layout.device_layout.device_size[device_dim]
     n = concretize_expr(layout.size[new_stick_dim])
     new_dim_size = n + compute_padding(n, layout.dtype)
 
-    # Bump the device_size dim; unlike the output case the producer's host dim
-    # also grows to new_dim_size (grow_host_dim) so it actually computes the
-    # widened tail (see _pad_layout_device_dim).
-    in_buf.layout = _pad_layout_device_dim(
-        layout, device_dim, new_dim_size, grow_host_dim=new_stick_dim
+    buf.layout = _pad_layout_device_dim(
+        layout, device_dim, new_dim_size, grow_host_dim=grow_host_dim
     )
 
+    # grow_host_dim distinguishes the two roles: set -> in-place producer grow;
+    # None -> the identity clone of a graph input.
     logger.debug(
-        "insert_restickify_padding: fused pad into producer %s device dim %d "
-        "%d -> %d (host dim %d: %d -> %d)",
-        name,
+        "insert_restickify_padding: fused pad into %s %s device dim %d %d -> %d "
+        "(new stick host dim %d)",
+        "producer" if grow_host_dim is not None else "clone",
+        buf.get_name(),
         device_dim,
         old_dim_size,
         new_dim_size,
         new_stick_dim,
-        n,
-        new_dim_size,
     )
     return True
 
@@ -970,7 +970,7 @@ def _assert_input_not_sliced(op: ComputedBuffer, in_dep, in_layout) -> None:
             )
 
 
-def _pad_restickify_input_via_copy(
+def _pad_restickify_input(
     op: ComputedBuffer,
     operations: list[Operation],
     in_dep,
@@ -978,22 +978,27 @@ def _pad_restickify_input_via_copy(
     in_layout,
     new_stick_dim: int,
 ) -> None:
-    """Fallback read-side fix: insert an identity clone of the input ahead of the
-    restickify and redirect the restickify to read it.
+    """Read-side fix: ensure the restickify reads a grow-able ``ComputedBuffer``
+    whose stick-carrying dim is padded to a stick boundary.
 
-    Used when the input cannot be grown in place by
-    ``_pad_restickify_input_via_producer`` (a graph input, whose allocation is
-    not ours to widen).  The clone mirrors the producer path: it has the input's
-    exact host geometry with ``device_size`` bumped to the stick boundary on the
-    new-stick dim, so the restickify's over-read lands inside the clone's own
-    allocation.  The bumped tail is written by neither a fill nor the clone's
-    store (the identity copy iterates only the real rows), and is only ever read
-    into the output's backGap-discarded stick band -- so its contents are
-    don't-care, exactly as in the producer path.
+    Both cases run the same grow (``_grow_input_stick_dim``); they differ only in
+    whether we already have a buffer we own to grow, or must materialise one:
 
-    Only one copy op is emitted (no zero-fill), and the redirect reuses the
-    canonical ``NameSwapHandler`` rather than rewriting the restickify body.
+    - When the input is itself a ``ComputedBuffer`` we produced, grow it in place
+      (cheap: no extra buffer, no copy, no HBM round-trip).
+    - When it is a graph input whose allocation is not ours to widen, insert an
+      identity clone ahead of the restickify, grow the clone, and redirect the
+      restickify to read it.  The clone reads the input verbatim, so a sliced
+      input is refused loudly (``_assert_input_not_sliced``).
+
+    The clone's grow is device_size-only (``grow_host_dim=None``) while the
+    producer's also grows host_size -- see ``_grow_input_stick_dim`` for why.
     """
+    if isinstance(in_buf, ComputedBuffer) and _grow_input_stick_dim(
+        in_buf, new_stick_dim, grow_host_dim=new_stick_dim
+    ):
+        return
+
     device = in_buf.get_device()
     if device is None:
         return
@@ -1015,19 +1020,12 @@ def _pad_restickify_input_via_copy(
         insert_before=restickify_fx,
     )
 
-    # Bump the clone's device_size on the dim carrying the new stick dim to the
-    # stick boundary (device_size only; host size/stride/stride_map unchanged).
-    # The clone is a ComputedBuffer we own, so its stick-carrying device dim is
-    # located the same way as a producer's.
-    device_dim = _restickify_input_device_dim(clone_buf, new_stick_dim)
-    assert device_dim is not None, (
-        f"_pad_restickify_input_via_copy: no device dim carrying new stick dim "
+    # A clone we own always exposes the stick-carrying device dim; grow it
+    # device-size-only (the clone copies just the real rows).
+    grew = _grow_input_stick_dim(clone_buf, new_stick_dim, grow_host_dim=None)
+    assert grew, (
+        f"_pad_restickify_input: no device dim carrying new stick dim "
         f"{new_stick_dim} for clone {clone_buf.get_name()}"
-    )
-    n = host_size[new_stick_dim]
-    new_dim_size = n + compute_padding(n, dtype)
-    clone_buf.layout = _pad_layout_device_dim(
-        clone_buf.get_layout(), device_dim, new_dim_size, grow_host_dim=None
     )
 
     # Move the clone op to just before the restickify (run_node appends).
@@ -1049,11 +1047,10 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
       more than one stick block, the output's old-stick host dim becomes a
       non-stick device dim; if its dim size is not a stick multiple the second+
       block lands at the wrong physical offset.  Always attempted.
-    - Read side: when the new stick dim's size is not a stick multiple the read
-      runs past the true dim size.  ``_pad_restickify_input_via_producer``
-      grows the producer in place when eligible; otherwise
-      ``_pad_restickify_input_via_copy`` inserts a device-size-bumped identity
-      clone and redirects the restickify to read it.
+    - Read side (``_pad_restickify_input``): when the new stick dim's size is not
+      a stick multiple the read runs past the true dim size.  Grows the producer
+      in place when we own it, else inserts a device-size-bumped identity clone
+      and redirects the restickify to read it.
 
     The two are orthogonal — e.g. a 128x67 transpose has an aligned input
     stick dim (128) but an unaligned non-stick dim (67), so only the write-side
@@ -1073,13 +1070,4 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
             continue
 
-        # Grow the producer in place when the input is one we own (a
-        # ComputedBuffer); a graph input's allocation is not ours to widen, so it
-        # takes the identity-clone copy path.
-        if isinstance(in_buf, ComputedBuffer) and _pad_restickify_input_via_producer(
-            in_buf, new_stick_dim
-        ):
-            continue
-        _pad_restickify_input_via_copy(
-            op, operations, in_dep, in_buf, in_layout, new_stick_dim
-        )
+        _pad_restickify_input(op, operations, in_dep, in_buf, in_layout, new_stick_dim)
