@@ -671,11 +671,9 @@ def _pad_layout_device_dim(
     ``new_dim_size``, and ``host_size[grow_host_dim]`` grown to match when
     ``grow_host_dim`` is set (leaving the host size logical when it is None).
 
-    ``stride_map`` and ``host_stride`` are both left untouched.  A ``stride_map``
+    ``stride_map`` and ``host_stride`` are both left untouched: a ``stride_map``
     entry is the *per-step* host stride along a device dim, and growing a dim's
-    extent does not change how far one step moves — the same way a plain slice
-    changes ``device_size`` (its extent) while every ``stride_map`` entry keeps
-    pointing at the same host element spacing.  The identity
+    extent does not change how far one step moves.  The identity
     ``host_offset = dot(device_coordinates, stride_map)`` therefore still maps
     device coordinates onto the same storage; only the allocation is wider.
     """
@@ -834,41 +832,16 @@ def _pad_restickify_input_via_producer(
     instead of uninitialised HBM.
 
     The grow is layout-only (device_size + host_size on one dim), so it does not
-    branch on the producer's op kind.  The producer may be a Pointwise or a
-    Reduction (e.g. a sliced matmul output); the two differ in what the grown
-    tail contains, but both are safe:
+    branch on the producer's op kind.  A Pointwise producer's iteration space
+    follows its output, so it writes real values into the widened tail; a
+    Reduction (matmul) producer's iteration space follows its input, so the tail
+    is left unwritten (garbage).  Both are safe: the tail never reaches a read
+    position, since every consumer iterates its own logical extent and stops
+    before the bumped tail (the same bound that lets the restickify output
+    discard its own padded rows).
 
-    - Pointwise: iteration_space follows the output (write.ranges), so growing
-      host_size grows the iteration space and the producer writes real values
-      into the widened tail.
-    - Reduction (matmul): iteration_space follows the input (read.ranges, the
-      K-space), so growing the output dim does NOT grow the iteration space --
-      the producer's own write gets dev_dim_size > it_dim_size and its
-      write-side backGap leaves the tail unwritten (garbage).
-
-    Either way the tail never reaches a read position: every consumer iterates
-    its own it_dim_size, capped at the producer's logical extent, so a plain,
-    reducing, or restickifying co-reader stops before the bumped tail (the same
-    per-consumer bound that lets the restickify output discard its own padded
-    rows).  A grown buffer also cannot be LX-pinned -- device_size > it_dim_size
-    trips the allocator's back-gap gate (_would_produce_lx_back_gap), which the
-    backend supports on HBM but not LX -- so the fusion needs no consumer guard.
-
-    The one invariant the grow relies on is that the producer carries a
-    ``FixedTiledLayout``: the caller (_identify_restickify_candidate) requires it
-    here, and codegen's store() requires it again downstream.  This is the real
-    precondition, not the op kind -- an op-kind guard would be both narrower than
-    needed (Scatter is a Pointwise subclass, the *Reduction variants subclass
-    Reduction) and a false precondition (Scan/Sort would trip it though the
-    layout-only grow stays correct).
-
-    Two producer kinds need no guard because the caller never reaches them: the
-    caller already requires the input's layout to be a ``FixedTiledLayout``
-    (_identify_restickify_candidate), so a mutation-layout producer never
-    arrives here (and would be discarded anyway, since propagate_mutation_layouts
-    reassigns such layouts after this pass); and a producer that is also a graph
-    output is never restickified in place, since Inductor realizes such a graph
-    so the restickify reads the underlying source, not the output buffer.
+    The one precondition is a ``FixedTiledLayout`` producer, which the caller
+    (_identify_restickify_candidate) already requires -- not the op kind.
     """
     name = in_buf.get_name()
 
