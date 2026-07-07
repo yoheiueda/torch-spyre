@@ -700,6 +700,46 @@ def _extend_matmul_k_to_padded(
     )
 
 
+def _has_indirect_access(args) -> bool:
+    """True if any arg carries an IndirectAccess in its device coordinates.
+
+    The elided-stick restore rewrites assume plain affine coordinates; any
+    indirect access disqualifies the pattern.
+    """
+    return any(
+        isinstance(c, IndirectAccess) for arg in args for c in arg.device_coordinates
+    )
+
+
+def _fresh_restore_symbol(op_spec: OpSpec) -> Symbol:
+    """Return an ``rs{n}`` symbol distinct from every iteration-space symbol."""
+    used = set(op_spec.iteration_space.keys())
+    idx = 0
+    while Symbol(f"rs{idx}") in used:
+        idx += 1
+    return Symbol(f"rs{idx}")
+
+
+def _rebind_stick_coords(coords: list, sym: Symbol, stick_size: int, ctx: str) -> None:
+    """Rebind an operand's collapsed stick coords to carry ``sym`` in place.
+
+    The within-stick (last) coord and the outer-split slot are both the
+    constant ``0`` for an elided size-1 stick; rewrite them to the N>=2
+    ``[floor(sym/64), ..., Mod(sym, 64)]`` form so ``sym`` becomes this
+    operand's stick dim.  Mutates ``coords``; raises if no outer-split slot
+    (a symbol-free non-within coord) exists.
+    """
+    within_idx = len(coords) - 1
+    outer_candidates = [i for i in range(within_idx) if not coords[i].free_symbols]
+    if not outer_candidates:
+        raise Unsupported(
+            f"{ctx}: cannot restore elided stick dim "
+            "(no outer-split slot to carry the restored symbol)"
+        )
+    coords[outer_candidates[0]] = floor(sym / stick_size)
+    coords[within_idx] = Mod(sym, stick_size)
+
+
 def _restore_elided_restickify_stick(op_spec: OpSpec) -> OpSpec:
     """Restore the size-1 input-stick dim that upstream Inductor elided.
 
@@ -734,9 +774,8 @@ def _restore_elided_restickify_stick(op_spec: OpSpec) -> OpSpec:
     in_arg, out_arg = op_spec.args[0], op_spec.args[1]
 
     # Any indirect access disqualifies the pattern.
-    for arg in (in_arg, out_arg):
-        if any(isinstance(c, IndirectAccess) for c in arg.device_coordinates):
-            return op_spec
+    if _has_indirect_access((in_arg, out_arg)):
+        return op_spec
 
     def _within_stick_free(arg: TensorArg) -> bool:
         return bool(arg.device_coordinates[-1].free_symbols)
@@ -747,13 +786,7 @@ def _restore_elided_restickify_stick(op_spec: OpSpec) -> OpSpec:
         return op_spec
 
     stick_size = in_arg.device_dtype.elems_per_stick()
-
-    # A fresh symbol, distinct from every symbol already in the iteration space.
-    used = set(op_spec.iteration_space.keys())
-    idx = 0
-    while Symbol(f"rs{idx}") in used:
-        idx += 1
-    sym = Symbol(f"rs{idx}")
+    sym = _fresh_restore_symbol(op_spec)
 
     # Prepend the restored symbol as the outermost iteration dim so the SDSC
     # dim labels resolve to [mb, ...] (matching the N>=2 descriptor).
@@ -776,20 +809,7 @@ def _restore_elided_restickify_stick(op_spec: OpSpec) -> OpSpec:
     # INPUT: rebind the outer-split and within-stick coordinate slots (currently
     # the constant 0) to carry the restored symbol as this operand's stick dim.
     in_coords = list(in_arg.device_coordinates)
-    within_idx = len(in_coords) - 1
-    # The outer-split slot is the non-within-stick coordinate that is the
-    # constant 0 (the collapsed outer half of the stick address).
-    outer_candidates = [
-        i for i in range(len(in_coords) - 1) if not in_coords[i].free_symbols
-    ]
-    if not outer_candidates:
-        raise Unsupported(
-            "restickify: cannot restore elided input-stick dim "
-            "(no outer-split slot to carry the restored symbol)"
-        )
-    outer_idx = outer_candidates[0]
-    in_coords[outer_idx] = floor(sym / stick_size)
-    in_coords[within_idx] = Mod(sym, stick_size)
+    _rebind_stick_coords(in_coords, sym, stick_size, "restickify")
     new_in = dataclasses.replace(in_arg, device_coordinates=in_coords)
 
     # OUTPUT: the elided dim collapsed to a (size-1, constant-0) slot; drop it
@@ -882,9 +902,8 @@ def _restore_elided_producer_stick(op_spec: OpSpec) -> OpSpec:
         return op_spec
     out_arg = args[-1]
 
-    for arg in args:
-        if any(isinstance(c, IndirectAccess) for c in arg.device_coordinates):
-            return op_spec
+    if _has_indirect_access(args):
+        return op_spec
 
     stick_size = out_arg.device_dtype.elems_per_stick()
 
@@ -896,12 +915,7 @@ def _restore_elided_producer_stick(op_spec: OpSpec) -> OpSpec:
     if any(arg.device_coordinates[-1].free_symbols for arg in args):
         return op_spec
 
-    # A fresh outer symbol, distinct from every existing iteration symbol.
-    used = set(op_spec.iteration_space.keys())
-    idx = 0
-    while Symbol(f"rs{idx}") in used:
-        idx += 1
-    sym = Symbol(f"rs{idx}")
+    sym = _fresh_restore_symbol(op_spec)
     new_iteration_space = {sym: (stick_size, 1), **op_spec.iteration_space}
 
     # Each operand's within-stick coord (last) and its outer-split slot are the
@@ -910,17 +924,7 @@ def _restore_elided_producer_stick(op_spec: OpSpec) -> OpSpec:
     new_args = []
     for arg in args:
         coords = list(arg.device_coordinates)
-        within_idx = len(coords) - 1
-        outer_candidates = [
-            i for i in range(len(coords) - 1) if not coords[i].free_symbols
-        ]
-        if not outer_candidates:
-            raise Unsupported(
-                "restickify producer: cannot restore elided stick dim "
-                "(no outer-split slot to carry the restored symbol)"
-            )
-        coords[outer_candidates[0]] = floor(sym / stick_size)
-        coords[within_idx] = Mod(sym, stick_size)
+        _rebind_stick_coords(coords, sym, stick_size, "restickify producer")
         new_args.append(dataclasses.replace(arg, device_coordinates=coords))
 
     return dataclasses.replace(
