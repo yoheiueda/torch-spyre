@@ -347,6 +347,34 @@ def _device_coords(stl: SpyreTensorLayout, dep) -> list[Expr]:
     return compute_coordinates(stl.device_size, stl.stride_map, dep.ranges, index)
 
 
+def _size1_alloc_dim(stl: SpyreTensorLayout, tiebreak=None) -> int | None:
+    """Locate the size-1 (singleton) non-stick device dim that a restickify
+    grows to a stick, or None if the choice is ambiguous.
+
+    A size-1 host dim that moves into (input side) or out of (output side) stick
+    position carries no iteration symbol, so it cannot be tracked to a device dim
+    by symbol.  It is instead the singleton (``device_size == 1``) device dim
+    ``coarse_tile._resize_stl_device_dims`` marks with ``stride_map == -1``.
+    Several device dims can be size-1 (the host singleton plus a single-block
+    stick tile-count), so:
+
+    - a sole ``-1`` marker isolates the dim -> return it;
+    - no ``-1`` marker -> fall back to a sole size-1 dim, else decline;
+    - two-or-more ``-1`` markers -> hand the candidates to ``tiebreak`` (the
+      output side breaks the tie by geometry; the input side passes None and
+      declines).
+    """
+    device_size = [concretize_expr(s) for s in stl.device_size]
+    stride_map = list(stl.stride_map)
+    size1 = [d for d in range(len(device_size) - 1) if device_size[d] == 1]
+    grow = [d for d in size1 if stride_map[d] == -1]
+    if len(grow) == 1:
+        return grow[0]
+    if not grow:
+        return size1[0] if len(size1) == 1 else None
+    return tiebreak(grow) if tiebreak is not None else None
+
+
 def _named_write_dep(op):
     """Return ``op``'s sole named write dep.
 
@@ -684,52 +712,38 @@ def _restickify_output_size1_device_dim(
     after align instead (see ``_grow_size1_stick_allocations``); this function
     only locates the dim to tag.
 
-    When the input has a SECOND size-1 host dim (a leading/middle extra size-1
-    dim alongside the real innermost stick), the output has two-or-more device
-    dims that are size-1 with ``stride_map == -1``, and the sole ``-1`` marker no
-    longer isolates the collapsed old stick.  Only one of them is the demoted old
-    stick; the other(s) are incidental input size-1 dims that never carried stick
-    data.  They are told apart by geometry: the batch / preserved axes (the
-    "plane" dims the transpose leaves in place) carry an iteration symbol
-    (range > 1), while the old stick and the incidental size-1 dims are
-    symbol-free.  In the device row-major ordering the demoted old stick lands at
-    the slot FARTHEST from the plane axes -- adjacent to the stick block when the
-    batch nest is outer, or at the outermost slot when the batch nest is inner --
-    whereas an incidental size-1 dim sits among the batch axes.  Picking the
-    ``-1`` candidate that maximises its minimum distance to any plane dim
-    therefore recovers the same dim the N>=2 sibling (extra size-1 dim grown to
-    size 2) marks as its sole ``-1``.  This is also the dim
-    ``_grow_size1_stick_allocations`` grows with per-step stride
-    ``prod(host_size)`` -- the outermost-varying non-stick axis.
+    Resolution is delegated to ``_size1_alloc_dim``.  When a leading/middle extra
+    size-1 host dim leaves two-or-more ``-1`` markers, the ``_farthest_from_plane``
+    tiebreak isolates the demoted old stick (see its comment).
     """
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     if _single_free_sym(in_host_coords[in_stick_dim]) is not None:
         return None  # not a size-1 old-stick dim; aligned path owns it
-    out_layout = op.get_layout()
-    stl = out_layout.device_layout
-    device_size = [concretize_expr(s) for s in stl.device_size]
-    stride_map = list(stl.stride_map)
-    size1 = [d for d in range(len(device_size) - 1) if device_size[d] == 1]
-    grow = [d for d in size1 if stride_map[d] == -1]
-    if len(grow) == 1:
-        return grow[0]
-    if not grow:
-        return size1[0] if len(size1) == 1 else None
-    # Two-or-more collapsed size-1 device dims: the demoted old stick is the one
-    # farthest from the plane (batch/preserved) dims.  Plane dims are the
-    # non-stick device dims whose coordinate carries a free iteration symbol.
-    write_dep = _named_write_dep(op)
-    dev_coords = _device_coords(stl, write_dep)
-    plane = [
-        d
-        for d in range(len(device_size) - 1)
-        if _single_free_sym(dev_coords[d]) is not None
-    ]
-    if not plane:
-        # All-ones batch (e.g. [1,1,64,1]): no plane to measure against, and every
-        # candidate is a zero-extent relabel, so pick-first stays byte-correct.
-        return grow[0]
-    return max(grow, key=lambda g: (min(abs(g - p) for p in plane), -g))
+    stl = op.get_layout().device_layout
+
+    def _farthest_from_plane(grow: list[int]) -> int:
+        # Two-or-more collapsed size-1 device dims: the demoted old stick is the
+        # one farthest from the plane (batch/preserved) dims.  Plane dims are the
+        # non-stick device dims whose coordinate carries a free iteration symbol.
+        # In device row-major order the demoted old stick lands at the slot
+        # farthest from the plane axes (adjacent to the stick block when the batch
+        # nest is outer, outermost when inner), whereas an incidental input size-1
+        # dim sits among the batch axes.  This recovers the same dim the N>=2
+        # sibling marks as its sole -1.
+        write_dep = _named_write_dep(op)
+        dev_coords = _device_coords(stl, write_dep)
+        plane = [
+            d
+            for d in range(len(dev_coords) - 1)
+            if _single_free_sym(dev_coords[d]) is not None
+        ]
+        if not plane:
+            # All-ones batch (e.g. [1,1,64,1]): no plane to measure against, and
+            # every candidate is a zero-extent relabel, so pick-first is correct.
+            return grow[0]
+        return max(grow, key=lambda g: (min(abs(g - p) for p in plane), -g))
+
+    return _size1_alloc_dim(stl, tiebreak=_farthest_from_plane)
 
 
 def _pad_restickify_output(
@@ -790,11 +804,8 @@ def _restickify_input_device_dim(
     lands inside the producer's own buffer instead of uninitialised HBM.
 
     When ``new_stick_dim`` is a size-1 host dim (symbol-free coord), there is no
-    symbol to project onto a device dim, so fall back to the sole size-1
-    (singleton) producer device dim.  Several device dims can be size-1 (the
-    host singleton plus a single-block stick tile-count); disambiguate by the
-    ``stride_map == -1`` marker that ``coarse_tile._resize_stl_device_dims``
-    uses for the singleton being grown, and decline if still ambiguous.
+    symbol to project onto a device dim, so fall back to the singleton device dim
+    located by ``_size1_alloc_dim`` (declining if ambiguous).
     """
     layout = producer.get_layout()
     write_dep = _named_write_dep(producer)
@@ -803,17 +814,9 @@ def _restickify_input_device_dim(
     sym = _single_free_sym(host_coords[new_stick_dim])
     if sym is not None:
         return _device_dim_carrying_sym(stl, write_dep, sym)
-    # Size-1 host dim: match the singleton producer device dim by size, using
-    # stride_map == -1 to break ties among multiple size-1 device dims.
-    device_size = list(stl.device_size)
-    stride_map = list(stl.stride_map)
-    size1_dims = [
-        d for d in range(len(device_size) - 1) if concretize_expr(device_size[d]) == 1
-    ]
-    grow = [d for d in size1_dims if stride_map[d] == -1]
-    if len(grow) == 1:
-        return grow[0]
-    return size1_dims[0] if len(size1_dims) == 1 else None
+    # Size-1 host dim: locate the singleton producer device dim (declining if two
+    # or more -1 markers make the choice ambiguous).
+    return _size1_alloc_dim(stl)
 
 
 def _pad_restickify_input_via_producer(
