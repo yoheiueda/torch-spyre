@@ -979,103 +979,22 @@ def test_sliced_transpose_stick_expr_strict(fn, shape):
     _strict(fn, x)
 
 
-# ------- Restickify padding (unaligned stick dim) ---------
-
-# new_stick_dim = dim-0 (unaligned): shape (67, 128) or (1025, 1024), small tensor and large tensor.
-RESTICKIFY_PAD_2D_SIZES = [(67, 128), (1025, 1024)]
-
-
-@pytest.fixture(params=RESTICKIFY_PAD_2D_SIZES, ids=lambda p: f"{p[0]}x{p[1]}")
-def pad_tensors_2d(request):
-    s0, s1 = request.param
-    return torch.randn((s0, s1), dtype=torch.float16)
+# ------- Restickify padding: large tensors (tolerance oracle) ---------
+#
+# transpose(-2,-1)+clone with an unaligned new stick dim, padded up to a stick
+# boundary.  These tensors are too large for the fp16-exact ramp the strict
+# tests below use (``_arange`` caps at 1024 elements per value band), so they
+# compare ``randn`` data with a tolerance instead.  The exact geometry of every
+# small padded shape is covered strictly below.
+RESTICKIFY_PAD_LARGE_SIZES = [(1025, 1024), (2, 1025, 1024), (2, 2, 1025, 1024)]
 
 
-def test_pad_2d_transpose_clone(pad_tensors_2d):
-    """2D transpose(0,1)+clone: new stick dim is dim-0 (unaligned) — padding required."""
-    x = pad_tensors_2d
-    _compare(lambda x: x.transpose(0, 1).clone(), x, check_strides=False)
-
-
-# new_stick_dim = dim-1 (unaligned): shape (128, 67)
-RESTICKIFY_PAD_2D_LAST_SIZES = [(128, 67)]
-
-
-@pytest.fixture(params=RESTICKIFY_PAD_2D_LAST_SIZES, ids=lambda p: f"{p[0]}x{p[1]}")
-def pad_tensors_2d_last(request):
-    s0, s1 = request.param
-    return torch.randn((s0, s1), dtype=torch.float16)
-
-
-def test_pad_2d_transpose_clone_last_dim_unaligned(pad_tensors_2d_last):
-    """2D transpose(0,1)+clone: new stick dim is dim-1 (unaligned) — padding required."""
-    x = pad_tensors_2d_last
-    _compare(lambda x: x.transpose(0, 1).clone(), x, check_strides=False)
-
-
-# transpose(0,1)+clone on (rows, cols) where the new stick dim `rows` spans >1
-# stick block (rows > 64) and the middle dim `cols` is not a stick multiple, so
-# the second and later stick blocks must land at the correct offset.
-RESTICKIFY_PAD_2D_MID_SIZES = [(65, 4), (67, 4), (128, 67), (130, 33)]
-
-
-@pytest.fixture(params=RESTICKIFY_PAD_2D_MID_SIZES, ids=lambda p: f"{p[0]}x{p[1]}")
-def pad_tensors_2d_mid(request):
-    s0, s1 = request.param
-    return torch.randn((s0, s1), dtype=torch.float16)
-
-
-def test_pad_2d_transpose_clone_middle_dim_unaligned(pad_tensors_2d_mid):
-    """2D transpose(0,1)+clone where the new stick dim spans >1 block and the
-    middle dim is unaligned — every stick block must land correctly."""
-    x = pad_tensors_2d_mid
-    _compare(lambda x: x.transpose(0, 1).clone(), x, check_strides=False)
-
-
-# 3D: transpose(-2,-1).clone() — the new stick dim is the second-to-last dim
-RESTICKIFY_PAD_3D_SIZES = [(2, 67, 128), (2, 1025, 1024)]
-
-
-@pytest.fixture(params=RESTICKIFY_PAD_3D_SIZES, ids=lambda p: f"{p[0]}x{p[1]}x{p[2]}")
-def pad_tensors_3d(request):
-    s0, s1, s2 = request.param
-    return torch.randn((s0, s1, s2), dtype=torch.float16)
-
-
-def test_pad_3d_transpose_last2_clone(pad_tensors_3d):
-    """3D transpose(-2,-1)+clone: new stick dim is unaligned — padding required."""
-    x = pad_tensors_3d
-    _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)
-
-
-# 4D: two transpose variants matching the user's shapes
-RESTICKIFY_PAD_4D_SIZES = [(2, 2, 67, 128), (2, 2, 1025, 1024)]
-
-
-@pytest.fixture(
-    params=RESTICKIFY_PAD_4D_SIZES, ids=lambda p: f"{p[0]}x{p[1]}x{p[2]}x{p[3]}"
+@pytest.mark.parametrize(
+    "shape", RESTICKIFY_PAD_LARGE_SIZES, ids=lambda p: "x".join(map(str, p))
 )
-def pad_tensors_4d(request):
-    s0, s1, s2, s3 = request.param
-    return torch.randn((s0, s1, s2, s3), dtype=torch.float16)
-
-
-def test_pad_4d_transpose_last2_clone(pad_tensors_4d):
-    """4D transpose(-2,-1)+clone: new stick dim is unaligned — padding required."""
-    x = pad_tensors_4d
+def test_pad_large_transpose_clone(shape):
+    x = torch.randn(shape, dtype=torch.float16)
     _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)
-
-
-@pytest.fixture(ids=lambda p: f"{p[0]}x{p[1]}x{p[2]}x{p[3]}", params=[(2, 2, 67, 128)])
-def pad_tensors_4d_t1_last(request):
-    s0, s1, s2, s3 = request.param
-    return torch.randn((s0, s1, s2, s3), dtype=torch.float16)
-
-
-def test_pad_4d_transpose_1_last_clone(pad_tensors_4d_t1_last):
-    """4D transpose(1,-1)+clone: swaps dim-1 and dim-3, new stick dim unaligned."""
-    x = pad_tensors_4d_t1_last
-    _compare(lambda x: x.transpose(1, -1).clone(), x, check_strides=False)
 
 
 # ------- Restickify input padding fused into a producer ---------
@@ -1274,7 +1193,7 @@ def test_shared_producer_gets_two_restickify_nodes():
 # likely: an unaligned stick split across blocks, multiple leading batch dims,
 # and size-1 dims in or around the stick.
 
-SPLIT_2D = [(65, 4), (67, 4), (128, 67), (130, 33)]
+SPLIT_2D = [(65, 4), (67, 4), (128, 67), (130, 33), (67, 128)]
 
 
 @pytest.mark.parametrize("shape", SPLIT_2D, ids=lambda p: f"{p[0]}x{p[1]}")
@@ -1294,6 +1213,8 @@ SPLIT_ND = [
     (3, 5, 65, 4),
     (2, 4, 130, 33),
     (2, 2, 3, 65, 4),
+    (2, 67, 128),  # single leading batch, unaligned new stick
+    (2, 2, 67, 128),  # two leading batch dims, unaligned new stick
 ]
 
 
@@ -1305,7 +1226,7 @@ def test_strict_nd_transpose_clone(shape):
 
 # transpose(1, -1).clone() swaps an inner batch dim with the stick dim, a
 # different demoted-middle geometry than transpose(-2, -1).
-SPLIT_T1_LAST = [(2, 4, 67, 128), (2, 3, 65, 4)]
+SPLIT_T1_LAST = [(2, 4, 67, 128), (2, 3, 65, 4), (2, 2, 67, 128)]
 
 
 @pytest.mark.parametrize("shape", SPLIT_T1_LAST, ids=lambda p: "x".join(map(str, p)))
