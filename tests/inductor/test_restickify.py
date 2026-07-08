@@ -901,9 +901,8 @@ def test_pad_restickify_sliced_input_raises():
 
     ``x[:, :, 1:66, :]`` slices dim -2 (which the transpose turns into the new
     stick dim) at a non-stick-aligned start, so the read begins partway into a
-    stick.  This is unpaddable today; the pass must fail loudly (the sliced dim
-    reaches the padding perm loop with iter range < dim size) rather than route
-    the op to lower_restickify, which silently miscompiles.
+    stick.  This is unpaddable today, so the compiler must fail loudly rather
+    than return wrong data.
     """
     x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
     with pytest.raises(
@@ -919,11 +918,10 @@ def test_pad_restickify_sliced_producer_raises():
     """A mid-stick slice fed by a *producer* must also raise, not miscompile.
 
     Same geometry as test_pad_restickify_sliced_input_raises, but the ``+ 1``
-    makes the sliced tensor a produced ComputedBuffer, so the input-pad grows
-    the producer in place rather than inserting a clone.  The slice still lands
-    on the read feeding the restickify (``Mod(v + 1, 64)``), so it is equally
-    unpaddable -- the guard must cover the producer branch too, otherwise this
-    path silently returns wrong data.
+    makes the sliced tensor a produced (internal) buffer rather than a bare
+    graph input, exercising the other input path.  The slice is equally
+    unpaddable, so this path must also fail loudly rather than return wrong
+    data.
     """
     x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
     with pytest.raises(
@@ -938,42 +936,47 @@ def test_pad_restickify_sliced_producer_raises():
 # ------- Restickify padding: sliced-transpose stick expr classification -------
 
 
-# A sliced transpose produces an output-side stick expr whose *shape* varies
-# with where the slice lands and its extent: ``var + c`` (slice on a dim that
-# becomes non-stick), a bare var (stick-aligned start), or a rescaled modular
-# such as ``2*(Mod(var, 32)) + 1`` / ``floor(4*(Mod(var, 48))/3)`` (the stick
-# device-dim size shrank).  All carry the same free variable as the unsliced
-# ``Mod(var, 64)``, so ``_project_stick_host_dim`` resolves them to a host dim
-# and the op compiles correctly.  Contrast test_pad_restickify_sliced_input_raises,
-# where the slice lands mid-stick on the *becomes-stick* dim and must raise.
-OFFSET_STICK_OK_MODELS = [
-    # Slice the leading dim (becomes non-stick after transpose): var + c.
+# Sliced transposes that ARE valid and must compile correctly, spanning the
+# range of slice placements: on the leading dim (which becomes non-stick), a
+# stick-aligned start on the becomes-stick dim, and aligned/1.5-stick extents on
+# the becomes-stick dim.  Contrast test_pad_restickify_sliced_input_raises, where
+# the slice lands mid-stick on the becomes-stick dim and must raise.
+OFFSET_STICK_OK = [
+    # Slice the leading dim (becomes non-stick after transpose).
     (lambda x: x[3:67].transpose(0, 1).clone(), (128, 128)),
-    # Same, with an unaligned extent (63): still var + c, still fine.
+    # Same, with an unaligned extent (63): still fine.
     (lambda x: x[3:66].transpose(0, 1).clone(), (128, 128)),
-    # Stick-aligned slice start on the becomes-stick dim: collapses to bare var.
+    # Stick-aligned slice start on the becomes-stick dim.
     (lambda x: x[:, :, 64:128, :].transpose(-2, -1).clone(), (2, 2, 128, 128)),
-    # Slice on the becomes-stick dim, aligned extent: rescaled 2*(Mod(var,32))+1.
+    # Slice on the becomes-stick dim, aligned (single-stick) extent.
     (lambda x: x[:, 64:128].transpose(0, 1).clone(), (128, 128)),
-    # Slice on the becomes-stick dim, 1.5-stick extent: rescaled floor modular.
+    # Slice on the becomes-stick dim, 1.5-stick extent.
     (lambda x: x[:, :96].transpose(0, 1).clone(), (128, 128)),
 ]
 
 
 @pytest.mark.parametrize(
-    "fn,shape", OFFSET_STICK_OK_MODELS, ids=lambda p: p if isinstance(p, tuple) else ""
+    "fn,shape", OFFSET_STICK_OK, ids=lambda p: p if isinstance(p, tuple) else ""
 )
 def test_sliced_transpose_stick_expr_compiles(fn, shape):
-    """A sliced transpose compiles correctly regardless of the stick expr shape.
-
-    Locks in that ``_project_stick_host_dim`` classifies restickify by the
-    stick coordinate's free variable (matching codegen), so ``var + c`` and
-    slice-rescaled modular coords resolve to a host dim rather than being
-    declined by a shape special-case.
-    """
+    """A valid sliced transpose compiles correctly regardless of where the slice
+    lands or its extent -- only a mid-stick slice on the becomes-stick dim is
+    rejected (see test_pad_restickify_sliced_input_raises)."""
     x = torch.randn(shape, dtype=torch.float16)
     result = _compile_and_run(fn, (x,), DEVICE)
     compare_with_cpu(fn, x, target=result, run_eager=False)
+
+
+# Strict versions of the becomes-stick-dim slices above: a slice that lands on
+# the dim the transpose turns into the stick is the case most likely to misplace
+# a stick lane, and randn + tolerance can mask that.  A distinct-value ramp with
+# torch.equal catches a single displaced lane exactly.
+@pytest.mark.parametrize(
+    "fn,shape", OFFSET_STICK_OK, ids=lambda p: p if isinstance(p, tuple) else ""
+)
+def test_sliced_transpose_stick_expr_strict(fn, shape):
+    x = _arange(*shape)
+    _strict(fn, x)
 
 
 # ------- Restickify padding (unaligned stick dim) ---------
@@ -1010,12 +1013,9 @@ def test_pad_2d_transpose_clone_last_dim_unaligned(pad_tensors_2d_last):
     _compare(lambda x: x.transpose(0, 1).clone(), x, check_strides=False)
 
 
-# Unaligned "old-stick" MIDDLE dim while the new stick dim spans >1 stick block.
-# transpose(0,1)+clone on (rows, cols): the output stick dim is `rows` (split
-# across multiple stick blocks when rows > 64) and the middle device dim is
-# `cols`.  When cols is not a stick multiple, the second+ block must land at a
-# padded physical offset (See #1756) — the restickify output's middle device
-# dim is padded up to a stick boundary.
+# transpose(0,1)+clone on (rows, cols) where the new stick dim `rows` spans >1
+# stick block (rows > 64) and the middle dim `cols` is not a stick multiple, so
+# the second and later stick blocks must land at the correct offset.
 RESTICKIFY_PAD_2D_MID_SIZES = [(65, 4), (67, 4), (128, 67), (130, 33)]
 
 
@@ -1027,8 +1027,7 @@ def pad_tensors_2d_mid(request):
 
 def test_pad_2d_transpose_clone_middle_dim_unaligned(pad_tensors_2d_mid):
     """2D transpose(0,1)+clone where the new stick dim spans >1 block and the
-    middle (old-stick) dim is unaligned — output middle device dim padding
-    required."""
+    middle dim is unaligned — every stick block must land correctly."""
     x = pad_tensors_2d_mid
     _compare(lambda x: x.transpose(0, 1).clone(), x, check_strides=False)
 
@@ -1079,23 +1078,21 @@ def test_pad_4d_transpose_1_last_clone(pad_tensors_4d_t1_last):
     _compare(lambda x: x.transpose(1, -1).clone(), x, check_strides=False)
 
 
-# ------- Restickify input padding fused into a pointwise producer ---------
+# ------- Restickify input padding fused into a producer ---------
 #
-# When the restickify's input is an internal single-consumer pointwise
-# ComputedBuffer, insert_restickify_padding grows the producer's output to the
-# stick boundary (device_size bump) instead of emitting a lower_pad_sequence
-# copy.  The producer keeps computing its true rows; the widened tail is left
-# defined by the backGap path and over-read into the restickify's discarded
-# output band.  A graph-input restickify has no producer and falls back to the
-# copy.
+# When the restickify's input is produced by an internal op, the padding can be
+# folded into that producer instead of inserting a separate copy; a restickify
+# reading a bare graph input has no producer and falls back to the copy.  These
+# tests exercise both outcomes (asserting on the debug log which path fired) and
+# check that the result is correct either way.
 #
-# The materializer must put BOTH binary operands behind a computation so the
-# transposed side (not a bare graph input) is the one restickified — a bare
-# graph-input operand is preferred for restickify and would hit the fallback.
+# The tests put BOTH binary operands behind a computation so the transposed side
+# (not a bare graph input) is the one restickified -- a bare graph-input operand
+# would otherwise be the one chosen and hit the fallback.
 
 
 def _run_capturing_padding_log(fn, *args):
-    """Run fn on Spyre, returning (result, fused_fire_count, copy_fire_count)
+    """Run fn on Spyre, returning (result, fused_fire_count, all_log_records)
     captured from insert_restickify_padding's debug log."""
     import logging
 
@@ -1133,10 +1130,9 @@ def fuse_tensors(request):
 
 
 def test_pad_fused_into_producer(fuse_tensors):
-    """Both-computed binary (x*2).T + relu(y): the transposed side is an
-    internal single-consumer pointwise producer, so the input pad fuses into it
-    (no lower_pad_sequence copy).  Both operands unaligned -> input-stick pad
-    AND output-middle pad fire on the same restickify op."""
+    """(x*2).T + relu(y): the transposed side is an internal single-consumer
+    pointwise producer, so the padding fuses into it (no copy).  Both operands
+    are unaligned, so the same restickify needs both input and output padding."""
     x, y = fuse_tensors
 
     def fn(x, y):
@@ -1148,13 +1144,9 @@ def test_pad_fused_into_producer(fuse_tensors):
 
 
 def test_pad_fused_into_matmul_producer():
-    """A sliced matmul output (a@b)[:,c:]+z reaches the producer path as a
-    Reduction (batchmatmul), not a Pointwise.  Growing it does not grow its
-    iteration space (a Reduction iterates its K-space reads, not its output), so
-    the matmul's own write leaves the bumped tail unwritten -- but every consumer
-    caps at the logical extent and never reads it, so the fusion is still safe
-    and correct.  Locks in that Reduction producers fuse (no lower_pad_sequence
-    copy) rather than falling back."""
+    """A sliced matmul output (a@b)[:,c:]+z: the producer is a matmul
+    (a reduction), not a pointwise op.  It should still fuse rather than fall
+    back to a copy, and the result must be correct."""
     a = torch.randn((67, 64), dtype=torch.float16)
     b = torch.randn((64, 67), dtype=torch.float16)
     z = torch.randn((67, 64), dtype=torch.float16)
@@ -1168,8 +1160,8 @@ def test_pad_fused_into_matmul_producer():
 
 
 def test_pad_graph_input_falls_back():
-    """Restickifying a bare graph input has no producer to fuse into; the pass
-    must fall back to the lower_pad_sequence copy and still be correct."""
+    """Restickifying a bare graph input has no producer to fuse into, so the
+    padding must fall back to a copy -- and still be correct."""
     x = torch.randn((67, 67), dtype=torch.float16)
     y = torch.randn((67, 67), dtype=torch.float16)
 
@@ -1182,13 +1174,9 @@ def test_pad_graph_input_falls_back():
 
 
 def test_pad_multi_consumer_producer_fuses_with_coreader():
-    """A producer read by a restickify AND a non-restickify co-reader still
-    fuses: growing the shared buffer is safe because every consumer iterates its
-    own it_dim_size, so the co-reader (here p.sum(), a reducing reader) never
-    touches the bumped tail -- the growth lands in the restickify's
-    backGap-discarded band.  A grown buffer also cannot be LX-pinned
-    (device_size > it_dim_size trips the allocator's back-gap gate), so the
-    fusion needs no consumer-kind guard of its own."""
+    """A producer read by a restickify AND a non-restickify co-reader (here
+    p.sum()) still fuses, and the co-reader's result stays correct -- growing
+    the shared producer for the restickify does not disturb the other reader."""
     x = torch.randn((67, 128), dtype=torch.float16)
     z = torch.randn((128, 67), dtype=torch.float16)
 
@@ -1204,8 +1192,7 @@ def test_pad_multi_consumer_producer_fuses_with_coreader():
 def test_pad_shared_all_restickify_consumers_fuse():
     """A producer read only by restickify ops fuses even with several consumers.
     Two transposes of the same producer take different new stick dims, so each
-    bumps a different device entry of the shared buffer; the bumps compose and
-    both restickifies over-read their own defined tails."""
+    needs a different padding; both must apply and both results be correct."""
     x = torch.randn((67, 53, 128), dtype=torch.float16)
     za = torch.randn((128, 53, 67), dtype=torch.float16)
     zb = torch.randn((67, 128, 53), dtype=torch.float16)
@@ -1221,8 +1208,7 @@ def test_pad_shared_all_restickify_consumers_fuse():
 
 def _is_restickify_op(op) -> bool:
     """True when ``op`` is a spyre.restickify ComputedBuffer, detected via its
-    origin FX node's target (restickify has no ATen decomposition, so
-    _create_restickify_node stamps the synthetic node into origins)."""
+    origin FX node's target."""
     from torch._inductor.ir import ComputedBuffer
 
     if not isinstance(op, ComputedBuffer):
@@ -1280,12 +1266,13 @@ def test_shared_producer_gets_two_restickify_nodes():
 
 # ------- Restickify padding: strict (distinct values + torch.equal) ---------
 #
-# The tolerance-based tests above use ``compare_with_cpu`` with atol=rtol=0.1 on
-# ``randn`` data, whose fp16 value collisions in [-3, 3] can MASK a misplaced
-# stick.  The tests below use a distinct-per-element ramp (``_arange``) and
-# exact ``torch.equal`` (via ``_strict``) so any byte landing in the wrong stick
-# is caught -- the split-stick / multi-batch / size-1 shapes that used to
-# silently miscompile.
+# The tolerance-based tests above compare ``randn`` data with atol=rtol=0.1,
+# whose fp16 value collisions in [-3, 3] can MASK an element landing in the
+# wrong stick.  The tests below feed a distinct-per-element ramp (``_arange``)
+# and require exact equality (``_strict``), so a single misplaced element fails.
+# They cover the transpose+clone geometries where a misplaced element is most
+# likely: an unaligned stick split across blocks, multiple leading batch dims,
+# and size-1 dims in or around the stick.
 
 SPLIT_2D = [(65, 4), (67, 4), (128, 67), (130, 33)]
 
@@ -1296,10 +1283,9 @@ def test_strict_2d_transpose_clone(shape):
     _strict(lambda x: x.transpose(0, 1).clone(), x)
 
 
-# transpose(-2, -1).clone() with >=2 leading non-degenerate batch dims used to
-# drop inner batch planes.  Covers: single stick block (..64..), multi block
-# (..65..), the size-4 old-stick middle dim that exposed both bailout guards in
-# _restickify_output_middle_device_dim, and deeper/larger batch nests.
+# transpose(-2, -1).clone() with >=2 leading batch dims: every batch plane must
+# survive.  Covers a single stick block (..64..) and multiple blocks (..65..),
+# an unaligned middle (old-stick) dim of size 4, and deeper/larger batch nests.
 SPLIT_ND = [
     (4, 91, 72),
     (2, 3, 65, 4),
@@ -1328,13 +1314,9 @@ def test_strict_nd_transpose_1_last_clone(shape):
     _strict(lambda x: x.transpose(1, -1).clone(), x)
 
 
-# transpose(0, -1).clone() swaps the OUTERMOST dim with the stick dim.  When both
-# the source stick dim and the destination stick dim are sub-64 (e.g. 2 and 7),
-# the restickify-padding candidate scan used to project the output stick coord
-# through the input read dep, which composes the two sub-stick stride patterns
-# into a multi-symbol coord and dropped the candidate -- so no fill was inserted
-# and the restickify over-read uninitialized stick lanes (silent miscompile).
-# Deriving the output stick dim from the output layout's own write dep fixes it.
+# transpose(0, -1).clone() swaps the OUTERMOST dim with the stick dim, with both
+# the source and destination stick dims sub-64 (e.g. 2 and 7) so neither fills a
+# full stick.  Must still place every element exactly.
 SPLIT_T0_LAST = [(7, 67, 2), (7, 65, 2), (5, 3, 2), (7, 67, 63)]
 
 
@@ -1344,24 +1326,16 @@ def test_strict_transpose_0_last_clone(shape):
     _strict(lambda x: x.transpose(0, -1).clone(), x)
 
 
-# Size-1 input-stick shapes ((7, 67, 1) etc.) are a distinct failure: upstream
-# Inductor elides the size-1 source-stick dim (no loop symbol), so the
-# restickify's input operand collapses to a 2-dim iteration space with no KERNEL
-# data-stage and the backend aborts (dxp_standalone SIGABRT).  Two rewrites make
-# N=1 match N>=2: superdsc._restore_elided_restickify_stick restores the elided
-# stick as a fresh size-64 symbol so the SDSC descriptor is 3-dim, and the
-# scheduler grows the output's collapsed size-1 device dim to a full stick so
-# the physical allocation matches the 64-plane descriptor write
-# (scheduler._grow_size1_stick_allocations).  Without the second fix the
-# descriptor writes 64 planes into a 1-plane buffer and all but the first plane
-# come back garbage.
+# A size-1 dim IN the input stick ((7, 67, 1) etc.): the transpose moves this
+# size-1 dim out of the stick and a real dim in.  These shapes used to abort in
+# the backend or return garbage for all but the first plane; every element must
+# now come back correctly.
 #
-# The .exp() makes the restickify input an internal ComputedBuffer, so
-# insert_restickify_padding grows the producer in place (the fast path) rather
-# than the zero-filled graph-input copy fallback.  A cheap arithmetic producer
-# would be constant-folded away and never materialize the collapsed layout, so a
-# transcendental is used; its last-ULP host/device drift means this asserts
-# allclose rather than the exact torch.equal the ramp-based tests use.
+# The .exp() forces the restickify input to be an internal (produced) buffer
+# rather than a bare graph input, exercising the in-place producer path; the
+# graph-input path is covered by the next test.  A plain arithmetic op would be
+# constant-folded away, so a transcendental is used -- its last-ULP host/device
+# drift means this asserts allclose rather than the exact equality below.
 SIZE1_INPUT_STICK = [(7, 67, 1), (7, 65, 1), (5, 3, 1)]
 
 
@@ -1377,15 +1351,10 @@ def test_size1_input_stick_transpose_0_last_clone(shape):
     torch.testing.assert_close(spyre.cpu(), fn(x), atol=1e-2, rtol=1e-2)
 
 
-# The bare clone (no .exp()) drives the same size-1 stick elision through the
-# GRAPH-INPUT fallback: the restickify input is a graph input, so
-# insert_restickify_padding takes the zero-filled copy path
-# (_pad_restickify_input_via_copy) and rebuilds the restickify body via
-# replace_computed_buffer_body -- which must carry the _size1_stick_alloc_dim tag
-# onto the replacement buffer, or the scheduler grows nothing and the descriptor
-# writes 64 planes into a 1-plane allocation (all but the first plane garbage).
-# The copy path preserves the input bit-for-bit, so this asserts exact equality
-# on a distinct ramp (unlike the .exp() fast path above).
+# Same size-1-in-stick shapes, but the restickify input is a bare graph input
+# (no .exp()), exercising the other input path.  A copy preserves the input
+# bit-for-bit, so this asserts exact equality on the ramp (unlike the allclose
+# above).
 @pytest.mark.parametrize(
     "shape", SIZE1_INPUT_STICK, ids=lambda p: "x".join(map(str, p))
 )
@@ -1394,22 +1363,14 @@ def test_size1_input_stick_transpose_0_last_clone_graph_input(shape):
     _strict(lambda x: x.transpose(0, -1).clone(), x)
 
 
-# >=2 size-1 host dims with a size-1 dim in the input stick.  The stick-dim
-# projection (_host_dim_for_stick_sym) has no free symbol to match, so it takes
-# the size-1 fallback -- and with several size-1 dims present that fallback picks
-# the FIRST one rather than declining.  This is safe because size-1 dims do not
-# contribute to the Spyre device layout (tensors_and_layouts.md canonical form):
-# every size-1 host dim maps to host_size 1 and the physical dim to grow is
-# re-derived from device-side stride_map markers, not this host index, so any
-# size-1 dim yields the same layout.  These shapes assert that "pick the first"
-# is byte-correct; the interleaved variants (size-1 dims not adjacent, a real dim
-# between them) confirm the choice is independent of size-1 dim placement.  A
-# genuine device-level ambiguity (>=2 size-1 *device* dims) still declines in
-# _restickify_input_device_dim, so this fallback never masks a real hazard.
+# A size-1 dim in the input stick PLUS at least one more size-1 host dim
+# elsewhere, so more than one size-1 dim is present at once.  Result must be
+# correct regardless of where the extra size-1 dims sit; the interleaved
+# variants (a real dim between the size-1 dims) confirm placement does not
+# matter.
 #
-# Each entry is (shape, transpose_dims): the transpose must swap the size-1
-# input-stick dim with a real dim, and the two dims not touched must both be
-# size-1 (so >=2 size-1 dims and pick-first is exercised).
+# Each entry is (shape, transpose_dims): the transpose swaps the size-1
+# input-stick dim with a real dim, and the two untouched dims are both size-1.
 SIZE1_MULTI_STICK = [
     ((1, 1, 64, 1), (0, -1)),  # three size-1 dims (0, 1, 3)
     ((1, 1, 67, 1), (0, -1)),  # three size-1 dims, unaligned stick
@@ -1429,21 +1390,15 @@ def test_size1_multi_input_stick_transpose_clone(shape, dims):
     _strict(lambda x: x.transpose(*dims).clone(), x)
 
 
-# A size-1 input-stick transpose where a real batch/leading dim (extent > 1)
+# A size-1 dim in the input stick where a real batch/leading dim (extent > 1)
 # survives OUTSIDE both the old (size-1) and new sticks -- e.g. (4, 64, 1)
 # transpose(1, 2), whose batch dim 0 stays leading while dims 1 and 2 swap.
-# _restore_elided_restickify_stick used to reinsert the restored old stick
-# immediately before the within-stick coord, but in the N>=2 descriptor the old
-# stick lands at the rank the NEW stick occupies among the INPUT's coords -- the
-# transpose swaps the two sticks' slots and every surviving dim keeps its place.
-# When a batch dim sits between the two sticks those ranks differ, so the fixed
-# "adjacent to within-stick" position mis-strided the batch dim and its non-first
-# planes came back zeroed (all but batch plane 0 was garbage).  Deriving the
-# insert position from the new stick's rank in the input coords fixes it.
+# Every surviving batch plane must come back correct (non-first planes used to
+# be zeroed).
 #
-# The new (destination) stick must be a full 64 here: an unaligned destination
-# (e.g. 67) additionally needs output-middle stick padding, a separate path not
-# covered by this restore-position fix.  Each entry is (shape, transpose_dims).
+# The new (destination) stick is a full 64 here on purpose: an unaligned
+# destination would additionally need output-middle padding, covered separately
+# above.  Each entry is (shape, transpose_dims).
 SIZE1_SURVIVING_BATCH = [
     ((4, 64, 1), (1, 2)),  # batch dim 0 = 4 survives; new stick = dim 1
     ((2, 64, 1), (1, 2)),  # smaller batch
@@ -1463,20 +1418,14 @@ def test_size1_input_stick_surviving_batch_transpose_clone(shape, dims):
     _strict(lambda x: x.transpose(*dims).clone(), x)
 
 
-# A size-1 input stick PLUS a second (leading or middle) size-1 host dim.  The
-# transpose moves a real dim into the stick and demotes the size-1 stick to a
-# collapsed non-stick device dim; the incidental extra size-1 dim ALSO collapses
-# to a stride_map==-1 singleton, so the sole-``-1`` marker no longer isolates the
-# old stick and _restickify_output_size1_device_dim must disambiguate by distance
-# from the batch/preserved ("plane") dims (leading extra -> innermost grow dim,
-# middle extra -> outermost).  Without that the collapsed old-stick alloc is
-# never grown to a full stick and non-first batch planes come back zeroed
-# (max_diff=255).  Baselines before the fix: the leading and batch-inner shapes
-# below miscompiled; the middle / batch-outer ones already passed (kept as
-# lock-in).  Distinct-ramp + torch.equal catches a mis-placed plane exactly.
+# A size-1 dim in the input stick PLUS a second size-1 host dim (leading or
+# middle) that is not itself part of either stick.  With two size-1 dims present
+# the transpose still has to place every real batch plane correctly regardless
+# of where the extra size-1 dim sits (non-first planes used to come back
+# zeroed).  Distinct-ramp + torch.equal catches a mis-placed plane exactly.
 SIZE1_EXTRA = [
-    ((1, 4, 64, 1), (2, 3)),  # leading extra size-1 (dim0); old stick -> dim3
-    ((4, 1, 64, 1), (2, 3)),  # middle extra size-1 (dim1); old stick -> dim0
+    ((1, 4, 64, 1), (2, 3)),  # extra size-1 leading (dim0)
+    ((4, 1, 64, 1), (2, 3)),  # extra size-1 in the middle (dim1)
     ((1, 4, 1, 64, 1), (3, 4)),  # two extra size-1, batch outer
     ((4, 1, 1, 64, 1), (3, 4)),  # two extra size-1, batch/size-1 interleaved
     ((1, 1, 4, 64, 1), (3, 4)),  # two extra size-1, batch inner
@@ -1493,25 +1442,19 @@ def test_size1_extra_dim_transpose_clone(shape, dims):
     _strict(lambda x: x.transpose(*dims).clone(), x)
 
 
-# A size-1 input stick whose NEW stick dim spans >=2 stick blocks (host size
-# > 64).  The elided size-1 old stick is restored by superdsc as a fresh 64-wide
-# symbol; when the new stick is multi-block it splits into a tile-count device
-# dim (floor(new_stick / 64)) that occupies the new stick's input rank, so the
-# restored old stick must land one slot EARLIER (immediately outer to the block
-# dim).  Inserting it at the block dim's slot gave the grown size-1 alloc a
-# stride that collided with the block/batch host mapping and mis-placed the 2nd+
-# stick block, so even a stick-ALIGNED multi-block new stick ([1,128,1]) came
-# back wrong (max_diff=127).  Single-block new sticks are unaffected (their
-# floor(.) slot is a degenerate extent-1 dim).  Distinct-ramp + torch.equal.
+# A size-1 dim in the input stick whose NEW stick dim spans >=2 stick blocks
+# (host size > 64), aligned or unaligned, with and without leading batch dims.
+# The second and later stick blocks used to be mis-placed even when aligned;
+# every block must now land correctly.  Distinct-ramp + torch.equal.
 SIZE1_MULTI_BLOCK = [
-    ((1, 128, 1), (1, 2)),  # 2 aligned blocks, no batch (was md=127)
-    ((1, 192, 1), (1, 2)),  # 3 aligned blocks, no batch (was md=191)
-    ((1, 67, 1), (1, 2)),  # 2 unaligned blocks, no batch (was md=66)
-    ((4, 128, 1), (1, 2)),  # 2 aligned blocks + batch 4 (was md=511)
+    ((1, 128, 1), (1, 2)),  # 2 aligned blocks, no batch
+    ((1, 192, 1), (1, 2)),  # 3 aligned blocks, no batch
+    ((1, 67, 1), (1, 2)),  # 2 unaligned blocks, no batch
+    ((4, 128, 1), (1, 2)),  # 2 aligned blocks + batch 4
     ((2, 128, 1), (1, 2)),  # 2 aligned blocks + batch 2
-    ((4, 67, 1), (1, 2)),  # 2 unaligned blocks + batch (was md=267)
+    ((4, 67, 1), (1, 2)),  # 2 unaligned blocks + batch
     ((4, 192, 1), (1, 2)),  # 3 blocks + batch
-    ((2, 3, 67, 1), (2, 3)),  # 2 unaligned blocks + leading batch nest (md=401)
+    ((2, 3, 67, 1), (2, 3)),  # 2 unaligned blocks + leading batch nest
 ]
 
 
@@ -1525,15 +1468,10 @@ def test_size1_multi_block_transpose_clone(shape, dims):
     _strict(lambda x: x.transpose(*dims).clone(), x)
 
 
-# A contiguous OFFSET on a NON-stick host dim of a restickify input (#1333): the
-# difference between an STL device-dim size and the corresponding iteration
-# range.  A restickify whose new-stick dim is unaligned (67) routes through the
-# input-padding clone path, which used to refuse ANY sliced input host dim.  A
-# contiguous offset (coord ``var + c``) on a non-stick dim is fine -- the clone
-# copies the full base buffer and codegen's general offset/gap primitive
-# (dev_dim_size > it_dim_size) carries the offset and backGap.  Each fn below
-# RAISED before the guard was narrowed; distinct-ramp + torch.equal catches a
-# misplaced plane exactly.
+# A restickify input sliced with a contiguous OFFSET on a NON-stick host dim
+# (e.g. x[1:3]), with an unaligned new stick (67) that needs padding.
+# This is a valid, paddable slice and must compile correctly (it used to be
+# refused).  Distinct-ramp + torch.equal catches a misplaced plane exactly.
 OFFSET_NONSTICK_INPUT = [
     # Graph-input leading-dim offset (rows 1..2 of 4), unaligned new stick (67).
     (lambda x: x[1:3].transpose(1, 2).clone(), (4, 67, 128)),
@@ -1552,11 +1490,10 @@ def test_offset_nonstick_input_transpose_clone(fn, shape):
     _strict(fn, x)
 
 
-# A STRIDED (step > 1) read of a restickify input is NOT carried by codegen's
-# contiguous-tail backGap -- the clone would read the wrong (non-adjacent) rows.
-# The input-padding guard must fail loudly rather than miscompile.  ``x[::2]``
-# on the leading dim yields coord ``2*d0``; the unaligned new stick (67) routes
-# it through the clone path.
+# A STRIDED (step > 1) read of a restickify input (``x[::2]``) is not paddable:
+# the strided rows are non-adjacent, so a copy would read the wrong data.  With
+# an unaligned new stick (67) that needs padding, this must fail loudly rather
+# than silently miscompile.
 def test_strided_input_transpose_clone_raises():
     x = _arange(4, 67, 128)
     with pytest.raises(RuntimeError, match="strided input on host dim"):
