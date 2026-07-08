@@ -576,18 +576,13 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     if new_stick_dim == in_stick_dim:
         return None
 
-    # Skip a broadcast read (a host dim iterated wider than its size, e.g. a size-2
-    # rope dim read 128x): the read-side padding paths read the input verbatim, so
-    # there is no unique dim to grow.  A true transpose reads each dim over its full
-    # size (never dropped here); a narrowing slice hits the copy path's loud guard.
-    in_host_coords = host_coordinates(in_layout, in_dep, None)
-    for i, coord in enumerate(in_host_coords):
-        sym = _single_free_sym(coord)
-        if sym is None:  # degenerate size-1 host dim, nothing to iterate
-            continue
-        if concretize_expr(in_dep.ranges[sym]) > concretize_expr(in_layout.size[i]):
-            return None
-
+    # A broadcast read (a host dim iterated wider than its size, e.g. a size-2 rope
+    # dim read 128x) is fine here: the broadcast host coord has a zero per-step
+    # coefficient (``floor(d1/64)``, ``Mod(d1, 64)``), so codegen derives the read's
+    # device strides from the device layout, not the host coefficient, and reads the
+    # repeated block correctly.  Growing the (different) new-stick dim leaves the
+    # broadcast dim untouched.  Only a real stride (coeff not in {0, 1}) is
+    # unpaddable, and ``_assert_input_not_sliced`` rejects that on the padding path.
     return in_dep, in_buf, in_layout, new_stick_dim, in_stick_dim
 
 
@@ -946,24 +941,33 @@ def _assert_input_not_sliced(
       for *both* the producer-grow and the identity-clone paths: the slice sits
       on the read feeding the restickify regardless of which buffer we grow, so
       the displacement (``Mod(v + c, 64)``) survives into codegen either way.
-    - A **strided** (step > 1) read of any host dim (coord ``k*var``, k != 1)
-      picks non-contiguous rows, but codegen's offset/gap primitive masks a
-      *contiguous* tail (``backGap = dev_dim_size - it_dim_size``), so a stride
-      would silently read the wrong rows -- fail loudly.
+    - A **strided** read of any host dim (coord ``k*var``, k not in {0, 1}: step > 1
+      or reversed) picks non-contiguous rows, but codegen's offset/gap primitive
+      masks a *contiguous* tail (``backGap = dev_dim_size - it_dim_size``), so a
+      stride would silently read the wrong rows -- fail loudly.
 
     A **contiguous offset** on a non-stick host dim (coord ``var + c``) is fine:
     the offset region is included and the read dep's index is preserved verbatim,
     so codegen's general offset/gap primitive (``dev_dim_size > it_dim_size``)
     emits the correct offset and backGap.
+
+    A **broadcast** read (coord with a zero coefficient, ``floor(v/64)`` or
+    ``Mod(v, 64)``, iterated wider than the dim size) is also fine: codegen derives
+    the read's device strides from the device layout, not the host coefficient, and
+    reads the repeated block correctly.  It is left to flow through (only a real
+    stride is refused), so growing the separate new-stick dim still pads other dims.
     """
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     for i, coord in enumerate(in_host_coords):
         sym = _single_free_sym(coord)
         if sym is None:  # degenerate size-1 host dim, nothing to slice
             continue
-        # A step > 1 read (k*var) is not carried by codegen's contiguous-tail
-        # backGap, on any dim.
-        if concretize_expr(coord.coeff(sym)) != 1:
+        # A strided read (coord ``k*var``, k not in {0, 1}: step > 1 or reversed) is
+        # not carried by codegen's contiguous-tail backGap, on any dim -- refuse it.
+        # A broadcast read has a zero coefficient (``floor(v/64)``, ``Mod(v, 64)``);
+        # codegen derives its device strides from the device layout, not this host
+        # coefficient, and reads the repeated block correctly, so it is not a stride.
+        if concretize_expr(coord.coeff(sym)) not in (0, 1):
             raise Unsupported(
                 f"insert_restickify_padding: strided input on host dim "
                 f"{i} of {op.get_name()} (coord {coord}) is not supported"
