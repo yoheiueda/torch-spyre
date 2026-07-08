@@ -355,7 +355,8 @@ def _size1_alloc_dim(stl: SpyreTensorLayout, tiebreak=None) -> int | None:
     A size-1 host dim that moves into (input side) or out of (output side) stick
     position carries no iteration symbol, so it cannot be tracked to a device dim
     by symbol.  It is instead the singleton (``device_size == 1``) device dim
-    ``coarse_tile._resize_stl_device_dims`` marks with ``stride_map == -1``.
+    marked with ``stride_map == -1`` (the extent-1 / never-stepped marker
+    handled by ``coarse_tile._resize_device_layout``).
     Several device dims can be size-1 (the host singleton plus a single-block
     stick tile-count), so:
 
@@ -435,8 +436,9 @@ def _project_stick_host_dim(
     projected through dep.  The projection is by free *variable*: the host dim
     whose coordinate carries the stick coord's symbol.  The caller then reads a
     restickify off ``in_stick_dim != new_stick_dim`` — the same test codegen
-    uses (``in_coords[-1].free_symbols != out_coords[-1].free_symbols``,
-    spyre_kernel.py).  A constant coefficient or offset from a sliced stick
+    uses (the ``is_restickify`` predicate in pass_utils, which compares the
+    within-stick coords' free symbols).  A constant coefficient or offset from a
+    sliced stick
     device-dim size (e.g. ``2*(Mod(var, 32)) + 1``) does not change the free
     variable, so such rescaled coords need no shape special-case.
 
@@ -857,8 +859,6 @@ def _grow_input_stick_dim(
         layout, device_dim, new_dim_size, grow_host_dim=grow_host_dim
     )
 
-    # grow_host_dim distinguishes the two roles: set -> in-place producer grow;
-    # None -> the identity clone of a graph input.
     logger.debug(
         "insert_restickify_padding: fused pad into %s %s device dim %d %d -> %d "
         "(new stick host dim %d)",
