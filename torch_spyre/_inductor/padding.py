@@ -476,11 +476,11 @@ def _codegen_will_restickify(op, out_layout, in_layout, in_dep) -> bool:
     """Return whether codegen will emit a RESTICKIFY (vs IDENTITY) for ``op``.
 
     Delegates to the shared ``is_restickify`` predicate (pass_utils) that codegen
-    itself calls, so the pass and the store side cannot drift apart.  The pass
-    MUST agree with codegen: a restickify codegen emits on an unpadded, unaligned
-    buffer over-reads uninitialized stick lanes.  So the pass only returns None
-    ("carry on unpadded") when this is False; when it is True the op is either
-    padded or refused loudly, never silently skipped.
+    itself calls, so the pass and the store side cannot drift apart.  Used only by
+    the can't-happen backstop in ``_identify_restickify_candidate``: when no input
+    host dim carries the output stick, this decides skip (codegen won't restickify)
+    vs. refuse loudly (it would, so the unpadded buffer would over-read
+    uninitialized stick lanes).
 
     The pass supplies the two operands' device coords via ``_device_coords`` (the
     padding-local peer that omits ``check_stick_expr_supported`` -- only the free
@@ -513,7 +513,13 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     """Identify whether ``op`` is a restickify the padding pass may act on.
 
     A candidate is a single-input pointwise copy between two FixedTiledLayouts
-    that lands a *different* host dim within the stick.
+    that lands a *different* host dim within the stick.  After confirming the
+    shape (pointwise, one input, both FixedTiled), it derives the two host dims
+    the padding logic needs and applies three gates that reject non-candidates:
+    the restickify test does not hold (same stick dim), the output stick aliases
+    the input's own stick, or the read is a broadcast.  A fourth branch is a
+    can't-happen backstop: a recognized restickify whose output stick maps to no
+    input host dim is refused loudly rather than skipped (see below).
 
     Returns None if ``op`` is not a candidate, else the tuple:
 
@@ -545,23 +551,23 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     if not isinstance(in_layout, FixedTiledLayout):
         return None
 
+    # The restickify test, expressed as host dims: the input's own within-stick
+    # dim vs. the input dim that carries the output's stick symbol.  A restickify
+    # lands a *different* host dim in the stick, i.e. new_stick_dim != in_stick_dim
+    # (the free-symbol inequality is_restickify checks, projected onto host dims).
     in_stick_dim = _project_stick_host_dim(in_layout, in_layout, in_dep)
     new_stick_dim = _output_stick_input_host_dim(op, out_layout, in_layout, in_dep)
     if in_stick_dim is None:
         return None
     if new_stick_dim is None:
-        # No input host dim was located for the output stick.  This is safe to
-        # skip only if codegen will NOT restickify (identical in/out stick
-        # symbols -> IDENTITY, no over-read).  If codegen WILL restickify, the
-        # buffer reaches codegen unpadded and over-reads uninitialized stick
-        # lanes -- so fail loudly rather than miscompile.  Reaching here with a
-        # real restickify means the output stick carries an iteration symbol that
-        # no input host dim carries (e.g. a fused multi-symbol coord); a size-1
-        # output stick always resolves to a host dim (_host_dim_for_stick_sym
-        # picks the first size-1 dim), so it does not land here.
+        # Can't-happen backstop: finalize_layouts guarantees a single-symbol output
+        # stick that always resolves to a host dim, so no known shape lands here.
+        # If the invariant ever breaks and codegen would still restickify, the
+        # unpadded buffer over-reads uninitialized lanes -- refuse loudly, not skip.
         if _codegen_will_restickify(op, out_layout, in_layout, in_dep):
             raise Unsupported(
-                "restickify padding: cannot locate input host dim for output stick"
+                "restickify padding: output stick maps to no input host dim "
+                f"for {op.get_name()} (unexpected: layout invariant broken)"
             )
         return None
     if new_stick_dim == in_stick_dim:
@@ -569,30 +575,21 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
 
     host_size = [concretize_expr(s) for s in in_layout.size]
 
-    # No over-read when the output stick aliases the input's OWN stick.  Projecting
-    # the output stick coord through the input read dep (the pre-3ddc683 method)
-    # lands back on ``in_stick_dim``: the restickified read stays inside the input's
-    # already-initialized stick, so no padding is needed -- and padding it would
-    # relabel a tracked named dim (see test_permute_matmul_distinct_lqlk, a permuted
-    # matmul input whose full D=64 stick re-tiles to a sub-64 Lk output stick).
-    # This is distinct from the 3ddc683 sub-stick->sub-stick hazard, where the
-    # projection composes two sub-64 stride patterns into a multi-symbol coord and
-    # returns None: that case must stay a candidate, so gate on "not None".  A
-    # genuine unaligned transpose projects onto a *different* host dim
-    # (projection != in_stick_dim), so it is kept and padded.
+    # Skip when the new stick dim is carved from the input's OWN stick: the
+    # widened read stays inside already-initialized lanes, so there is no over-read
+    # to pad.  (Padding it anyway would grow a device dim that may carry a tracked
+    # named dim, e.g. a matmul's D -- test_permute_matmul_distinct_lqlk.)  Detected
+    # by projecting the output stick back through the input read: landing on
+    # in_stick_dim means it aliases the input stick.  A projection to None
+    # (sub-stick->sub-stick) or a different dim (real transpose) stays a candidate.
     projected = _project_stick_host_dim(in_layout, out_layout, in_dep)
     if projected is not None and projected == in_stick_dim:
         return None
 
-    # The read-side padding paths (producer-grow, identity-clone copy) read the
-    # input verbatim, so they can only own a restickify whose read is a pure
-    # permutation.  A host dim iterated with a range wider than its size is a
-    # broadcast (e.g. the qkv rope size-2 dim read 128x): there is no unique
-    # input dim to grow and no verbatim read to redirect.  Decline quietly and
-    # leave it to codegen, as before the output-write-dep derivation promoted it
-    # to a candidate.  A genuine transpose reads every dim over its full size, so
-    # this never drops a real hazard; a narrowing slice (iter range < dim size)
-    # still falls through to the copy path's loud guard.
+    # Skip a broadcast read (a host dim iterated wider than its size, e.g. a size-2
+    # rope dim read 128x): the read-side padding paths read the input verbatim, so
+    # there is no unique dim to grow.  A true transpose reads each dim over its full
+    # size (never dropped here); a narrowing slice hits the copy path's loud guard.
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     for i, coord in enumerate(in_host_coords):
         sym = _single_free_sym(coord)
