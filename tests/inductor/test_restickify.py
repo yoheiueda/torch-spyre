@@ -1419,3 +1419,27 @@ def test_strided_input_transpose_clone_raises():
     x = _arange(4, 67, 128)
     with pytest.raises(RuntimeError, match="strided input on host dim"):
         _compile_and_run(lambda x: x[::2].transpose(1, 2).clone(), (x,), DEVICE)
+
+
+# Matmul with a SUB-STICK contraction dim (D) reached through a permuted key,
+# k.permute(0,2,3,1), which restickifies k into [B,H,D,Lk] with the sub-stick D
+# demoted to a non-stick device dim.  The permuted-key stick (Lk) projects back
+# onto D by free symbol, so the restickify alias guard used to skip padding for
+# ANY D -- but when D does not fill a whole stick (D=48) the widened read runs
+# past D's initialized lanes and the whole matmul came back wrong.  D must be
+# padded (and its K-tail zero-filled) so the contraction ignores the pad rows.
+# Small-span ramps keep the fp16 accumulation exact so torch.equal is a true
+# oracle; D spans sub-stick (33, 48), aligned (64), and multi-block (96) sizes.
+SUBSTICK_MATMUL_D = [33, 48, 63, 64, 96]
+
+
+@pytest.mark.parametrize("D", SUBSTICK_MATMUL_D, ids=lambda d: f"D{d}")
+def test_substick_contraction_permuted_key(D):
+    B, H, Lq, Lk = 2, 4, 16, 32
+    q = _arange(B, Lq, H, D, span=3)
+    k = _arange(B, Lk, H, D, span=3)
+
+    def fn(q, k):
+        return torch.matmul(q.permute(0, 2, 1, 3), k.permute(0, 2, 3, 1))
+
+    _strict(fn, q, k)

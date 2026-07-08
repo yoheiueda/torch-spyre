@@ -515,17 +515,20 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     A candidate is a single-input pointwise copy between two FixedTiledLayouts
     that lands a *different* host dim within the stick.  After confirming the
     shape (pointwise, one input, both FixedTiled), it derives the two host dims
-    the padding logic needs and applies three gates that reject non-candidates:
-    the restickify test does not hold (same stick dim), the output stick aliases
-    the input's own stick, or the read is a broadcast.  A fourth branch is a
-    can't-happen backstop: a recognized restickify whose output stick maps to no
-    input host dim is refused loudly rather than skipped (see below).
+    the padding logic needs and applies two gates that reject non-candidates:
+    the restickify test does not hold (same stick dim), or the read is a
+    broadcast.  A third branch is a can't-happen backstop: a recognized
+    restickify whose output stick maps to no input host dim is refused loudly
+    rather than skipped (see below).
+
+    Note the aliasing check (output stick carved from the input's OWN stick)
+    lives on the read side, not here: it gates only the input padding, which is
+    the padding it is actually about (see ``_new_stick_aliases_input_stick``).
 
     Returns None if ``op`` is not a candidate, else the tuple:
 
     - ``in_dep`` / ``in_buf`` / ``in_layout``: the single input's dep, buffer,
       and (FixedTiled) layout.
-    - ``host_size``: the input's concretized host size.
     - ``new_stick_dim``: input host dim that becomes the output's stick dim.
     - ``in_stick_dim``: input host dim that becomes the output's "old-stick"
       non-stick device dim.
@@ -573,19 +576,6 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     if new_stick_dim == in_stick_dim:
         return None
 
-    host_size = [concretize_expr(s) for s in in_layout.size]
-
-    # Skip when the new stick dim is carved from the input's OWN stick: the
-    # widened read stays inside already-initialized lanes, so there is no over-read
-    # to pad.  (Padding it anyway would grow a device dim that may carry a tracked
-    # named dim, e.g. a matmul's D -- test_permute_matmul_distinct_lqlk.)  Detected
-    # by projecting the output stick back through the input read: landing on
-    # in_stick_dim means it aliases the input stick.  A projection to None
-    # (sub-stick->sub-stick) or a different dim (real transpose) stays a candidate.
-    projected = _project_stick_host_dim(in_layout, out_layout, in_dep)
-    if projected is not None and projected == in_stick_dim:
-        return None
-
     # Skip a broadcast read (a host dim iterated wider than its size, e.g. a size-2
     # rope dim read 128x): the read-side padding paths read the input verbatim, so
     # there is no unique dim to grow.  A true transpose reads each dim over its full
@@ -598,7 +588,7 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
         if concretize_expr(in_dep.ranges[sym]) > concretize_expr(in_layout.size[i]):
             return None
 
-    return in_dep, in_buf, in_layout, host_size, new_stick_dim, in_stick_dim
+    return in_dep, in_buf, in_layout, new_stick_dim, in_stick_dim
 
 
 def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | None:
@@ -990,6 +980,38 @@ def _assert_input_not_sliced(
             )
 
 
+def _new_stick_aliases_input_stick(
+    op: ComputedBuffer, in_dep, in_layout, host_size, in_stick_dim: int
+) -> bool:
+    """Return True when the output stick is carved from the input's OWN stick and
+    that input stick fills a whole stick -- the read-side skip condition.
+
+    The over-read the input padding exists to cover stays inside already-
+    initialized lanes here, so there is nothing to pad; growing the dim anyway
+    would widen a device dim that may carry a tracked named dim (e.g. a matmul's
+    D -- test_permute_matmul_distinct_lqlk).  Detected by projecting the output
+    stick back through the input read: landing on ``in_stick_dim`` means it
+    aliases the input stick.  A projection to None (sub-stick->sub-stick) or a
+    different dim (a real transpose) is not an alias.
+
+    The "inside already-initialized lanes" rationale only holds when
+    ``in_stick_dim`` fills a WHOLE stick: the projection matches by free *symbol*,
+    so it is blind to ``in_stick_dim``'s size and reports the alias whether the
+    input stick dim is a full 64 (D=64) or sub-stick (D=48).  When it is sub-stick
+    the widened read runs past the initialized lanes into uninitialized HBM --
+    codegen still restickifies and reads garbage (a matmul with a sub-stick
+    contraction dim miscompiles).  So only treat it as an alias when the input
+    stick dim is itself stick-aligned; a sub-stick alias falls through to the grow.
+    """
+    stick_size = get_elem_in_stick(in_layout.dtype)
+    projected = _project_stick_host_dim(in_layout, op.get_layout(), in_dep)
+    return (
+        projected is not None
+        and projected == in_stick_dim
+        and host_size[in_stick_dim] % stick_size == 0
+    )
+
+
 def _pad_restickify_input(
     op: ComputedBuffer,
     operations: list[Operation],
@@ -997,9 +1019,17 @@ def _pad_restickify_input(
     in_buf,
     in_layout,
     new_stick_dim: int,
+    in_stick_dim: int,
 ) -> None:
     """Read-side fix: ensure the restickify reads a grow-able ``ComputedBuffer``
     whose stick-carrying dim is padded to a stick boundary.
+
+    Declines up front when there is no over-read to cover -- either the new stick
+    dim is already a stick multiple (so the read never runs past the true dim
+    size), or it is carved from the input's OWN aligned stick
+    (``_new_stick_aliases_input_stick``): the widened read stays inside
+    already-initialized lanes, so there is nothing to pad and growing the dim
+    would only widen a device dim that may carry a tracked named dim.
 
     Both cases run the same grow (``_grow_input_stick_dim``); they differ only in
     whether we already have a buffer we own to grow, or must materialise one:
@@ -1020,6 +1050,12 @@ def _pad_restickify_input(
     would.  The producer branch is grown in place with no separate read, so the
     guard is the only thing standing between it and a silent miscompile.
     """
+    host_size = [concretize_expr(s) for s in in_layout.size]
+    if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
+        return
+    if _new_stick_aliases_input_stick(op, in_dep, in_layout, host_size, in_stick_dim):
+        return
+
     # Guard both branches: the offending slice is on the restickify's read, not
     # on the buffer we grow, so it defeats the producer-grow path just as it
     # defeats the clone path.
@@ -1035,7 +1071,6 @@ def _pad_restickify_input(
         return
 
     dtype = in_layout.dtype
-    host_size = [concretize_expr(s) for s in in_layout.size]
 
     in_fx = _find_arg_fx_node(in_dep.name)
     restickify_fx = next(iter(op.origins))
@@ -1089,13 +1124,11 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         match = _identify_restickify_candidate(op, graph)
         if match is None:
             continue
-        in_dep, in_buf, in_layout, host_size, new_stick_dim, in_stick_dim = match
+        in_dep, in_buf, in_layout, new_stick_dim, in_stick_dim = match
         # ComputedBuffer guaranteed by _identify_restickify_candidate
         assert isinstance(op, ComputedBuffer)
 
         _pad_restickify_output(op, in_dep, in_layout, in_stick_dim)
-
-        if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
-            continue
-
-        _pad_restickify_input(op, operations, in_dep, in_buf, in_layout, new_stick_dim)
+        _pad_restickify_input(
+            op, operations, in_dep, in_buf, in_layout, new_stick_dim, in_stick_dim
+        )
