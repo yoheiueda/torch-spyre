@@ -5937,6 +5937,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             expected[:, :, start:end].copy_(y)
         torch.testing.assert_close(x_spyre.cpu(), expected, atol=0.1, rtol=0.1)
 
+    def test_slice_stick_mutation_1d_no_alt_dim_raises(self):
+        """A stick-dim mutation on a 1D buffer that needs relocation raises.
+
+        Relocating an unsupported stick write means moving the stick onto a
+        different dimension, but a 1D tensor has no other dimension to move it
+        to.  Both an offset write (``[32:96]``) and a sub-stick write
+        (``[:32]``) into a full-stick 1D buffer therefore fail with a clear
+        Unsupported error rather than miscompiling.
+        """
+
+        def fn(x, y):
+            x[32:96].copy_(y)
+            return x.clone()
+
+        x = torch.randn(128, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, dtype=torch.float16, device="spyre")
+
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
+        with pytest.raises(Exception) as exc_info:
+            compiled(x, y)
+        assert "no offset-free alternative stick dim" in str(exc_info.value)
+
     def test_slice_synthetic_dims_cpu(self, x):
         def fn(x):
             return x[:, 1:2, :, :, :] + x[:, :, 2:3, :, :]
