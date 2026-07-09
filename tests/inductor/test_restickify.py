@@ -100,6 +100,37 @@ def _make_2d_tensors(s1, s2):
     return A, B, X, Y
 
 
+def _arange(*shape, base=0, span=1000):
+    """A distinct-value ramp that is EXACT in fp16.
+
+    Build the ramp in int64 and take the modulo BEFORE casting: fp16 cannot
+    represent integers above 2048 exactly (``torch.arange`` itself overflows to
+    inf past ~65504), and odd integers in (1024, 2048] are not representable, so
+    a direct fp16 arange — or any band reaching past 1023 — silently rounds and
+    turns the oracle's exact-equality check into a lie.
+
+    ``base + span`` must stay <= 1024 so every value lands on an exact fp16
+    integer (ULP < 1); a misplaced stick then shows up as a wrong value, never a
+    rounding artifact.  ``base`` lets a second argument occupy a disjoint band
+    from the first, so a swapped element is caught even between two cat inputs.
+    """
+    assert base + span <= 1024, f"band [{base}, {base + span}) exceeds fp16-exact 1024"
+    n = 1
+    for s in shape:
+        n *= s
+    ramp = (torch.arange(n, dtype=torch.int64) % span) + base
+    return ramp.to(torch.float16).reshape(shape)
+
+
+def _strict(fn, *args):
+    spyre = _compile_and_run(fn, args, DEVICE)
+    cpu = fn(*args)
+    shapes = [tuple(a.shape) for a in args]
+    assert torch.equal(spyre.cpu(), cpu), (
+        f"\nMISMATCH shapes={shapes}\n cpu   =\n{cpu}\n spyre =\n{spyre.cpu()}\n"
+    )
+
+
 # -------- Pointwise tests ----------
 
 # 2-arg tests — run on a full set of size pairs
@@ -859,3 +890,574 @@ def test_sparse_dense_pointwise_unsupported():
         InductorError, match="No mechanism to gather elements from multiple sticks"
     ):
         _compare(lambda a, b: a.sum(1) + b, a, b)
+
+
+# ------- Restickify padding: sliced input raises Unsupported ---------
+
+
+def test_pad_restickify_sliced_input_raises():
+    """A mid-stick-sliced input to transpose+clone must raise, not silently
+    corrupt output.
+
+    ``x[:, :, 1:66, :]`` slices dim -2 (which the transpose turns into the new
+    stick dim) at a non-stick-aligned start, so the read begins partway into a
+    stick.  This is unpaddable today, so the compiler must fail loudly rather
+    than return wrong data.
+    """
+    x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
+    with pytest.raises(
+        RuntimeError,
+        match="sliced input on host dim",
+    ):
+        _compile_and_run(
+            lambda x: x[:, :, 1:66, :].transpose(-2, -1).clone(), (x,), DEVICE
+        )
+
+
+def test_pad_restickify_sliced_producer_raises():
+    """A mid-stick slice fed by a *producer* must also raise, not miscompile.
+
+    Same geometry as test_pad_restickify_sliced_input_raises, but the ``+ 1``
+    makes the sliced tensor a produced (internal) buffer rather than a bare
+    graph input, exercising the other input path.  The slice is equally
+    unpaddable, so this path must also fail loudly rather than return wrong
+    data.
+    """
+    x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
+    with pytest.raises(
+        RuntimeError,
+        match="sliced input on host dim",
+    ):
+        _compile_and_run(
+            lambda x: (x + 1)[:, :, 1:66, :].transpose(-2, -1).clone(), (x,), DEVICE
+        )
+
+
+# ------- Restickify padding: sliced-transpose stick expr classification -------
+
+
+# Sliced transposes that ARE valid and must compile correctly, spanning the
+# range of slice placements: on the leading dim (which becomes non-stick), a
+# stick-aligned start on the becomes-stick dim, and aligned/1.5-stick extents on
+# the becomes-stick dim.  Contrast test_pad_restickify_sliced_input_raises, where
+# the slice lands mid-stick on the becomes-stick dim and must raise.
+OFFSET_STICK_OK = [
+    # Slice the leading dim (becomes non-stick after transpose).
+    (lambda x: x[3:67].transpose(0, 1).clone(), (128, 128)),
+    # Same, with an unaligned extent (63): still fine.
+    (lambda x: x[3:66].transpose(0, 1).clone(), (128, 128)),
+    # Stick-aligned slice start on the becomes-stick dim.
+    (lambda x: x[:, :, 64:128, :].transpose(-2, -1).clone(), (2, 2, 128, 128)),
+    # Slice on the becomes-stick dim, aligned (single-stick) extent.
+    (lambda x: x[:, 64:128].transpose(0, 1).clone(), (128, 128)),
+    # Slice on the becomes-stick dim, 1.5-stick extent.
+    (lambda x: x[:, :96].transpose(0, 1).clone(), (128, 128)),
+]
+
+
+@pytest.mark.parametrize(
+    "fn,shape", OFFSET_STICK_OK, ids=lambda p: p if isinstance(p, tuple) else ""
+)
+def test_sliced_transpose_stick_expr_compiles(fn, shape):
+    """A valid sliced transpose compiles correctly regardless of where the slice
+    lands or its extent -- only a mid-stick slice on the becomes-stick dim is
+    rejected (see test_pad_restickify_sliced_input_raises)."""
+    x = torch.randn(shape, dtype=torch.float16)
+    result = _compile_and_run(fn, (x,), DEVICE)
+    compare_with_cpu(fn, x, target=result, run_eager=False)
+
+
+# Strict versions of the becomes-stick-dim slices above: a slice that lands on
+# the dim the transpose turns into the stick is the case most likely to misplace
+# a stick lane, and randn + tolerance can mask that.  A distinct-value ramp with
+# torch.equal catches a single displaced lane exactly.
+@pytest.mark.parametrize(
+    "fn,shape", OFFSET_STICK_OK, ids=lambda p: p if isinstance(p, tuple) else ""
+)
+def test_sliced_transpose_stick_expr_strict(fn, shape):
+    x = _arange(*shape)
+    _strict(fn, x)
+
+
+# ------- Restickify padding: large tensors (tolerance oracle) ---------
+#
+# transpose(-2,-1)+clone with an unaligned new stick dim, padded up to a stick
+# boundary.  These tensors are too large for the fp16-exact ramp the strict
+# tests below use (``_arange`` caps at 1024 elements per value band), so they
+# compare ``randn`` data with a tolerance instead.  The exact geometry of every
+# small padded shape is covered strictly below.
+RESTICKIFY_PAD_LARGE_SIZES = [(1025, 1024), (2, 1025, 1024), (2, 2, 1025, 1024)]
+
+
+@pytest.mark.parametrize(
+    "shape", RESTICKIFY_PAD_LARGE_SIZES, ids=lambda p: "x".join(map(str, p))
+)
+def test_pad_large_transpose_clone(shape):
+    x = torch.randn(shape, dtype=torch.float16)
+    _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)
+
+
+# ------- Restickify input padding fused into a producer ---------
+#
+# When the restickify's input is produced by an internal op, the padding can be
+# folded into that producer instead of inserting a separate copy; a restickify
+# reading a bare graph input has no producer and falls back to the copy.  These
+# tests exercise both outcomes (asserting on the debug log which path fired) and
+# check that the result is correct either way.
+#
+# The tests put BOTH binary operands behind a computation so the transposed side
+# (not a bare graph input) is the one restickified -- a bare graph-input operand
+# would otherwise be the one chosen and hit the fallback.
+
+
+def _run_capturing_padding_log(fn, *args):
+    """Run fn on Spyre, returning (result, fused_fire_count, all_log_records)
+    captured from insert_restickify_padding's debug log."""
+    import logging
+
+    import torch_spyre._inductor.padding as _padding
+
+    records: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture()
+    prev_level = _padding.logger.level
+    _padding.logger.addHandler(handler)
+    _padding.logger.setLevel(logging.DEBUG)
+    try:
+        result = _compile_and_run(fn, args, DEVICE)
+    finally:
+        _padding.logger.removeHandler(handler)
+        _padding.logger.setLevel(prev_level)
+
+    fused = sum("fused pad into producer" in m for m in records)
+    return result, fused, records
+
+
+RESTICKIFY_FUSE_SIZES = [(67, 67), (2, 67, 67)]
+
+
+@pytest.fixture(params=RESTICKIFY_FUSE_SIZES, ids=lambda p: "x".join(map(str, p)))
+def fuse_tensors(request):
+    shape = request.param
+    x = torch.randn(shape, dtype=torch.float16)
+    y = torch.randn(shape, dtype=torch.float16)
+    return x, y
+
+
+def test_pad_fused_into_producer(fuse_tensors):
+    """(x*2).T + relu(y): the transposed side is an internal single-consumer
+    pointwise producer, so the padding fuses into it (no copy).  Both operands
+    are unaligned, so the same restickify needs both input and output padding."""
+    x, y = fuse_tensors
+
+    def fn(x, y):
+        return (x * 2).transpose(-2, -1) + torch.relu(y)
+
+    result, fused, _ = _run_capturing_padding_log(fn, x, y)
+    assert fused >= 1, "expected producer-fusion to fire, but it did not"
+    compare_with_cpu(fn, x, y, target=result, run_eager=False)
+
+
+def test_pad_fused_into_matmul_producer():
+    """A sliced matmul output (a@b)[:,c:]+z: the producer is a matmul
+    (a reduction), not a pointwise op.  It should still fuse rather than fall
+    back to a copy, and the result must be correct."""
+    a = torch.randn((67, 64), dtype=torch.float16)
+    b = torch.randn((64, 67), dtype=torch.float16)
+    z = torch.randn((67, 64), dtype=torch.float16)
+
+    def fn(a, b, z):
+        return (a @ b)[:, 3:] + z
+
+    result, fused, _ = _run_capturing_padding_log(fn, a, b, z)
+    assert fused >= 1, "matmul (Reduction) producer should fuse, not fall back"
+    compare_with_cpu(fn, a, b, z, target=result, run_eager=False)
+
+
+def test_pad_graph_input_falls_back():
+    """Restickifying a bare graph input has no producer to fuse into, so the
+    padding must fall back to a copy -- and still be correct."""
+    x = torch.randn((67, 67), dtype=torch.float16)
+    y = torch.randn((67, 67), dtype=torch.float16)
+
+    def fn(x, y):
+        return x.transpose(-2, -1) + y
+
+    result, fused, _ = _run_capturing_padding_log(fn, x, y)
+    assert fused == 0, "graph-input restickify should not fuse into a producer"
+    compare_with_cpu(fn, x, y, target=result, run_eager=False)
+
+
+def test_pad_multi_consumer_producer_fuses_with_coreader():
+    """A producer read by a restickify AND a non-restickify co-reader (here
+    p.sum()) still fuses, and the co-reader's result stays correct -- growing
+    the shared producer for the restickify does not disturb the other reader."""
+    x = torch.randn((67, 128), dtype=torch.float16)
+    z = torch.randn((128, 67), dtype=torch.float16)
+
+    def fn(x, z):
+        p = x * 2  # two consumers: the transpose (restickify) and the sum
+        return p.transpose(-2, -1) + z + p.sum()
+
+    result, fused, _ = _run_capturing_padding_log(fn, x, z)
+    assert fused >= 1, "producer with a non-restickify co-reader should still fuse"
+    compare_with_cpu(fn, x, z, target=result, run_eager=False)
+
+
+def test_pad_shared_all_restickify_consumers_fuse():
+    """A producer read only by restickify ops fuses even with several consumers.
+    Two transposes of the same producer take different new stick dims, so each
+    needs a different padding; both must apply and both results be correct."""
+    x = torch.randn((67, 53, 128), dtype=torch.float16)
+    za = torch.randn((128, 53, 67), dtype=torch.float16)
+    zb = torch.randn((67, 128, 53), dtype=torch.float16)
+
+    def fn(x, za, zb):
+        p = x * 2  # sole consumers are the two transposes below (restickifies)
+        return p.transpose(0, 2) + za, p.transpose(1, 2) + zb
+
+    result, fused, _ = _run_capturing_padding_log(fn, x, za, zb)
+    assert fused >= 1, "all-restickify shared producer should fuse"
+    compare_with_cpu(fn, x, za, zb, target=result, run_eager=False)
+
+
+def _is_restickify_op(op) -> bool:
+    """True when ``op`` is a spyre.restickify ComputedBuffer, detected via its
+    origin FX node's target."""
+    from torch._inductor.ir import ComputedBuffer
+
+    if not isinstance(op, ComputedBuffer):
+        return False
+    origins = op.origins
+    if not origins:
+        return False
+    return next(iter(origins)).target is torch.ops.spyre.restickify.default
+
+
+def _restickify_readers_by_source(fn, *args):
+    """Run fn on Spyre and return {producer_name: [restickify buffer names]},
+    a map of every source buffer to the restickify ops that read it, captured
+    from graph.operations right after insert_restickify splices them in."""
+    import torch_spyre._inductor.passes as _passes
+
+    insert_restickify = _passes.insert_restickify
+    by_source: dict[str, list[str]] = {}
+
+    def capturing_insert_restickify(graph):
+        insert_restickify(graph)
+        for op in graph.operations:
+            if not _is_restickify_op(op):
+                continue
+            for read in op.get_read_writes().reads:
+                name = getattr(read, "name", None)
+                if name is not None:
+                    by_source.setdefault(name, []).append(op.get_name())
+
+    with patch.object(_passes, "insert_restickify", capturing_insert_restickify):
+        _compile_and_run(fn, args, DEVICE)
+    return by_source
+
+
+def test_shared_producer_gets_two_restickify_nodes():
+    """insert_restickify keys its plan by consumer, not by source, so a producer
+    that fans out to two consumers each wanting a different layout gets a
+    *separate* restickify node per consumer -- both reading the one producer.
+    We assert the two-node shape directly rather than via the fusion log."""
+    x = torch.randn((67, 53, 128), dtype=torch.float16)
+    za = torch.randn((128, 53, 67), dtype=torch.float16)
+    zb = torch.randn((67, 128, 53), dtype=torch.float16)
+
+    def fn(x, za, zb):
+        p = x * 2  # sole consumers are the two transposes below (restickifies)
+        return p.transpose(0, 2) + za, p.transpose(1, 2) + zb
+
+    by_source = _restickify_readers_by_source(fn, x, za, zb)
+    shared = [src for src, readers in by_source.items() if len(readers) >= 2]
+    assert shared, (
+        "expected one producer read by >=2 restickify nodes, got "
+        f"{ {s: r for s, r in by_source.items()} }"
+    )
+
+
+# ------- Restickify padding: strict (distinct values + torch.equal) ---------
+#
+# The tolerance-based tests above compare ``randn`` data with atol=rtol=0.1,
+# whose fp16 value collisions in [-3, 3] can MASK an element landing in the
+# wrong stick.  The tests below feed a distinct-per-element ramp (``_arange``)
+# and require exact equality (``_strict``), so a single misplaced element fails.
+# They cover the transpose+clone geometries where a misplaced element is most
+# likely: an unaligned stick split across blocks, multiple leading batch dims,
+# and size-1 dims in or around the stick.
+
+SPLIT_2D = [(65, 4), (67, 4), (128, 67), (130, 33), (67, 128)]
+
+
+@pytest.mark.parametrize("shape", SPLIT_2D, ids=lambda p: f"{p[0]}x{p[1]}")
+def test_strict_2d_transpose_clone(shape):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(0, 1).clone(), x)
+
+
+# transpose(-2, -1).clone() with >=2 leading batch dims: every batch plane must
+# survive.  Covers a single stick block (..64..) and multiple blocks (..65..),
+# an unaligned middle (old-stick) dim of size 4, and deeper/larger batch nests.
+SPLIT_ND = [
+    (4, 91, 72),
+    (2, 3, 65, 4),
+    (2, 3, 64, 4),
+    (2, 2, 65, 64),
+    (3, 5, 65, 4),
+    (2, 4, 130, 33),
+    (2, 2, 3, 65, 4),
+    (2, 67, 128),  # single leading batch, unaligned new stick
+    (2, 2, 67, 128),  # two leading batch dims, unaligned new stick
+]
+
+
+@pytest.mark.parametrize("shape", SPLIT_ND, ids=lambda p: "x".join(map(str, p)))
+def test_strict_nd_transpose_clone(shape):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(-2, -1).clone(), x)
+
+
+# transpose(1, -1).clone() swaps an inner batch dim with the stick dim, a
+# different demoted-middle geometry than transpose(-2, -1).
+SPLIT_T1_LAST = [(2, 4, 67, 128), (2, 3, 65, 4), (2, 2, 67, 128)]
+
+
+@pytest.mark.parametrize("shape", SPLIT_T1_LAST, ids=lambda p: "x".join(map(str, p)))
+def test_strict_nd_transpose_1_last_clone(shape):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(1, -1).clone(), x)
+
+
+# transpose(0, -1).clone() swaps the OUTERMOST dim with the stick dim, with both
+# the source and destination stick dims sub-64 (e.g. 2 and 7) so neither fills a
+# full stick.  Must still place every element exactly.
+SPLIT_T0_LAST = [(7, 67, 2), (7, 65, 2), (5, 3, 2), (7, 67, 63)]
+
+
+@pytest.mark.parametrize("shape", SPLIT_T0_LAST, ids=lambda p: "x".join(map(str, p)))
+def test_strict_transpose_0_last_clone(shape):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(0, -1).clone(), x)
+
+
+# A size-1 dim IN the input stick ((7, 67, 1) etc.): the transpose moves this
+# size-1 dim out of the stick and a real dim in.  These shapes used to abort in
+# the backend or return garbage for all but the first plane; every element must
+# now come back correctly.
+#
+# The .exp() forces the restickify input to be an internal (produced) buffer
+# rather than a bare graph input, exercising the in-place producer path; the
+# graph-input path is covered by the next test.  A plain arithmetic op would be
+# constant-folded away, so a transcendental is used -- its last-ULP host/device
+# drift means this asserts allclose rather than the exact equality below.
+SIZE1_INPUT_STICK = [(7, 67, 1), (7, 65, 1), (5, 3, 1)]
+
+
+@pytest.mark.parametrize(
+    "shape", SIZE1_INPUT_STICK, ids=lambda p: "x".join(map(str, p))
+)
+def test_size1_input_stick_transpose_0_last_clone(shape):
+    def fn(x):
+        return x.exp().transpose(0, -1).clone()
+
+    x = torch.ones(*shape, dtype=torch.float16)
+    spyre = _compile_and_run(fn, (x,), DEVICE)
+    torch.testing.assert_close(spyre.cpu(), fn(x), atol=1e-2, rtol=1e-2)
+
+
+# Same size-1-in-stick shapes, but the restickify input is a bare graph input
+# (no .exp()), exercising the other input path.  A copy preserves the input
+# bit-for-bit, so this asserts exact equality on the ramp (unlike the allclose
+# above).
+@pytest.mark.parametrize(
+    "shape", SIZE1_INPUT_STICK, ids=lambda p: "x".join(map(str, p))
+)
+def test_size1_input_stick_transpose_0_last_clone_graph_input(shape):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(0, -1).clone(), x)
+
+
+# A size-1 dim in the input stick PLUS at least one more size-1 host dim
+# elsewhere, so more than one size-1 dim is present at once.  Result must be
+# correct regardless of where the extra size-1 dims sit; the interleaved
+# variants (a real dim between the size-1 dims) confirm placement does not
+# matter.
+#
+# Each entry is (shape, transpose_dims): the transpose swaps the size-1
+# input-stick dim with a real dim, and the two untouched dims are both size-1.
+SIZE1_MULTI_STICK = [
+    ((1, 1, 64, 1), (0, -1)),  # three size-1 dims (0, 1, 3)
+    ((1, 1, 67, 1), (0, -1)),  # three size-1 dims, unaligned stick
+    ((1, 5, 67, 1), (0, -1)),  # interleaved: size-1 at 0 and 3, real 5/67 between
+    ((7, 1, 64, 1), (1, 3)),  # interleaved: size-1 at 1 and 3, real 7/64 between
+    ((5, 1, 67, 1), (1, 3)),  # interleaved: size-1 at 1 and 3, real 5/67 between
+]
+
+
+@pytest.mark.parametrize(
+    "shape,dims",
+    SIZE1_MULTI_STICK,
+    ids=[f"{'x'.join(map(str, s))}_t{d}" for s, d in SIZE1_MULTI_STICK],
+)
+def test_size1_multi_input_stick_transpose_clone(shape, dims):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(*dims).clone(), x)
+
+
+# A size-1 dim in the input stick where a real batch/leading dim (extent > 1)
+# survives OUTSIDE both the old (size-1) and new sticks -- e.g. (4, 64, 1)
+# transpose(1, 2), whose batch dim 0 stays leading while dims 1 and 2 swap.
+# Every surviving batch plane must come back correct (non-first planes used to
+# be zeroed).
+#
+# The new (destination) stick is a full 64 here on purpose: an unaligned
+# destination would additionally need output-middle padding, covered separately
+# above.  Each entry is (shape, transpose_dims).
+SIZE1_SURVIVING_BATCH = [
+    ((4, 64, 1), (1, 2)),  # batch dim 0 = 4 survives; new stick = dim 1
+    ((2, 64, 1), (1, 2)),  # smaller batch
+    ((3, 5, 64, 1), (2, 3)),  # batch 3 + spatial 5 both survive; new stick dim 2
+    ((2, 2, 64, 1), (2, 3)),  # two leading dims survive
+    ((2, 3, 4, 64, 1), (3, 4)),  # deep batch nest
+]
+
+
+@pytest.mark.parametrize(
+    "shape,dims",
+    SIZE1_SURVIVING_BATCH,
+    ids=[f"{'x'.join(map(str, s))}_t{d}" for s, d in SIZE1_SURVIVING_BATCH],
+)
+def test_size1_input_stick_surviving_batch_transpose_clone(shape, dims):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(*dims).clone(), x)
+
+
+# A size-1 dim in the input stick PLUS a second size-1 host dim (leading or
+# middle) that is not itself part of either stick.  With two size-1 dims present
+# the transpose still has to place every real batch plane correctly regardless
+# of where the extra size-1 dim sits (non-first planes used to come back
+# zeroed).  Distinct-ramp + torch.equal catches a mis-placed plane exactly.
+SIZE1_EXTRA = [
+    ((1, 4, 64, 1), (2, 3)),  # extra size-1 leading (dim0)
+    ((4, 1, 64, 1), (2, 3)),  # extra size-1 in the middle (dim1)
+    ((1, 4, 1, 64, 1), (3, 4)),  # two extra size-1, batch outer
+    ((4, 1, 1, 64, 1), (3, 4)),  # two extra size-1, batch/size-1 interleaved
+    ((1, 1, 4, 64, 1), (3, 4)),  # two extra size-1, batch inner
+]
+
+
+@pytest.mark.parametrize(
+    "shape,dims",
+    SIZE1_EXTRA,
+    ids=[f"{'x'.join(map(str, s))}_t{d}" for s, d in SIZE1_EXTRA],
+)
+def test_size1_extra_dim_transpose_clone(shape, dims):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(*dims).clone(), x)
+
+
+# A size-1 dim in the input stick whose NEW stick dim spans >=2 stick blocks
+# (host size > 64), aligned or unaligned, with and without leading batch dims.
+# The second and later stick blocks used to be mis-placed even when aligned;
+# every block must now land correctly.  Distinct-ramp + torch.equal.
+SIZE1_MULTI_BLOCK = [
+    ((1, 128, 1), (1, 2)),  # 2 aligned blocks, no batch
+    ((1, 192, 1), (1, 2)),  # 3 aligned blocks, no batch
+    ((1, 67, 1), (1, 2)),  # 2 unaligned blocks, no batch
+    ((4, 128, 1), (1, 2)),  # 2 aligned blocks + batch 4
+    ((2, 128, 1), (1, 2)),  # 2 aligned blocks + batch 2
+    ((4, 67, 1), (1, 2)),  # 2 unaligned blocks + batch
+    ((4, 192, 1), (1, 2)),  # 3 blocks + batch
+    ((2, 3, 67, 1), (2, 3)),  # 2 unaligned blocks + leading batch nest
+]
+
+
+@pytest.mark.parametrize(
+    "shape,dims",
+    SIZE1_MULTI_BLOCK,
+    ids=[f"{'x'.join(map(str, s))}_t{d}" for s, d in SIZE1_MULTI_BLOCK],
+)
+def test_size1_multi_block_transpose_clone(shape, dims):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(*dims).clone(), x)
+
+
+# A restickify input sliced with a contiguous OFFSET on a NON-stick host dim
+# (e.g. x[1:3]), with an unaligned new stick (67) that needs padding.
+# This is a valid, paddable slice and must compile correctly (it used to be
+# refused).  Distinct-ramp + torch.equal catches a misplaced plane exactly.
+OFFSET_NONSTICK_INPUT = [
+    # Graph-input leading-dim offset (rows 1..2 of 4), unaligned new stick (67).
+    (lambda x: x[1:3].transpose(1, 2).clone(), (4, 67, 128)),
+    # Offset on a middle (non-leading, non-stick) dim.
+    (lambda x: x[:, 1:3].transpose(2, 3).clone(), (2, 4, 67, 128)),
+]
+
+
+@pytest.mark.parametrize(
+    "fn,shape",
+    OFFSET_NONSTICK_INPUT,
+    ids=["x".join(map(str, s)) for _, s in OFFSET_NONSTICK_INPUT],
+)
+def test_offset_nonstick_input_transpose_clone(fn, shape):
+    x = _arange(*shape)
+    _strict(fn, x)
+
+
+# A STRIDED (step > 1) read of a restickify input (``x[::2]``) is not paddable:
+# the strided rows are non-adjacent, so a copy would read the wrong data.  With
+# an unaligned new stick (67) that needs padding, this must fail loudly rather
+# than silently miscompile.
+def test_strided_input_transpose_clone_raises():
+    x = _arange(4, 67, 128)
+    with pytest.raises(RuntimeError, match="strided input on host dim"):
+        _compile_and_run(lambda x: x[::2].transpose(1, 2).clone(), (x,), DEVICE)
+
+
+# A BROADCAST read (a dim iterated wider than its size) coexisting with an
+# unaligned new-stick dim that needs padding.  The rope view
+# ``k.view(B, S, H, D)`` on a ``[B, S, H, 2, 1, D/2]`` input folds the size-2 dim
+# into the last dim, so after ``transpose(2, 3)`` that dim is read with a
+# zero-coefficient coord (``floor(v/64)`` / ``Mod(v, 64)``) -- a re-read, not a
+# stride.  Unlike ``x[::2]`` above, this is fine: codegen derives the read's
+# device strides from the device layout, so the broadcast reads correctly while
+# the unaligned new stick (S=67) is padded.  Every element must land exactly.
+def test_broadcast_input_transpose_clone():
+    def fn(k):
+        B, S, H = k.shape[0], k.shape[1], k.shape[2]
+        D = k.shape[-1] * 2
+        return k.view(B, S, H, D).transpose(1, 2).transpose(2, 3).clone()
+
+    x = _arange(1, 67, 1, 2, 1, 64)
+    _strict(fn, x)
+
+
+# Matmul with a SUB-STICK contraction dim (D) reached through a permuted key,
+# k.permute(0,2,3,1), which restickifies k into [B,H,D,Lk] with the sub-stick D
+# demoted to a non-stick device dim.  The permuted-key stick (Lk) projects back
+# onto D by free symbol, so the restickify alias guard used to skip padding for
+# ANY D -- but when D does not fill a whole stick (D=48) the widened read runs
+# past D's initialized lanes and the whole matmul came back wrong.  D must be
+# padded (and its K-tail zero-filled) so the contraction ignores the pad rows.
+# Small-span ramps keep the fp16 accumulation exact so torch.equal is a true
+# oracle; D spans sub-stick (33, 48), aligned (64), and multi-block (96) sizes.
+SUBSTICK_MATMUL_D = [33, 48, 63, 64, 96]
+
+
+@pytest.mark.parametrize("D", SUBSTICK_MATMUL_D, ids=lambda d: f"D{d}")
+def test_substick_contraction_permuted_key(D):
+    B, H, Lq, Lk = 2, 4, 16, 32
+    q = _arange(B, Lq, H, D, span=3)
+    k = _arange(B, Lk, H, D, span=3)
+
+    def fn(q, k):
+        return torch.matmul(q.permute(0, 2, 1, 3), k.permute(0, 2, 3, 1))
+
+    _strict(fn, q, k)

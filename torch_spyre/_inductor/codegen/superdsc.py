@@ -31,6 +31,7 @@ from torch_spyre._inductor.constants import (
     TOPK_OPS,
 )
 from torch_spyre._inductor import config as _spyre_config
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
@@ -619,6 +620,20 @@ def _ref_arg(op_spec):
     return op_spec.args[-1]
 
 
+def _round_up_to_stick(
+    sdsc_iteration_space: dict,
+    sym,
+    stick_size: int,
+    caller: str,
+) -> None:
+    """Round ``sdsc_iteration_space[sym]`` up to the next stick boundary."""
+    cur = sdsc_iteration_space[sym]
+    padded = ((cur + stick_size - 1) // stick_size) * stick_size
+    if padded > cur:
+        logger.debug("%s: extending %s %d -> %d", caller, sym, cur, padded)
+        sdsc_iteration_space[sym] = padded
+
+
 def _extend_matmul_k_to_padded(
     op_spec: OpSpec,
     sdsc_iteration_space: dict,
@@ -680,21 +695,275 @@ def _extend_matmul_k_to_padded(
     # allocation's K extent, not the slice's logical K, so it can be larger
     # than the matmul's actual K and would over-extend the iteration space.
     stick_size = y_arg.device_dtype.elems_per_stick()
-    k_current = sdsc_iteration_space[k_sym]
-    k_padded = ((k_current + stick_size - 1) // stick_size) * stick_size
+    _round_up_to_stick(
+        sdsc_iteration_space, k_sym, stick_size, "_extend_matmul_k_to_padded"
+    )
 
-    if k_padded > k_current:
-        logger.debug(
-            "_extend_matmul_k_to_padded: extending K %d -> %d (sym=%s)",
-            k_current,
-            k_padded,
-            k_sym,
+
+def _has_indirect_access(args) -> bool:
+    """True if any arg carries an IndirectAccess in its device coordinates.
+
+    The elided-stick restore rewrites assume plain affine coordinates; any
+    indirect access disqualifies the pattern.
+    """
+    return any(
+        isinstance(c, IndirectAccess) for arg in args for c in arg.device_coordinates
+    )
+
+
+def _fresh_restore_symbol(op_spec: OpSpec) -> Symbol:
+    """Return an ``rs{n}`` symbol distinct from every iteration-space symbol."""
+    used = set(op_spec.iteration_space.keys())
+    idx = 0
+    while Symbol(f"rs{idx}") in used:
+        idx += 1
+    return Symbol(f"rs{idx}")
+
+
+def _rebind_stick_coords(coords: list, sym: Symbol, stick_size: int, ctx: str) -> None:
+    """Rebind an operand's collapsed stick coords to carry ``sym`` in place.
+
+    The within-stick (last) coord and the outer-split slot are both the
+    constant ``0`` for an elided size-1 stick; rewrite them to the N>=2
+    ``[floor(sym/64), ..., Mod(sym, 64)]`` form so ``sym`` becomes this
+    operand's stick dim.  Mutates ``coords``; raises if no outer-split slot
+    (a symbol-free non-within coord) exists.
+    """
+    within_idx = len(coords) - 1
+    outer_candidates = [i for i in range(within_idx) if not coords[i].free_symbols]
+    if not outer_candidates:
+        raise Unsupported(
+            f"{ctx}: cannot restore elided stick dim "
+            "(no outer-split slot to carry the restored symbol)"
         )
-        sdsc_iteration_space[k_sym] = k_padded
+    coords[outer_candidates[0]] = floor(sym / stick_size)
+    coords[within_idx] = Mod(sym, stick_size)
+
+
+def _restore_elided_restickify_stick(op_spec: OpSpec) -> OpSpec:
+    """Restore the size-1 input-stick dim that upstream Inductor elided.
+
+    For ``x.transpose(0, -1).clone()`` whose transpose *source* stick dim has
+    host size 1, upstream Inductor never creates a loop symbol for that size-1
+    dim, so the restickify's INPUT operand carries a constant ``0`` where the
+    N>=2 case carries a live within-stick symbol.  The result is a 2-dim
+    iteration space with no KERNEL data-stage; the backend cannot build a
+    dimension mapping for the transpose and aborts (``dxp_standalone`` SIGABRT).
+
+    The SDSC does not encode how many real items live inside a stick, so N=2
+    and N=63 emit byte-identical descriptors.  We reproduce that same 3-dim
+    descriptor for the size-1 case by restoring the elided stick as a fresh
+    iteration symbol at the padded stick size (64):
+
+      - INPUT (arg0): its ``device_size`` already carries the padded-64 stick
+        slot; only its within-stick / outer-split coordinates are the constant
+        ``0``.  We rebind them to ``Mod(sym, 64)`` / ``floor(sym / 64)`` so the
+        restored symbol becomes the input's stick dim.
+      - OUTPUT (arg1): it is genuinely missing the 64-wide non-stick slot (its
+        elided dim collapsed to ``device_size`` 1 with a ``0`` coordinate).  We
+        widen that slot to 64 and bind the restored symbol as a pass-through
+        non-stick dim.
+
+    Both rewrites are done on ``dataclasses.replace`` copies; the shared
+    physical layouts are never mutated.  Returns ``op_spec`` unchanged unless
+    the tightly-gated elided-input-stick pattern is detected.
+    """
+    if len(op_spec.args) != 2:
+        return op_spec
+
+    in_arg, out_arg = op_spec.args[0], op_spec.args[1]
+
+    # Any indirect access disqualifies the pattern.
+    if _has_indirect_access((in_arg, out_arg)):
+        return op_spec
+
+    def _within_stick_free(arg: TensorArg) -> bool:
+        return bool(arg.device_coordinates[-1].free_symbols)
+
+    # Gate: input within-stick coord is symbol-free (elided) while output's is
+    # a live symbol.  Only the size-1-input-stick case reaches this state.
+    if _within_stick_free(in_arg) or not _within_stick_free(out_arg):
+        return op_spec
+
+    stick_size = in_arg.device_dtype.elems_per_stick()
+    sym = _fresh_restore_symbol(op_spec)
+
+    # Prepend the restored symbol as the outermost iteration dim so the SDSC
+    # dim labels resolve to [mb, ...] (matching the N>=2 descriptor).
+    new_iteration_space = {sym: (stick_size, 1), **op_spec.iteration_space}
+
+    # The output's within-stick coordinate carries the NEW stick symbol (the
+    # transpose target).  The restored old stick must land in the output's
+    # middle coords at the same rank the new stick occupies among the input's
+    # coords -- see the OUTPUT rewrite below.
+    new_stick_syms = out_arg.device_coordinates[-1].free_symbols
+    new_stick_pos = next(
+        (
+            i
+            for i, c in enumerate(in_arg.device_coordinates)
+            if c.free_symbols & new_stick_syms
+        ),
+        None,
+    )
+
+    # INPUT: rebind the outer-split and within-stick coordinate slots (currently
+    # the constant 0) to carry the restored symbol as this operand's stick dim.
+    in_coords = list(in_arg.device_coordinates)
+    _rebind_stick_coords(in_coords, sym, stick_size, "restickify")
+    new_in = dataclasses.replace(in_arg, device_coordinates=in_coords)
+
+    # OUTPUT: the elided dim collapsed to a (size-1, constant-0) slot; drop it
+    # and insert the restored symbol as a padded-64 pass-through non-stick dim.
+    #
+    # Position matters when a batch/spatial dim survives between the old and new
+    # sticks.  In the N>=2 descriptor the old stick lands in the middle coords at
+    # the rank the NEW stick occupies among the INPUT's coords (transpose swaps
+    # the two sticks' slots; every surviving dim keeps its place).  Reproduce
+    # that rank instead of always sitting adjacent to the within-stick coord --
+    # the latter mis-strides the surviving batch dim and zeroes its non-first
+    # planes (see test_size1_input_stick_surviving_batch_transpose_clone).
+    out_coords = list(out_arg.device_coordinates)
+    out_size = list(out_arg.device_size)
+    elided_out = [
+        i
+        for i in range(len(out_coords) - 1)
+        if not out_coords[i].free_symbols and out_size[i] == 1
+    ]
+    if not elided_out:
+        raise Unsupported(
+            "restickify: cannot restore elided input-stick dim "
+            "(no collapsed output slot to widen)"
+        )
+    out_idx = elided_out[0]
+    del out_coords[out_idx]
+    del out_size[out_idx]
+    insert_at = new_stick_pos if new_stick_pos is not None else len(out_coords) - 1
+    # A multi-block new stick (host size > 64) splits into a tile-count device
+    # dim carrying floor(new_stick / 64) plus the within-stick Mod term.  That
+    # tile-count dim already occupies new_stick_pos (the new stick's input rank),
+    # so the restored old stick belongs one slot EARLIER -- immediately outer to
+    # the block dim, reproducing the N>=2 sibling's [.., old_stick, block, ..]
+    # device order.  Inserting at new_stick_pos itself would land the old stick
+    # AFTER the block dim, giving the grown size-1 alloc a stride that collides
+    # with the block/batch host mapping in get_dim_map and mis-places the 2nd+
+    # stick block (see test_size1_multi_block_transpose_clone).  A single-block
+    # new stick has no real tile-count dim (its floor(.) slot is degenerate,
+    # extent 1), so new_stick_pos is already correct and the surviving-batch rule
+    # above stands unchanged.
+    multi_block = any(
+        out_size[i] >= 2
+        and out_coords[i].has(floor)
+        and (out_coords[i].free_symbols & new_stick_syms)
+        for i in range(len(out_coords) - 1)  # exclude within-stick
+    )
+    if multi_block and insert_at > 0:
+        insert_at -= 1
+    out_coords.insert(insert_at, sym)
+    out_size.insert(insert_at, stick_size)
+    new_out = dataclasses.replace(
+        out_arg, device_coordinates=out_coords, device_size=out_size
+    )
+
+    return dataclasses.replace(
+        op_spec, iteration_space=new_iteration_space, args=[new_in, new_out]
+    )
+
+
+def _restore_elided_producer_stick(op_spec: OpSpec) -> OpSpec:
+    """Restore the size-1 stick iteration symbol that upstream Inductor elided
+    from a pointwise producer whose output feeds a restickify.
+
+    Companion to ``_restore_elided_restickify_stick``.  When the transpose
+    source stick dim has host size 1 (e.g. ``ones(5, 3, 1).exp().transpose(
+    0, -1).clone()``), the restickify's *producer* (here the ``exp``) also loses
+    the stick loop symbol: its output stick host dim is size 1, so upstream
+    Inductor never emits a within-stick iteration variable and every operand's
+    within-stick coordinate collapses to the constant ``0``.
+
+    ``insert_restickify_padding`` (``_pad_restickify_input``, producer grow)
+    already grows the producer OUTPUT's device stick slot to the padded 64, so
+    physically the buffer holds a full stick -- but with no iteration symbol
+    only lane 0 is written, and the restickify (forced to the N>=2 3-symbol form
+    by ``_restore_elided_restickify_stick``) reads all 64 lanes across the wrong
+    dim.  The two operands then disagree on which dim carries the stick and only
+    the aligned plane survives.
+
+    Restoring a fresh outer iteration symbol bound to the (already 64-wide)
+    output stick slot makes the producer emit the same 3-symbol descriptor as
+    N>=2, so producer and restickify agree.  A pointwise op maps input to output
+    coordinate-for-coordinate, so the same rebind applies to every operand.
+
+    Gated to leave every other op untouched: the output stick device slot must
+    already be the padded stick size (only the bumped size-1 case reaches this)
+    and every operand's within-stick coordinate must be the symbol-free ``0``.
+    """
+    args = op_spec.args
+    if len(args) < 2:
+        return op_spec
+    out_arg = args[-1]
+
+    if _has_indirect_access(args):
+        return op_spec
+
+    stick_size = out_arg.device_dtype.elems_per_stick()
+
+    # Gate: the output's within-stick device slot is already the padded stick
+    # size (bumped by insert_restickify_padding) but carries no iteration symbol
+    # -- a state only the elided size-1 producer stick reaches.
+    if out_arg.device_size[-1] != stick_size:
+        return op_spec
+    if any(arg.device_coordinates[-1].free_symbols for arg in args):
+        return op_spec
+
+    sym = _fresh_restore_symbol(op_spec)
+    new_iteration_space = {sym: (stick_size, 1), **op_spec.iteration_space}
+
+    # Each operand's within-stick coord (last) and its outer-split slot are the
+    # constant 0; rebind them to carry the restored symbol as this operand's
+    # stick dim, mirroring the N>=2 [floor(sym/64), ..., Mod(sym, 64)] form.
+    new_args = []
+    for arg in args:
+        coords = list(arg.device_coordinates)
+        _rebind_stick_coords(coords, sym, stick_size, "restickify producer")
+        new_args.append(dataclasses.replace(arg, device_coordinates=coords))
+
+    return dataclasses.replace(
+        op_spec, iteration_space=new_iteration_space, args=new_args
+    )
+
+
+def _extend_restickify_to_padded(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    """Round sdsc_iteration_space[stick_sym] up to a stick boundary for each
+    restickify arg.  Both input (old stick) and output (new stick) may carry
+    the unaligned iter, so we extend per-arg.
+
+    Running before ``_create_sdsc_tensors`` keeps backGap correct: the
+    unaligned-stick arg gets dev_dim_size==it_dim_size on the within-stick
+    axis (no backGap), and the other arg's outer-split strides are computed
+    against the padded extent (no stale-stride mismatch with the later
+    widening done by ``_get_padded_iteration_space``).
+    """
+    for arg in op_spec.args:
+        _, stick_sym = _get_device_dim_order(arg, symbol_mapping)
+        if stick_sym is None or stick_sym not in sdsc_iteration_space:
+            continue
+        stick_size = arg.device_dtype.elems_per_stick()
+        _round_up_to_stick(
+            sdsc_iteration_space, stick_sym, stick_size, "_extend_restickify_to_padded"
+        )
 
 
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
+    is_restickify = op_spec.op == RESTICKIFY_OP
+    if is_restickify:
+        op_spec = _restore_elided_restickify_stick(op_spec)
+    elif not is_matmul:
+        op_spec = _restore_elided_producer_stick(op_spec)
     ndim = len(op_spec.iteration_space)
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
@@ -769,6 +1038,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+    elif is_restickify:
+        _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,
@@ -798,7 +1069,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[0]],
             [args[0].dim_order],
         )
-    elif op_spec.op == RESTICKIFY_OP:
+    elif is_restickify:
         # Pad iteration space using all args so both the old stick (input) and
         # new stick (output) are rounded up to the nearest stick boundary.
         pad_args, pad_sdsc_args, dim_order = (
@@ -818,7 +1089,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     # For restickify, update backGaps based on the padded iteration space,
     # since non-stick dimensions may now have it_dim_size > dev_dim_size.
-    if op_spec.op == RESTICKIFY_OP:
+    if is_restickify:
         for sdsc_arg, op_spec_arg in zip(args, op_spec.args):
             layout = layouts[sdsc_arg.layout]
             stick_dim = layout["stick_dim_order"]

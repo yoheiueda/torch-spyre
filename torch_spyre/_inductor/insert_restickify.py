@@ -20,8 +20,7 @@ import torch
 from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .loop_info import copy_op_metadata
-from .pass_utils import copy_fx_custom_meta
+from .pass_utils import copy_fx_custom_meta, redirect_computed_buffer_reads
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -34,7 +33,6 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch_spyre._C import SpyreTensorLayout
-from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 
 from torch.utils._ordered_set import OrderedSet
@@ -63,24 +61,6 @@ def _record_restickify(
     restickify_plan[op.get_name()].append(
         {"arg_name": dep_name, "target_layout": target_layout}
     )
-
-
-class NameSwapHandler(WrapperHandler):
-    """
-    Wrapper to patch a node's inner_fn to use new buffer names after inserting
-    nodes upstream that change the input buffers.
-
-    This is the canonical example of the correct WrapperHandler wrapping
-    pattern for compiler passes. See CLAUDE.md "Compiler Pass Conventions"
-    and issue #2797.
-    """
-
-    def __init__(self, inner, name_map: dict[str, str]):
-        super().__init__(inner)
-        self._name_map = name_map
-
-    def load(self, name, index):
-        return super().load(self._name_map.get(name, name), index)
 
 
 def _create_restickify_node(
@@ -174,35 +154,9 @@ def insert_restickify_on_node_inputs(
         operations.insert(op_index, restick_buff)
         op_index += 1  # consumer shifted right by 1
 
-    # Patch inner_fn once with the full name_map covering all restickified args.
-    orig_inner = op.data.inner_fn
-
-    def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
-        with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
-            return _orig_inner(*args)
-
-    object.__setattr__(op.data, "inner_fn", new_inner_fn)
-
-    # Reconstruct ComputedBuffer as a fresh object so the instance-keyed cache
-    # on get_default_sizes_body can be cleanly invalidated below.
-    new_consumer_buffer = ComputedBuffer(
-        name=op.get_name(),
-        layout=op.layout,
-        data=op.data,
-        _split_size=op._split_size,
-        _original_inner_fn=op._original_inner_fn,
-        _original_ranges=op._original_ranges,
-        _original_reduction_ranges=op._original_reduction_ranges,
-    )
-    new_consumer_buffer.operation_name = op.operation_name
-    new_consumer_buffer.origins = op.origins
-    copy_op_metadata(op, new_consumer_buffer)
-    # Replace op in the operations list with the reconstructed buffer.
-    operations[op_index] = new_consumer_buffer
-    V.graph.name_to_buffer[new_consumer_buffer.get_name()] = new_consumer_buffer
-
-    # Invalidate the sizes/body cache so it is recomputed on next access with the patched inner_fn.
-    ComputedBuffer.get_default_sizes_body.clear_cache(new_consumer_buffer)
+    # Patch inner_fn with the full name_map and reconstruct the consumer so its
+    # sizes/body cache is invalidated (carries _size1_stick_alloc_dim across).
+    redirect_computed_buffer_reads(op, name_map, operations)
 
 
 def insert_restickify(graph: GraphLowering) -> None:

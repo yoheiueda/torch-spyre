@@ -150,6 +150,23 @@ def _output_stl_from_stick_expr(
     return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim)
 
 
+def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[int]]:
+    """Split ``dims`` into (aligned, unaligned) by their extent in ``sizes``.
+
+    A caller scans the aligned dims first (no padding needed) and only falls
+    back to the unaligned dims when the aligned group yields nothing; the
+    unaligned dim it then picks is padded up to a stick boundary later by
+    ``insert_restickify_padding`` (See #1756).
+    """
+    aligned, unaligned = [], []
+    for dim in dims:
+        if concretize_expr(sizes[dim]) % stick_size == 0:
+            aligned.append(dim)
+        else:
+            unaligned.append(dim)
+    return aligned, unaligned
+
+
 def _make_output_stl(
     output, output_dep, c_size, c_stride, stick_dim
 ) -> SpyreTensorLayout | None:
@@ -182,17 +199,17 @@ def _candidate_output_stls(
     out_coords = host_coordinates(output, output_dep, None)
     skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
 
-    result = []
-    for alt_stick_dim in range(len(output.size)):
-        if alt_stick_dim == skip_dim:
-            continue
-        if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
-            # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
-            continue
-        stl = _make_output_stl(output, output_dep, c_size, c_stride, alt_stick_dim)
-        if stl is not None:
-            result.append(stl)
-    return result
+    dims = [d for d in range(len(output.size)) if d != skip_dim]
+    aligned_dims, unaligned_dims = _dims_by_alignment(dims, output.size, stick_size)
+    stls: list[SpyreTensorLayout] = []
+    for group in (aligned_dims, unaligned_dims):
+        for d in group:
+            stl = _make_output_stl(output, output_dep, c_size, c_stride, d)
+            if stl is not None:
+                stls.append(stl)
+        if stls:
+            break
+    return stls
 
 
 def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
@@ -298,31 +315,35 @@ def _single_arg_op_layout(
             if out_stl is not None:
                 return [out_stl]
 
-        # Try alternative layouts when input layout is not supported
+        # Try alternative layouts when input layout is not supported.
+        # Skip the dim already known to produce an unsupported stick.
         in_coords = host_coordinates(in_layout, dep, None)
         out_coords = host_coordinates(output, output_dep, None)
-        stick_dim = matching_dim(in_coords, x_stick_expr)
-        layouts = []
-        for in_dim in range(len(in_layout.size)):
-            if in_dim == stick_dim:
-                continue
-            if concretize_expr(in_layout.size[in_dim]) % stick_size != 0:
-                # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
-                continue
-            in_coord = in_coords[in_dim]
-            # Map input dim to output dim. If input dim carries reduction var, it's collapsed
-            if reduction_var is not None and reduction_var in in_coord.free_symbols:
-                out_stick_dim = -1
-            else:
-                out_stick_dim = _pick_stick_dim(in_coord, out_coords)
-                if out_stick_dim < 0:
-                    continue
-            out_stl = _make_output_stl(
-                output, output_dep, c_size, c_stride, out_stick_dim
-            )
-            if out_stl is not None:
-                layouts.append(out_stl)
+        skip_in_dim = matching_dim(in_coords, x_stick_expr)
 
+        dims = [d for d in range(len(in_layout.size)) if d != skip_in_dim]
+        aligned_dims, unaligned_dims = _dims_by_alignment(
+            dims, in_layout.size, stick_size
+        )
+        layouts: list[SpyreTensorLayout] = []
+        for group in (aligned_dims, unaligned_dims):
+            for in_dim in group:
+                in_coord = in_coords[in_dim]
+                # Map input dim to output dim. If input dim carries reduction
+                # var, it's collapsed
+                if reduction_var is not None and reduction_var in in_coord.free_symbols:
+                    out_stick_dim = -1
+                else:
+                    out_stick_dim = _pick_stick_dim(in_coord, out_coords)
+                    if out_stick_dim < 0:
+                        continue
+                out_stl = _make_output_stl(
+                    output, output_dep, c_size, c_stride, out_stick_dim
+                )
+                if out_stl is not None:
+                    layouts.append(out_stl)
+            if layouts:
+                break
         return layouts
 
     # Single-arg pointwise
@@ -847,13 +868,16 @@ def _multi_arg_pointwise_layouts(
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
             _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
 
-    # Try alternative layouts if no valid layouts found
+    # Try alternative layouts if no valid layouts found.  The last dim is the
+    # within-stick dim, never a stick candidate here.
     if not results:
-        for alt_stick_dim in range(len(output.size) - 1):
-            # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
-            if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
-                continue
-            _try_stick_dim(alt_stick_dim)
+        dims = range(len(output.size) - 1)
+        aligned_dims, unaligned_dims = _dims_by_alignment(dims, output.size, stick_size)
+        for group in (aligned_dims, unaligned_dims):
+            for alt_stick_dim in group:
+                _try_stick_dim(alt_stick_dim)
+            if results:
+                break
 
     if not results:
         raise Unsupported(

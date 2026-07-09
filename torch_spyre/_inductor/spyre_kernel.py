@@ -51,6 +51,7 @@ from .pass_utils import (
     apply_splits_from_index_coeff,
     iteration_space,
     indirect_access_subs_from_kernel,
+    is_restickify,
 )
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
@@ -806,10 +807,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 ]
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
-            if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
-                # Broadcast: scalar input expanding to non-scalar output.
-                op = IDENTITY_OP
-            elif in_coords[-1].free_symbols != out_coords[-1].free_symbols:
+            if is_restickify(in_coords, out_coords):
                 op = RESTICKIFY_OP
             else:
                 op = IDENTITY_OP
