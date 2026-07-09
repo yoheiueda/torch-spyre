@@ -576,13 +576,6 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     if new_stick_dim == in_stick_dim:
         return None
 
-    # A broadcast read (a host dim iterated wider than its size, e.g. a size-2 rope
-    # dim read 128x) is fine here: the broadcast host coord has a zero per-step
-    # coefficient (``floor(d1/64)``, ``Mod(d1, 64)``), so codegen derives the read's
-    # device strides from the device layout, not the host coefficient, and reads the
-    # repeated block correctly.  Growing the (different) new-stick dim leaves the
-    # broadcast dim untouched.  Only a real stride (coeff not in {0, 1}) is
-    # unpaddable, and ``_assert_input_not_sliced`` rejects that on the padding path.
     return in_dep, in_buf, in_layout, new_stick_dim, in_stick_dim
 
 
@@ -926,52 +919,58 @@ def lower_identity_clone(
     return clone_buf, new_ops
 
 
-def _assert_input_not_sliced(
+def _assert_input_paddable(
     op: ComputedBuffer, in_dep, in_layout, new_stick_dim: int
 ) -> None:
-    """Raise ``Unsupported`` for restickify inputs whose slice neither input-pad
-    path can carry.
+    """Raise ``Unsupported`` for restickify inputs the stick-boundary grow cannot
+    pad, classifying each input dim's read by its coordinate.
 
-    Both input-pad paths grow the read buffer's device_size on the dim carrying
-    ``new_stick_dim`` to the stick boundary; neither can re-base a read that
-    begins partway into a stick.  Two slice shapes are unpaddable:
+    The grow widens the read to a stick boundary; it cannot re-base a read that
+    begins partway into a stick (a stick has no start offset -- it always begins
+    at its first element), nor gather non-adjacent rows.  Two read shapes are
+    unpaddable and must fail loudly, not miscompile:
 
-    - A slice on the **new-stick dim** starts the read partway into a stick, so
-      the stick-boundary grow reads the wrong lanes -- fail loudly.  This holds
-      for *both* the producer-grow and the identity-clone paths: the slice sits
-      on the read feeding the restickify regardless of which buffer we grow, so
-      the displacement (``Mod(v + c, 64)``) survives into codegen either way.
-    - A **strided** read of any host dim (coord ``k*var``, k not in {0, 1}: step > 1
-      or reversed) picks non-contiguous rows, but codegen's offset/gap primitive
-      masks a *contiguous* tail (``backGap = dev_dim_size - it_dim_size``), so a
-      stride would silently read the wrong rows -- fail loudly.
+    - **Strided** read of any dim (coord ``k*var``, k not in {0, 1}: step > 1 or
+      reversed), e.g. ``x[::2].transpose(1, 2).clone()``.  Codegen masks only a
+      *contiguous* tail, so it would silently read the wrong rows.
+    - **Narrowing slice on the new-stick dim** (iter range < dim size), e.g.
+      ``x[:, :, 1:66, :].transpose(-2, -1).clone()``, whose slice becomes the new
+      stick and starts partway into a stick.  Both input-pad paths grow the read
+      feeding the restickify, so the displacement survives into codegen either way.
 
-    A **contiguous offset** on a non-stick host dim (coord ``var + c``) is fine:
-    the offset region is included and the read dep's index is preserved verbatim,
-    so codegen's general offset/gap primitive (``dev_dim_size > it_dim_size``)
-    emits the correct offset and backGap.
+    TODO: both raises are removable by double-restickifying -- a re-base copy that
+    reads the sliced/strided source and materializes a fresh buffer starting at a
+    stick boundary, then restickifies that (the grow can pad such a buffer).
 
-    A **broadcast** read (coord with a zero coefficient, ``floor(v/64)`` or
-    ``Mod(v, 64)``, iterated wider than the dim size) is also fine: codegen derives
-    the read's device strides from the device layout, not the host coefficient, and
-    reads the repeated block correctly.  It is left to flow through (only a real
-    stride is refused), so growing the separate new-stick dim still pads other dims.
+    Two read shapes are fine and flow through unchanged:
+
+    - **Contiguous offset** on a non-stick dim (coord ``var + c``), e.g.
+      ``x[:, 1:, :]``: codegen's offset/gap primitive carries it.
+    - **Broadcast** read: a dim iterated wider than its size, so the same elements
+      are re-read, e.g. ``k.view(B, S, H, D).transpose(1, 2).transpose(2, 3)`` on a
+      ``[B, S, H, 2, 1, D/2]`` input, whose folded size-2 dim is read repeatedly.
+      Its coordinate has a zero coefficient (``floor(v/64)`` / ``Mod(v, 64)`` --
+      the loop var does not advance the read position), which is why it is not a
+      stride: codegen takes the read's strides from the device layout rather than
+      this coefficient, so the repeated block is read correctly.  The broadcast dim
+      is never the dim we grow, so it is left as-is while the new-stick dim is
+      padded (see ``test_broadcast_input_transpose_clone``).
     """
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     for i, coord in enumerate(in_host_coords):
         sym = _single_free_sym(coord)
         if sym is None:  # degenerate size-1 host dim, nothing to slice
             continue
-        # A strided read (coord ``k*var``, k not in {0, 1}: step > 1 or reversed) is
-        # not carried by codegen's contiguous-tail backGap, on any dim -- refuse it.
-        # A broadcast read has a zero coefficient (``floor(v/64)``, ``Mod(v, 64)``);
-        # codegen derives its device strides from the device layout, not this host
-        # coefficient, and reads the repeated block correctly, so it is not a stride.
+        # Strided (k not in {0, 1}), on any dim: codegen carries only a contiguous
+        # tail.  A broadcast (coeff 0) is read from the device layout, not this
+        # coefficient, so it is not a stride and is left to flow through.
         if concretize_expr(coord.coeff(sym)) not in (0, 1):
             raise Unsupported(
                 f"insert_restickify_padding: strided input on host dim "
                 f"{i} of {op.get_name()} (coord {coord}) is not supported"
             )
+        # A narrowing slice matters only on the new-stick dim (it starts the read
+        # partway into a stick); a narrowed non-stick dim is a carried offset.
         if i != new_stick_dim:
             continue
         iter_range = concretize_expr(in_dep.ranges[sym])
@@ -1047,12 +1046,13 @@ def _pad_restickify_input(
     The clone's grow is device_size-only (``grow_host_dim=None``) while the
     producer's also grows host_size -- see ``_grow_input_stick_dim`` for why.
 
-    A slice the grow cannot carry (mid-stick start on the new-stick dim, or a
-    strided read) is refused loudly (``_assert_input_not_sliced``) up front,
-    before either branch: the slice sits on the read feeding the restickify, so
-    growing the producer we own does not undo it any more than growing a clone
-    would.  The producer branch is grown in place with no separate read, so the
-    guard is the only thing standing between it and a silent miscompile.
+    A read the grow cannot carry (mid-stick start on the new-stick dim, or a
+    strided read) is refused loudly (``_assert_input_paddable``) up front, before
+    either branch: the read feeding the restickify is the same regardless of which
+    buffer we grow, so growing the producer we own does not undo it any more than
+    growing a clone would.  The producer branch is grown in place with no separate
+    read, so the guard is the only thing standing between it and a silent
+    miscompile.
     """
     host_size = [concretize_expr(s) for s in in_layout.size]
     if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
@@ -1060,10 +1060,10 @@ def _pad_restickify_input(
     if _new_stick_aliases_input_stick(op, in_dep, in_layout, host_size, in_stick_dim):
         return
 
-    # Guard both branches: the offending slice is on the restickify's read, not
-    # on the buffer we grow, so it defeats the producer-grow path just as it
-    # defeats the clone path.
-    _assert_input_not_sliced(op, in_dep, in_layout, new_stick_dim)
+    # Guard both branches: the offending read is the restickify's, not the buffer
+    # we grow, so it defeats the producer-grow path just as it defeats the clone
+    # path.
+    _assert_input_paddable(op, in_dep, in_layout, new_stick_dim)
 
     if isinstance(in_buf, ComputedBuffer) and _grow_input_stick_dim(
         in_buf, new_stick_dim, grow_host_dim=new_stick_dim

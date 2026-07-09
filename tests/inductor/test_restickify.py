@@ -1421,6 +1421,24 @@ def test_strided_input_transpose_clone_raises():
         _compile_and_run(lambda x: x[::2].transpose(1, 2).clone(), (x,), DEVICE)
 
 
+# A BROADCAST read (a dim iterated wider than its size) coexisting with an
+# unaligned new-stick dim that needs padding.  The rope view
+# ``k.view(B, S, H, D)`` on a ``[B, S, H, 2, 1, D/2]`` input folds the size-2 dim
+# into the last dim, so after ``transpose(2, 3)`` that dim is read with a
+# zero-coefficient coord (``floor(v/64)`` / ``Mod(v, 64)``) -- a re-read, not a
+# stride.  Unlike ``x[::2]`` above, this is fine: codegen derives the read's
+# device strides from the device layout, so the broadcast reads correctly while
+# the unaligned new stick (S=67) is padded.  Every element must land exactly.
+def test_broadcast_input_transpose_clone():
+    def fn(k):
+        B, S, H = k.shape[0], k.shape[1], k.shape[2]
+        D = k.shape[-1] * 2
+        return k.view(B, S, H, D).transpose(1, 2).transpose(2, 3).clone()
+
+    x = _arange(1, 67, 1, 2, 1, 64)
+    _strict(fn, x)
+
+
 # Matmul with a SUB-STICK contraction dim (D) reached through a permuted key,
 # k.permute(0,2,3,1), which restickifies k into [B,H,D,Lk] with the sub-stick D
 # demoted to a non-stick device dim.  The permuted-key stick (Lk) projects back
