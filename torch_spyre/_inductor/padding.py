@@ -417,7 +417,7 @@ def _host_dim_for_stick_sym(host_coords: list[Expr], sym, sizes: list) -> int | 
         # layout (tensors_and_layouts.md canonical-form rule), so every size-1
         # dim maps to host_size 1 and the physical dim to pad is re-derived from
         # device-side markers, not from this host index (see
-        # _restickify_input_device_dim / _restickify_output_device_dim).  So any
+        # _restickify_input_device_dim / _pad_restickify_output).  So any
         # size-1 dim yields the same device layout -- pick the first.  A genuine
         # device-level ambiguity (>=2 size-1 device dims) still declines there.
         ones = [i for i, s in enumerate(sizes) if concretize_expr(s) == 1]
@@ -596,45 +596,6 @@ def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | No
     return None
 
 
-def _restickify_output_device_dim(
-    op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
-) -> int | None:
-    """Return the device-size dim index of the non-stick device dim that carries
-    the input's old stick dim, or None if it is stick-aligned and needs no
-    padding.
-
-    That dim is the host dim carrying the iter symbol of the input's old stick
-    dim (``in_stick_dim``).  After the restickify it is a non-stick device dim
-    whose true dim size is the (small) old-stick host size.  Padding is required
-    whenever that device dim's size is not a stick multiple, regardless of how
-    many stick blocks the new stick dim spans or where the block dim sits
-    relative to this dim: bumping the dim to a stick boundary widens the physical
-    allocation so every batch plane and stick block lands at the correct offset.
-    """
-    # The old stick dim's host coord carries more than one iter symbol (a fused
-    # host dim): no single symbol to track through to a device dim, so decline.
-    in_host_coords = host_coordinates(in_layout, in_dep, None)
-    old_sym = _single_free_sym(in_host_coords[in_stick_dim])
-    if old_sym is None:
-        return None
-    # Old stick dim collapsed to a size-1 output host dim (const-0 coord, no
-    # symbol): nothing survives to misalign, so nothing to pad.
-    out_layout = op.get_layout()
-    write_dep = _named_write_dep(op)
-    out_host_coords = host_coordinates(out_layout, write_dep, None)
-    if _host_dim_carrying_sym(out_host_coords, old_sym) is None:
-        return None
-    stl = out_layout.device_layout
-    device_dim = _device_dim_carrying_sym(stl, write_dep, old_sym)
-    if device_dim is None:
-        return None
-    # Already a stick multiple: stick blocks land aligned, no padding needed.
-    stick_size = get_elem_in_stick(out_layout.dtype)
-    if stl.device_size[device_dim] % stick_size == 0:
-        return None
-    return device_dim
-
-
 def _pad_layout_device_dim(
     layout: FixedTiledLayout,
     device_dim: int,
@@ -666,77 +627,62 @@ def _pad_layout_device_dim(
     )
 
 
-def _restickify_output_size1_device_dim(
-    op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
-) -> int | None:
-    """Return the collapsed old-stick output device dim when the input's old
-    stick host dim is size 1, or None when it does not apply / is ambiguous.
-
-    Companion to ``_restickify_output_device_dim`` for the case that function
-    declines with ``old_sym is None``: a size-1 input old-stick host dim carries
-    no symbol to project, so the output dim it collapses to is a size-1 singleton
-    (``device_size == 1``) marked ``stride_map == -1``.  Mirrors the input-side
-    ``_restickify_input_device_dim`` tiebreak; declines if still ambiguous.
-
-    Unlike the aligned path this dim cannot be grown in place here: growing a
-    size-1 device dim before ``align_tensors`` yields a fractional coordinate
-    (``7*c0/64``) that ``normalize_coordinates`` rejects.  The scheduler grows it
-    after align instead (see ``_grow_size1_stick_allocations``); this function
-    only locates the dim to tag.
-
-    Resolution is delegated to ``_size1_alloc_dim``.  When a leading/middle extra
-    size-1 host dim leaves two-or-more ``-1`` markers, the ``_farthest_from_plane``
-    tiebreak isolates the demoted old stick (see its comment).
-    """
-    in_host_coords = host_coordinates(in_layout, in_dep, None)
-    if _single_free_sym(in_host_coords[in_stick_dim]) is not None:
-        return None  # not a size-1 old-stick dim; aligned path owns it
-    stl = op.get_layout().device_layout
-
-    def _farthest_from_plane(grow: list[int]) -> int:
-        # Two-or-more collapsed size-1 device dims: the demoted old stick is the
-        # one farthest from the plane (batch/preserved) dims.  Plane dims are the
-        # non-stick device dims whose coordinate carries a free iteration symbol.
-        # In device row-major order the demoted old stick lands at the slot
-        # farthest from the plane axes (adjacent to the stick block when the batch
-        # nest is outer, outermost when inner), whereas an incidental input size-1
-        # dim sits among the batch axes.  This recovers the same dim the N>=2
-        # sibling marks as its sole -1.
-        write_dep = _named_write_dep(op)
-        dev_coords = _device_coords(stl, write_dep)
-        plane = [
-            d
-            for d in range(len(dev_coords) - 1)
-            if _single_free_sym(dev_coords[d]) is not None
-        ]
-        if not plane:
-            # All-ones batch (e.g. [1,1,64,1]): no plane to measure against, and
-            # every candidate is a zero-extent relabel, so pick-first is correct.
-            return grow[0]
-        return max(grow, key=lambda g: (min(abs(g - p) for p in plane), -g))
-
-    return _size1_alloc_dim(stl, tiebreak=_farthest_from_plane)
-
-
 def _pad_restickify_output(
     op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
 ) -> None:
-    """Pad the output's unaligned non-stick device dim (the one carrying the
-    input's old stick dim) to a stick boundary so the second+ stick block lands
-    at the correct offset.
+    """Pad the output dim carrying the input's old stick dim to a stick boundary,
+    so the second+ stick block and every batch plane land at the correct offset.
 
-    Only the device layout grows (see _pad_layout_device_dim); the tail rows are
-    covered by ``_create_sdsc_tensors``'s backGap path and never read back.
+    Only the device layout grows (see ``_pad_layout_device_dim``); the tail rows
+    are covered by ``_create_sdsc_tensors``'s backGap path and never read back.
+    The dim carries the free symbol of ``in_stick_dim``'s host coord; padding is
+    needed whenever its device size is not a stick multiple.
 
-    When the input old-stick host dim is size 1 the output dim collapses to a
-    size-1 singleton whose in-place grow would break ``align_tensors``; tag it
-    with ``_size1_stick_alloc_dim`` for the scheduler to grow after align.
+    Two shapes of that dim, split on whether the old stick host dim carries a
+    symbol at all:
+
+    - **Size 1** (no symbol): the old stick collapses to a size-1 singleton
+      device dim, located by ``_size1_alloc_dim`` from the ``stride_map == -1``
+      marker (``_farthest_from_plane`` breaks a multi-marker tie by geometry).
+      It cannot grow in place -- a size-1 grow before ``align_tensors`` yields a
+      fractional coordinate ``normalize_coordinates`` rejects -- so tag it with
+      ``_size1_stick_alloc_dim`` for the scheduler to grow after align (see
+      ``_grow_size1_stick_allocations``).
+    - **Has a symbol**: track it to the non-stick device dim and, if unaligned,
+      grow the device layout in place.  A fused old-stick host coord (>1 symbol),
+      one that collapses to a const-0 output coord, or an already-aligned dim
+      needs no padding.
     """
-    device_dim = _restickify_output_device_dim(op, in_dep, in_layout, in_stick_dim)
-    if device_dim is None:
-        size1_dim = _restickify_output_size1_device_dim(
-            op, in_dep, in_layout, in_stick_dim
-        )
+    in_host_coords = host_coordinates(in_layout, in_dep, None)
+    old_sym = _single_free_sym(in_host_coords[in_stick_dim])
+    out_layout = op.get_layout()
+    write_dep = _named_write_dep(op)
+    stl = out_layout.device_layout
+
+    if old_sym is None:
+
+        def _farthest_from_plane(grow: list[int]) -> int:
+            # Two-or-more collapsed size-1 device dims: the demoted old stick is
+            # the one farthest from the plane (batch/preserved) dims.  Plane dims
+            # are the non-stick device dims whose coord carries a free iteration
+            # symbol.  In device row-major order the demoted old stick lands at
+            # the slot farthest from the plane axes (adjacent to the stick block
+            # when the batch nest is outer, outermost when inner), whereas an
+            # incidental input size-1 dim sits among the batch axes.  This
+            # recovers the same dim the N>=2 sibling marks as its sole -1.
+            dev_coords = _device_coords(stl, write_dep)
+            plane = [
+                d
+                for d in range(len(dev_coords) - 1)
+                if _single_free_sym(dev_coords[d]) is not None
+            ]
+            if not plane:
+                # All-ones batch (e.g. [1,1,64,1]): no plane to measure against,
+                # and every candidate is a zero-extent relabel, so pick first.
+                return grow[0]
+            return max(grow, key=lambda g: (min(abs(g - p) for p in plane), -g))
+
+        size1_dim = _size1_alloc_dim(stl, tiebreak=_farthest_from_plane)
         if size1_dim is not None:
             op._size1_stick_alloc_dim = size1_dim
             logger.debug(
@@ -747,12 +693,21 @@ def _pad_restickify_output(
             )
         return
 
-    out_layout = op.get_layout()
-    old_dim_size = out_layout.device_layout.device_size[device_dim]
+    # Old stick collapsed to a size-1 output host dim (const-0 coord, no symbol):
+    # nothing survives to misalign, so nothing to pad.
+    out_host_coords = host_coordinates(out_layout, write_dep, None)
+    if _host_dim_carrying_sym(out_host_coords, old_sym) is None:
+        return
+    device_dim = _device_dim_carrying_sym(stl, write_dep, old_sym)
+    if device_dim is None:
+        return
+    # Already a stick multiple: stick blocks land aligned, no padding needed.
+    if stl.device_size[device_dim] % get_elem_in_stick(out_layout.dtype) == 0:
+        return
+
+    old_dim_size = stl.device_size[device_dim]
     new_dim_size = old_dim_size + compute_padding(old_dim_size, out_layout.dtype)
-
     op.layout = _pad_layout_device_dim(out_layout, device_dim, new_dim_size)
-
     logger.debug(
         "insert_restickify_padding: padded output %s device dim %d %d -> %d",
         op.get_name(),
