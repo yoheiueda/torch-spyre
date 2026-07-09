@@ -643,7 +643,8 @@ def _pad_restickify_output(
 
     - **Size 1** (no symbol): the old stick collapses to a size-1 singleton
       device dim, located by ``_size1_alloc_dim`` from the ``stride_map == -1``
-      marker (``_farthest_from_plane`` breaks a multi-marker tie by geometry).
+      marker (``_old_stick_size1_dim`` breaks a multi-marker tie: the dim before
+      the new stick's tile-count dim when it is multi-block, else by geometry).
       It cannot grow in place -- a size-1 grow before ``align_tensors`` yields a
       fractional coordinate ``normalize_coordinates`` rejects -- so tag it with
       ``_size1_stick_alloc_dim`` for the scheduler to grow after align (see
@@ -661,16 +662,32 @@ def _pad_restickify_output(
 
     if old_sym is None:
 
-        def _farthest_from_plane(grow: list[int]) -> int:
-            # Two-or-more collapsed size-1 device dims: the demoted old stick is
-            # the one farthest from the plane (batch/preserved) dims.  Plane dims
-            # are the non-stick device dims whose coord carries a free iteration
-            # symbol.  In device row-major order the demoted old stick lands at
-            # the slot farthest from the plane axes (adjacent to the stick block
-            # when the batch nest is outer, outermost when inner), whereas an
-            # incidental input size-1 dim sits among the batch axes.  This
-            # recovers the same dim the N>=2 sibling marks as its sole -1.
+        def _old_stick_size1_dim(grow: list[int]) -> int:
+            # Two-or-more collapsed size-1 device dims: pick the one that is the
+            # demoted old stick.  Two cases, split on whether the new stick spans
+            # multiple blocks.
             dev_coords = _device_coords(stl, write_dep)
+            new_sym = _single_free_sym(dev_coords[-1])
+            # MULTI-BLOCK new stick: it has a tile-count device dim carrying
+            # ``new_sym`` OUTSIDE the within-stick (last) dim.  The demoted old
+            # stick is the size-1 candidate immediately before that tile-count
+            # dim, so second+ blocks land at the right offset.  This is the sole
+            # correct choice (verified by forcing each candidate); the geometric
+            # distance heuristic below picks wrong here -- e.g. for
+            # ``[1,1,2,128,1].transpose(3,4)`` a real dim sits between the old
+            # stick and the plane, so max-distance lands on the wrong candidate.
+            if new_sym is not None:
+                for d in range(len(dev_coords) - 1):
+                    if new_sym in dev_coords[d].free_symbols:
+                        cand = d - 1
+                        if cand in grow:
+                            return cand
+                        break
+            # SINGLE-BLOCK new stick (no tile-count dim): the demoted old stick is
+            # the candidate farthest from the plane (batch/preserved) dims -- the
+            # non-stick device dims carrying a free iteration symbol.  In device
+            # row-major order it lands at the slot farthest from the plane axes,
+            # whereas an incidental input size-1 dim sits among them.
             plane = [
                 d
                 for d in range(len(dev_coords) - 1)
@@ -682,7 +699,7 @@ def _pad_restickify_output(
                 return grow[0]
             return max(grow, key=lambda g: (min(abs(g - p) for p in plane), -g))
 
-        size1_dim = _size1_alloc_dim(stl, tiebreak=_farthest_from_plane)
+        size1_dim = _size1_alloc_dim(stl, tiebreak=_old_stick_size1_dim)
         if size1_dim is not None:
             op._size1_stick_alloc_dim = size1_dim
             logger.debug(

@@ -1389,6 +1389,32 @@ def test_size1_multi_block_transpose_clone(shape, dims):
     _strict(lambda x: x.transpose(*dims).clone(), x)
 
 
+# A size-1 old stick with a MULTI-BLOCK new stick (host > 64) AND a real
+# (size > 1) dim positioned BETWEEN the old stick and the batch/plane dims.
+# The collapsed old stick then lands at a device dim that is NOT the farthest
+# from the plane, so the old "farthest-from-plane" tiebreak mis-selected the
+# dim to grow and the second+ stick blocks came back wrong (silent miscompile,
+# torch.equal false).  The old stick must instead be found as the dim before
+# the new stick's tile-count.  Distinct-ramp + torch.equal catches it exactly.
+SIZE1_MULTI_BLOCK_MID_DIM = [
+    ((1, 1, 2, 128, 1), (3, 4)),  # real dim (2) between old stick and plane
+    ((1, 1, 3, 128, 1), (3, 4)),  # size-3 mid dim
+    ((1, 1, 2, 192, 1), (3, 4)),  # 3 blocks
+    ((1, 1, 2, 67, 1), (3, 4)),  # unaligned blocks
+    ((1, 3, 2, 128, 1), (3, 4)),  # plane + mid dim both real
+]
+
+
+@pytest.mark.parametrize(
+    "shape,dims",
+    SIZE1_MULTI_BLOCK_MID_DIM,
+    ids=[f"{'x'.join(map(str, s))}_t{d}" for s, d in SIZE1_MULTI_BLOCK_MID_DIM],
+)
+def test_size1_multi_block_mid_dim_transpose_clone(shape, dims):
+    x = _arange(*shape)
+    _strict(lambda x: x.transpose(*dims).clone(), x)
+
+
 # A restickify input sliced with a contiguous OFFSET on a NON-stick host dim
 # (e.g. x[1:3]), with an unaligned new stick (67) that needs padding.
 # This is a valid, paddable slice and must compile correctly (it used to be
