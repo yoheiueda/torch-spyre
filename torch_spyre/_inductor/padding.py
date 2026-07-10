@@ -550,6 +550,12 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     - ``new_stick_dim``: input host dim that becomes the output's stick dim.
     - ``in_stick_dim``: input host dim that becomes the output's "old-stick"
       non-stick device dim.
+
+    Both are indices into the INPUT host dims (named for what they become on
+    the output), so they are directly comparable -- ``new_stick_dim ==
+    in_stick_dim`` is the not-a-restickify test.  Neither is an output dim
+    index: a restickify re-tiles rather than preserving ranks, so the output
+    dim carrying the new stick generally sits at a different index.
     """
     if not isinstance(op, ComputedBuffer):
         return None
