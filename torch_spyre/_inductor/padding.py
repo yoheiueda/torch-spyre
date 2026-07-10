@@ -378,6 +378,23 @@ def _size1_alloc_dim(stl: SpyreTensorLayout, tiebreak=None) -> int | None:
     return tiebreak(grow) if tiebreak is not None else None
 
 
+def _dep_range(dep, sym) -> int | None:
+    """Return the concretized iteration range of loop symbol ``sym`` on ``dep``,
+    or None if ``sym`` is None or absent from the dep's ranges.
+
+    The read's iteration range over a dim is that dim's true logical fill -- 64
+    for a full stick dim, 2/48 for a sub-stick one -- which is the quantity the
+    restickify padding decisions turn on ("is this dim already a whole stick?").
+    Reading it off the dep keys off the same loop symbol codegen uses instead of
+    re-projecting a stick back to a host dim and re-indexing ``host_size``; the
+    device extent cannot substitute (within-stick device dims are stick-rounded
+    to 64 and cannot distinguish a full stick from a padded sub-stick one).
+    """
+    if sym is None or sym not in dep.ranges:
+        return None
+    return concretize_expr(dep.ranges[sym])
+
+
 def _named_write_dep(op):
     """Return ``op``'s sole named write dep.
 
@@ -949,9 +966,9 @@ def _assert_input_paddable(
         # partway into a stick); a narrowed non-stick dim is a carried offset.
         if i != new_stick_dim:
             continue
-        iter_range = concretize_expr(in_dep.ranges[sym])
+        iter_range = _dep_range(in_dep, sym)
         dim_size = concretize_expr(in_layout.size[i])
-        if iter_range != dim_size:
+        if iter_range is not None and iter_range != dim_size:
             raise Unsupported(
                 f"insert_restickify_padding: sliced input on host dim "
                 f"{i} of {op.get_name()} (iter range {iter_range} != "
@@ -998,9 +1015,10 @@ def _new_stick_aliases_input_stick(
         return False
     in_dev_coords = _device_coords(in_layout.device_layout, in_dep)
     in_stick_sym = _single_free_sym(in_dev_coords[-1]) if in_dev_coords else None
-    if in_stick_sym is None or in_stick_sym not in in_dep.ranges:
+    in_stick_fill = _dep_range(in_dep, in_stick_sym)
+    if in_stick_fill is None:
         return False
-    return concretize_expr(in_dep.ranges[in_stick_sym]) % stick_size == 0
+    return in_stick_fill % stick_size == 0
 
 
 def _pad_restickify_input(
@@ -1042,6 +1060,13 @@ def _pad_restickify_input(
     read, so the guard is the only thing standing between it and a silent
     miscompile.
     """
+    # Skip when the new-stick DIM is already a stick multiple: the read never runs
+    # past the true dim size, so there is nothing to pad.  This keys off the dim's
+    # declared size, not the read's iteration range -- for a slice that lands on a
+    # dim the transpose turns non-stick, the range is the narrowed extent while the
+    # dim is a full stick (x[3:66].transpose(0, 1) -> new_stick_dim size 128, range
+    # 63); the aligned full dim must skip, and the narrowing is a carried offset a
+    # non-stick dim tolerates (test_sliced_transpose_stick_expr_compiles).
     host_size = [concretize_expr(s) for s in in_layout.size]
     if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
         return
