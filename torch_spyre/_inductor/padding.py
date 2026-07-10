@@ -817,8 +817,12 @@ def _grow_input_stick_dim(
     The single read-side grow, shared by both input-padding entry points: the
     producer we own (``buf`` is the input) and the identity clone of a graph
     input (``buf`` is the clone).  Returns False if the geometry does not expose a
-    bumpable device dim (only the producer can fail this; a clone always exposes
-    one, so its caller asserts the result).
+    bumpable device dim.  Both callers now treat False as unreachable and assert on
+    it: a fresh contiguous clone always exposes the dim by construction, and a
+    producer reaching this point has a single non-size-1 free symbol on a
+    restickified dim (guaranteed by ``_pad_restickify_input``'s up-front declines),
+    which ``_device_dim_carrying_sym`` must be able to place -- so a False from
+    either is an invariant violation, not a case to handle.
 
     ``grow_host_dim`` selects the two cases, and it is load-bearing:
 
@@ -1065,23 +1069,31 @@ def _pad_restickify_input(
     already-initialized lanes, so there is nothing to pad and growing the dim
     would only widen a device dim that may carry a tracked named dim.
 
-    Both cases run the same grow (``_grow_input_stick_dim``); they differ only in
-    whether we already have a buffer we own to grow, or must materialise one:
+    The candidate splits into two mutually-exclusive arms on whether we own the
+    input buffer; they share the same grow (``_grow_input_stick_dim``) but differ
+    in what they grow and whether growing can fail:
 
-    - When the input is itself a ``ComputedBuffer`` we produced, grow it in place
-      (cheap: no extra buffer, no copy, no HBM round-trip).
-    - When it is a graph input whose allocation is not ours to widen, insert an
-      identity clone ahead of the restickify, grow the clone, and redirect the
-      restickify to read it.
+    - **Producer arm** -- the input is a ``ComputedBuffer`` we produced.  Grow it
+      in place (cheap: no extra buffer, no copy, no HBM round-trip).  The grow
+      cannot fail here: after the size-1 decline above, ``new_stick_dim`` carries a
+      single non-size-1 free symbol, and ``is_restickify`` fired for this candidate
+      (in-stick != out-stick), so that symbol must project onto a device dim other
+      than the within-stick one.  A False return is an invariant violation and
+      raises -- it never silently escalates to the clone arm.
+    - **Clone arm** -- the input is a graph input whose allocation is not ours to
+      widen (not a ``ComputedBuffer``).  Insert an identity clone ahead of the
+      restickify, grow the clone device-size-only, and redirect the restickify to
+      read it.  A fresh contiguous clone always exposes the device dim, so its grow
+      is asserted too.
 
     The clone's grow is device_size-only (``grow_host_dim=None``) while the
     producer's also grows host_size -- see ``_grow_input_stick_dim`` for why.
 
     A read the grow cannot carry (mid-stick start on the new-stick dim, or a
     strided read) is refused loudly (``_assert_input_paddable``) up front, before
-    either branch: the read feeding the restickify is the same regardless of which
+    either arm: the read feeding the restickify is the same regardless of which
     buffer we grow, so growing the producer we own does not undo it any more than
-    growing a clone would.  The producer branch is grown in place with no separate
+    growing a clone would.  The producer arm is grown in place with no separate
     read, so the guard is the only thing standing between it and a silent
     miscompile.
     """
@@ -1114,15 +1126,28 @@ def _pad_restickify_input(
     # path.
     _assert_input_paddable(op, in_dep, in_layout, new_stick_dim)
 
-    # Try the cheap in-place producer grow first; a False means this producer
-    # layout does not expose the new-stick dim as a bumpable device dim (a
-    # property of that layout, not the tensor), so escalate to the clone path
-    # below rather than skip -- the fresh contiguous clone always exposes it.
-    if isinstance(in_buf, ComputedBuffer) and _grow_input_stick_dim(
-        in_buf, new_stick_dim, grow_host_dim=new_stick_dim
-    ):
+    # Producer arm: a ComputedBuffer we produced.  Grow it in place (cheap: no
+    # extra buffer, no copy, no HBM round-trip).  The grow must succeed here --
+    # after the size-1 decline above, new_stick_dim carries a single non-size-1
+    # free symbol, and is_restickify fired for this candidate (in-stick !=
+    # out-stick), so _device_dim_carrying_sym finds a device dim other than the
+    # within-stick one.  A False is a can't-happen invariant violation, not a case
+    # to silently escalate to the clone arm.
+    if isinstance(in_buf, ComputedBuffer):
+        grew = _grow_input_stick_dim(in_buf, new_stick_dim, grow_host_dim=new_stick_dim)
+        assert grew, (
+            f"_pad_restickify_input: producer ComputedBuffer {in_buf.get_name()} "
+            f"exposed no bumpable device dim for new stick dim {new_stick_dim} -- "
+            f"after the size-1 decline this is a single non-size-1 free symbol on a "
+            f"restickified dim, which must project onto a device dim other than the "
+            f"within-stick one; a False here is a can't-happen invariant violation, "
+            f"not a case to clone-escalate."
+        )
         return
 
+    # Clone arm (graph input only): in_buf is not a ComputedBuffer, so its
+    # allocation is not ours to widen.  Materialise an identity clone ahead of the
+    # restickify, grow the clone device-size-only, and redirect the read to it.
     device = in_buf.get_device()
     if device is None:
         return
@@ -1169,8 +1194,9 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
       block lands at the wrong physical offset.  Always attempted.
     - Read side (``_pad_restickify_input``): when the new stick dim's size is not
       a stick multiple the read runs past the true dim size.  Grows the producer
-      in place when we own it, else inserts a device-size-bumped identity clone
-      and redirects the restickify to read it.
+      in place when we own the buffer (a ``ComputedBuffer``); for a graph input we
+      do not own, inserts a device-size-bumped identity clone and redirects the
+      restickify to read it.
 
     The two are orthogonal — e.g. a 128x67 transpose has an aligned input
     stick dim (128) but an unaligned non-stick dim (67), so only the write-side
