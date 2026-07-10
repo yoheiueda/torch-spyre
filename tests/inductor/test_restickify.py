@@ -1294,6 +1294,53 @@ def test_size1_input_stick_transpose_0_last_contiguous_producer(shape):
     _strict(lambda x: (x + x).transpose(0, -1).contiguous(), x)
 
 
+# A size-1 dim moving INTO the stick (the mirror of SIZE1_INPUT_STICK): the
+# transpose destination stick dim has host size 1, so upstream Inductor elides
+# the OUTPUT operand's within-stick loop symbol.  This used to crash -- the pass
+# asserted ``grew`` in _pad_restickify_input (padding.py) and, once that was made
+# to decline, the descriptor SIGABRT'd in dxp_standalone because
+# _restore_elided_restickify_stick only handled the mirror (elided INPUT stick).
+# The pass now declines the size-1-new-stick read (no over-read to cover) and
+# codegen restores the elided OUTPUT stick, so both must come back bit-exact.
+#
+# Each entry is (shape, transpose_dims); .contiguous() (not .clone(), which folds
+# to reinterpret_tensor) keeps a real producer ComputedBuffer and forces the
+# restickify.  Ramp span 511 doubled by x + x stays < 1024 (fp16-exact), so
+# torch.equal catches a mis-placed lane precisely.
+SIZE1_NEW_STICK = [
+    ((1, 1, 5, 67), (1, 3)),  # size-1 dim 1 moves into stick; real 5 survives
+    ((1, 3, 1, 67), (0, 3)),  # size-1 dim 0 moves into stick; real 3 survives
+]
+
+
+@pytest.mark.parametrize(
+    "shape,dims",
+    SIZE1_NEW_STICK,
+    ids=[
+        f"{'x'.join(map(str, s))}_t{'_'.join(map(str, d))}" for s, d in SIZE1_NEW_STICK
+    ],
+)
+def test_size1_new_stick_transpose_contiguous(shape, dims):
+    x = _arange(*shape, span=511)
+    _strict(lambda x: (x + x).transpose(*dims).contiguous(), x)
+
+
+# Same size-1 dim moving INTO the stick, but the restickify input is a bare graph
+# input.  Uses .clone() -- when the elided operand is the OUTPUT, the clone does
+# NOT fold to reinterpret_tensor (the destination stick's size-1 dim keeps a real
+# restickify), so this exercises the elided-output path for a plain input.
+@pytest.mark.parametrize(
+    "shape,dims",
+    SIZE1_NEW_STICK,
+    ids=[
+        f"{'x'.join(map(str, s))}_t{'_'.join(map(str, d))}" for s, d in SIZE1_NEW_STICK
+    ],
+)
+def test_size1_new_stick_transpose_clone_graph_input(shape, dims):
+    x = _arange(*shape, span=511)
+    _strict(lambda x: x.transpose(*dims).clone(), x)
+
+
 # Same size-1-in-stick shapes, but the restickify input is a bare graph input
 # (no producer op), exercising the other input path -- an inserted identity
 # clone we grow.  A copy preserves the input bit-for-bit, so this asserts exact

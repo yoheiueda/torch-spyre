@@ -791,7 +791,9 @@ def _restickify_input_device_dim(
 
     When ``new_stick_dim`` is a size-1 host dim (symbol-free coord), there is no
     symbol to project onto a device dim, so fall back to the singleton device dim
-    located by ``_size1_alloc_dim`` (declining if ambiguous).
+    located by ``_size1_alloc_dim`` (declining if ambiguous).  This size-1 branch
+    is now a defensive backstop: ``_pad_restickify_input`` declines a size-1
+    new-stick read up front, so the restickify's own read no longer reaches here.
     """
     layout = producer.get_layout()
     write_dep = _named_write_dep(producer)
@@ -1054,9 +1056,11 @@ def _pad_restickify_input(
     """Read-side fix: ensure the restickify reads a grow-able ``ComputedBuffer``
     whose stick-carrying dim is padded to a stick boundary.
 
-    Declines up front when there is no over-read to cover -- either the new stick
-    dim is already a stick multiple (so the read never runs past the true dim
-    size), or it is carved from the input's OWN aligned stick
+    Declines up front when there is no over-read to cover -- the new stick dim is
+    already a stick multiple (so the read never runs past the true dim size), it
+    is a size-1 host dim (one real lane, nothing past it; codegen's
+    ``_restore_elided_restickify_stick`` supplies the padded lanes on the elided
+    output stick), or it is carved from the input's OWN aligned stick
     (``_new_stick_aliases_input_stick``): the widened read stays inside
     already-initialized lanes, so there is nothing to pad and growing the dim
     would only widen a device dim that may carry a tracked named dim.
@@ -1090,6 +1094,17 @@ def _pad_restickify_input(
     # non-stick dim tolerates (test_sliced_transpose_stick_expr_compiles).
     host_size = [concretize_expr(s) for s in in_layout.size]
     if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
+        return
+    # Skip when the new-stick dim is a size-1 host dim (symbol-free coord): there
+    # is no over-read to cover.  The read is fully described by the input's live
+    # OLD stick (already padded to a stick boundary); the new stick carries one
+    # real lane and no data past it, so there is nothing to pad.  Codegen's
+    # _restore_elided_restickify_stick inserts the 63 padded lanes on the elided
+    # output stick, and none of them is ever read.  Growing here would only widen
+    # a device dim that may carry a tracked named dim, and the size-1 device dim
+    # is the -1-marked singleton the codegen restore handles directly.
+    in_host_coords = host_coordinates(in_layout, in_dep, None)
+    if _single_free_sym(in_host_coords[new_stick_dim]) is None:
         return
     if _new_stick_aliases_input_stick(op, in_dep, in_layout, in_stick_dim):
         return
