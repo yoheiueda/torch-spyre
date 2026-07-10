@@ -1099,6 +1099,10 @@ def _pad_restickify_input(
     # path.
     _assert_input_paddable(op, in_dep, in_layout, new_stick_dim)
 
+    # Try the cheap in-place producer grow first; a False means this producer
+    # layout does not expose the new-stick dim as a bumpable device dim (a
+    # property of that layout, not the tensor), so escalate to the clone path
+    # below rather than skip -- the fresh contiguous clone always exposes it.
     if isinstance(in_buf, ComputedBuffer) and _grow_input_stick_dim(
         in_buf, new_stick_dim, grow_host_dim=new_stick_dim
     ):
