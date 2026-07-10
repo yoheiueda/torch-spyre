@@ -576,13 +576,32 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     # dim vs. the input dim that carries the output's stick symbol.  A restickify
     # lands a *different* host dim in the stick, i.e. new_stick_dim != in_stick_dim
     # (the free-symbol inequality is_restickify checks, projected onto host dims).
+    # These two host dims are the restickify test re-expressed in host-dim space
+    # (is_restickify compares the within-stick device symbols; the projection maps
+    # each to the input host dim carrying it).  Every skip below therefore means
+    # "not a restickify", which must agree with the device-space is_restickify
+    # codegen keys off -- else the pass would skip an op codegen still restickifies
+    # on an unpadded buffer (over-reading uninitialized stick lanes).  Agreement
+    # rests on the single-symbol stick invariant finalize_layouts establishes:
+    #
+    #   - in_stick_dim is None: the input stick coord has no single symbol.  A
+    #     symbol-free stick means a size-1 host dim in stick position (canonical
+    #     form), so the size-1 fallback resolves it; None with a real restickify
+    #     would need a symbol-free stick AND no size-1 host dim -- inconsistent.
+    #   - new_stick_dim == in_stick_dim: a restickify carries two DIFFERENT stick
+    #     symbols (is_restickify's inequality), so equal host dims would need one
+    #     input host coord to carry both -- the invariant gives one symbol per
+    #     stick dim, so it does not arise.
+    #
+    # Only new_stick_dim is None keeps a live is_restickify assertion, because it
+    # is the one path where the projection failing could plausibly hide a real
+    # restickify if the invariant ever broke (verified unreachable across the
+    # restickify + propagate suite for all three paths).
     in_stick_dim = _project_stick_host_dim(in_layout, in_layout, in_dep)
     new_stick_dim = _output_stick_input_host_dim(op, out_layout, in_layout, in_dep)
     if in_stick_dim is None:
         return None
     if new_stick_dim is None:
-        # Can't-happen backstop: finalize_layouts guarantees a single-symbol output
-        # stick that always resolves to a host dim, so no known shape lands here.
         # If the invariant ever breaks and codegen would still restickify, the
         # unpadded buffer over-reads uninitialized lanes -- refuse loudly, not skip.
         if _codegen_will_restickify(op, out_layout, in_layout, in_dep):
