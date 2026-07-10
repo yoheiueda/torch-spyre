@@ -1536,11 +1536,11 @@ def test_broadcast_input_transpose_clone():
 
 # Matmul with a SUB-STICK contraction dim (D) reached through a permuted key,
 # k.permute(0,2,3,1), which restickifies k into [B,H,D,Lk] with the sub-stick D
-# demoted to a non-stick device dim.  The permuted-key stick (Lk) projects back
-# onto D by free symbol, so the restickify alias guard used to skip padding for
-# ANY D -- but when D does not fill a whole stick (D=48) the widened read runs
-# past D's initialized lanes and the whole matmul came back wrong.  D must be
-# padded (and its K-tail zero-filled) so the contraction ignores the pad rows.
+# demoted to a non-stick device dim.  When D does not fill a whole stick (D=48)
+# the restickify's widened read runs past D's initialized lanes; D must be padded
+# to a stick boundary (and its K-tail zero-filled) so the contraction ignores the
+# pad rows.  Read-side padding grows D's device dim device-size-only, which covers
+# the over-read for every D here (an already-full D=64 is a no-op grow).
 # Small-span ramps keep the fp16 accumulation exact so torch.equal is a true
 # oracle; D spans sub-stick (33, 48), aligned (64), and multi-block (96) sizes.
 SUBSTICK_MATMUL_D = [33, 48, 63, 64, 96]
