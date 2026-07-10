@@ -963,7 +963,7 @@ def _assert_input_paddable(
 
 
 def _new_stick_aliases_input_stick(
-    op: ComputedBuffer, in_dep, in_layout, host_size, in_stick_dim: int
+    op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
 ) -> bool:
     """Return True when the output stick is carved from the input's OWN stick and
     that input stick fills a whole stick -- the read-side skip condition.
@@ -976,22 +976,34 @@ def _new_stick_aliases_input_stick(
     aliases the input stick.  A projection to None (sub-stick->sub-stick) or a
     different dim (a real transpose) is not an alias.
 
-    The "inside already-initialized lanes" rationale only holds when
-    ``in_stick_dim`` fills a WHOLE stick: the projection matches by free *symbol*,
-    so it is blind to ``in_stick_dim``'s size and reports the alias whether the
-    input stick dim is a full 64 (D=64) or sub-stick (D=48).  When it is sub-stick
-    the widened read runs past the initialized lanes into uninitialized HBM --
-    codegen still restickifies and reads garbage (a matmul with a sub-stick
-    contraction dim miscompiles).  So only treat it as an alias when the input
-    stick dim is itself stick-aligned; a sub-stick alias falls through to the grow.
+    The "inside already-initialized lanes" rationale only holds when the input
+    stick fills a WHOLE stick: the projection matches by free *symbol*, so it is
+    blind to the stick dim's size and reports the alias whether the input stick is
+    a full 64 (D=64) or sub-stick (D=48).  When it is sub-stick the widened read
+    runs past the initialized lanes into uninitialized HBM -- codegen still
+    restickifies and reads garbage (a matmul with a sub-stick contraction dim
+    miscompiles).  So only treat it as an alias when the input stick is itself
+    stick-aligned; a sub-stick alias falls through to the grow.
+
+    The "is the input stick full" check reads the within-stick symbol's iteration
+    range straight off the read dep, not ``host_size[in_stick_dim]``: the loop var
+    over the stick dim iterates its true (logical) fill -- 64 for a full D, 2/48
+    for a sub-stick dim -- so ``range % stick_size`` is exactly the "already a
+    whole stick" test.  This keys off the same within-stick symbol codegen uses and
+    avoids re-indexing ``host_size`` by the projected dim, but the range and the
+    host size of the stick dim are the same number (the device extent is
+    stick-rounded and cannot distinguish full from sub-stick, which is why neither
+    can be replaced by ``device_size``).
     """
     stick_size = get_elem_in_stick(in_layout.dtype)
     projected = _project_stick_host_dim(in_layout, op.get_layout(), in_dep)
-    return (
-        projected is not None
-        and projected == in_stick_dim
-        and host_size[in_stick_dim] % stick_size == 0
-    )
+    if projected is None or projected != in_stick_dim:
+        return False
+    in_dev_coords = _device_coords(in_layout.device_layout, in_dep)
+    in_stick_sym = _single_free_sym(in_dev_coords[-1]) if in_dev_coords else None
+    if in_stick_sym is None or in_stick_sym not in in_dep.ranges:
+        return False
+    return concretize_expr(in_dep.ranges[in_stick_sym]) % stick_size == 0
 
 
 def _pad_restickify_input(
@@ -1036,7 +1048,7 @@ def _pad_restickify_input(
     host_size = [concretize_expr(s) for s in in_layout.size]
     if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
         return
-    if _new_stick_aliases_input_stick(op, in_dep, in_layout, host_size, in_stick_dim):
+    if _new_stick_aliases_input_stick(op, in_dep, in_layout, in_stick_dim):
         return
 
     # Guard both branches: the offending read is the restickify's, not the buffer
