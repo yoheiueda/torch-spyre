@@ -1252,11 +1252,15 @@ def test_strict_transpose_0_last_clone(shape):
 # the backend or return garbage for all but the first plane; every element must
 # now come back correctly.
 #
-# The .exp() forces the restickify input to be an internal (produced) buffer
-# rather than a bare graph input, exercising the in-place producer path; the
-# graph-input path is covered by the next test.  A plain arithmetic op would be
-# constant-folded away, so a transcendental is used -- its last-ULP host/device
-# drift means this asserts allclose rather than the exact equality below.
+# The .exp() prepends a pointwise op so the restickify input is an internal
+# (produced) buffer rather than a bare graph input.  Note this particular fn
+# does NOT reach _pad_restickify_input's producer-grow path: inductor folds the
+# .exp().transpose().clone() chain down to a reinterpret_tensor, so no
+# spyre.restickify is emitted and the size-1 dim never needs padding here.  The
+# producer grow path is exercised by the .contiguous() variant below (a clone
+# collapses, contiguous does not); the graph-input clone path by the test after
+# that.  The transcendental's last-ULP host/device drift means this asserts
+# allclose rather than exact equality.
 SIZE1_INPUT_STICK = [(7, 67, 1), (7, 65, 1), (5, 3, 1)]
 
 
@@ -1272,10 +1276,28 @@ def test_size1_input_stick_transpose_0_last_clone(shape):
     torch.testing.assert_close(spyre.cpu(), fn(x), atol=1e-2, rtol=1e-2)
 
 
+# Same size-1-in-stick shapes, produced buffer, but ending in .contiguous()
+# instead of .clone().  This is the one construction that reaches
+# _pad_restickify_input's IN-PLACE PRODUCER GROW: the transpose moves a real dim
+# (7 / 5) into the stick, so its unaligned new-stick dim must be padded to a
+# stick boundary, and inductor keeps the pointwise producer as a real
+# ComputedBuffer we own and grow in place (a .clone() on the same chain folds to
+# a reinterpret_tensor and never restickifies -- see the note above).  The ramp
+# spans [0, 511) and x + x doubles it, so every value stays < 1024 and lands on
+# an exact fp16 integer; torch.equal then catches a mis-placed or uninitialised
+# row precisely (a looser allclose could mask a single wrong lane).
+@pytest.mark.parametrize(
+    "shape", SIZE1_INPUT_STICK, ids=lambda p: "x".join(map(str, p))
+)
+def test_size1_input_stick_transpose_0_last_contiguous_producer(shape):
+    x = _arange(*shape, span=511)
+    _strict(lambda x: (x + x).transpose(0, -1).contiguous(), x)
+
+
 # Same size-1-in-stick shapes, but the restickify input is a bare graph input
-# (no .exp()), exercising the other input path.  A copy preserves the input
-# bit-for-bit, so this asserts exact equality on the ramp (unlike the allclose
-# above).
+# (no producer op), exercising the other input path -- an inserted identity
+# clone we grow.  A copy preserves the input bit-for-bit, so this asserts exact
+# equality on the ramp (unlike the allclose above).
 @pytest.mark.parametrize(
     "shape", SIZE1_INPUT_STICK, ids=lambda p: "x".join(map(str, p))
 )
