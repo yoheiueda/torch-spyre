@@ -70,6 +70,7 @@ from .pass_utils import (
     lower_pad_sequence,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
+    restickify_new_stick_pos,
 )
 from .views import compute_coordinates
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
@@ -690,14 +691,10 @@ def _pad_restickify_output(
             new_sym = _single_free_sym(dev_coords[-1])
             if new_sym is not None:
                 in_dev_coords = _device_coords(in_layout.device_layout, in_dep)
-                new_stick_pos = next(
-                    (
-                        d
-                        for d, c in enumerate(in_dev_coords)
-                        if new_sym in c.free_symbols
-                    ),
-                    None,
-                )
+                # Shared rule with codegen's _restore_elided_restickify_stick: the
+                # new stick's rank among the INPUT device coords is where the
+                # demoted old stick lands.  See pass_utils.restickify_new_stick_pos.
+                new_stick_pos = restickify_new_stick_pos(in_dev_coords, {new_sym})
                 if new_stick_pos is not None and new_stick_pos in grow:
                     return new_stick_pos
             # Defensive fallback for a new stick with no single symbol (e.g. an

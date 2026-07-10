@@ -333,6 +333,40 @@ def is_restickify(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
     return in_coords[-1].free_symbols != out_coords[-1].free_symbols
 
 
+def restickify_new_stick_pos(in_coords: list[Expr], out_stick_syms: set) -> int | None:
+    """Return the rank the restickify's NEW stick occupies among the INPUT device
+    coords: the first index whose coord carries an ``out_stick_syms`` symbol.
+
+    The one shared rule behind two independently-reasoned uses that must not drift
+    (each keeps its own downstream adaptation of the returned rank):
+
+    - codegen ``_restore_elided_restickify_stick`` (superdsc.py) inserts the
+      restored old stick into the OUTPUT coords at this rank (with a multi-block
+      decrement it applies itself, post-deletion).
+    - the padding pass ``_pad_restickify_output`` size-1 tiebreak
+      (padding.py ``_old_stick_size1_dim``) grows the size-1 device dim at this
+      rank.
+
+    A transpose swaps the two sticks' slots while every surviving batch/spatial
+    dim keeps its place, so the old stick lands where the new stick used to sit --
+    this rank.  ``out_stick_syms`` is the free-symbol set of the output's
+    within-stick (last) coord.  Returns None if no input coord carries it (e.g. a
+    symbol-free / all-const new stick).
+
+    TODO(reuse): this rule reads composed INPUT coords in the pass but decomposed
+    op_spec coords in codegen -- the same rule on opposite sides of align_tensors.
+    A future refactor could extract align_tensors' per-tensor decomposition
+    (normalize_coordinates, views.py, stage 1) into a side-effect-free primitive
+    so the pass reasons on the same decomposed coords codegen does, dissolving the
+    pass's composed-coord workarounds.  That is a separate PR; do NOT change
+    views.py / align_tensors as part of a padding change.
+    """
+    return next(
+        (i for i, c in enumerate(in_coords) if c.free_symbols & out_stick_syms),
+        None,
+    )
+
+
 def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
     """Return names of deps whose loaded values are used as indices in scatter output_indexer.
 

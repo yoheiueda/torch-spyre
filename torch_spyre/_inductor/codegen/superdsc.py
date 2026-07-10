@@ -795,16 +795,13 @@ def _restore_elided_restickify_stick(op_spec: OpSpec) -> OpSpec:
     # The output's within-stick coordinate carries the NEW stick symbol (the
     # transpose target).  The restored old stick must land in the output's
     # middle coords at the same rank the new stick occupies among the input's
-    # coords -- see the OUTPUT rewrite below.
+    # coords -- see the OUTPUT rewrite below.  The rank rule is shared with the
+    # padding pass (pass_utils.restickify_new_stick_pos); local import avoids the
+    # pass_utils -> codegen.superdsc module cycle.
+    from torch_spyre._inductor.pass_utils import restickify_new_stick_pos
+
     new_stick_syms = out_arg.device_coordinates[-1].free_symbols
-    new_stick_pos = next(
-        (
-            i
-            for i, c in enumerate(in_arg.device_coordinates)
-            if c.free_symbols & new_stick_syms
-        ),
-        None,
-    )
+    new_stick_pos = restickify_new_stick_pos(in_arg.device_coordinates, new_stick_syms)
 
     # INPUT: rebind the outer-split and within-stick coordinate slots (currently
     # the constant 0) to carry the restored symbol as this operand's stick dim.
