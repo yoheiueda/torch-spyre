@@ -539,10 +539,6 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     restickify whose output stick maps to no input host dim is refused loudly
     rather than skipped (see below).
 
-    Note the aliasing check (output stick carved from the input's OWN stick)
-    lives on the read side, not here: it gates only the input padding, which is
-    the padding it is actually about (see ``_new_stick_aliases_input_stick``).
-
     Returns None if ``op`` is not a candidate, else the tuple:
 
     - ``in_dep`` / ``in_buf`` / ``in_layout``: the single input's dep, buffer,
