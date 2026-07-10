@@ -809,20 +809,20 @@ def _restickify_input_device_dim(
 
 def _grow_input_stick_dim(
     buf: ComputedBuffer, new_stick_dim: int, grow_host_dim: int | None
-) -> bool:
+) -> None:
     """Grow ``buf``'s device_size on the dim carrying ``new_stick_dim`` up to the
     stick boundary, so the restickify's stick-aligned over-read lands inside
     ``buf``'s own (wider) allocation instead of uninitialised HBM.
 
     The single read-side grow, shared by both input-padding entry points: the
     producer we own (``buf`` is the input) and the identity clone of a graph
-    input (``buf`` is the clone).  Returns False if the geometry does not expose a
-    bumpable device dim.  Both callers now treat False as unreachable and assert on
-    it: a fresh contiguous clone always exposes the dim by construction, and a
-    producer reaching this point has a single non-size-1 free symbol on a
-    restickified dim (guaranteed by ``_pad_restickify_input``'s up-front declines),
-    which ``_device_dim_carrying_sym`` must be able to place -- so a False from
-    either is an invariant violation, not a case to handle.
+    input (``buf`` is the clone).  Asserts that the geometry exposes a bumpable
+    device dim -- both callers hand it a buffer where one must exist, so a missing
+    dim is an invariant violation, not a case to handle: a fresh contiguous clone
+    always exposes the dim by construction, and a producer reaching this point has
+    a single non-size-1 free symbol on a restickified dim (guaranteed by
+    ``_pad_restickify_input``'s up-front declines), which ``_device_dim_carrying_sym``
+    must be able to place.
 
     ``grow_host_dim`` selects the two cases, and it is load-bearing:
 
@@ -842,8 +842,14 @@ def _grow_input_stick_dim(
     ``_pad_layout_device_dim``).
     """
     device_dim = _restickify_input_device_dim(buf, new_stick_dim)
-    if device_dim is None:
-        return False
+    assert device_dim is not None, (
+        f"_grow_input_stick_dim: {'producer' if grow_host_dim is not None else 'clone'} "
+        f"{buf.get_name()} exposed no bumpable device dim for new stick dim "
+        f"{new_stick_dim} -- a fresh clone always exposes one, and a producer "
+        f"reaching here has a single non-size-1 free symbol on a restickified dim "
+        f"that must project onto a non-within-stick device dim; a missing dim is a "
+        f"can't-happen invariant violation."
+    )
 
     layout = buf.get_layout()
     old_dim_size = layout.device_layout.device_size[device_dim]
@@ -864,7 +870,6 @@ def _grow_input_stick_dim(
         new_dim_size,
         new_stick_dim,
     )
-    return True
 
 
 def lower_identity_clone(
@@ -1070,21 +1075,19 @@ def _pad_restickify_input(
     would only widen a device dim that may carry a tracked named dim.
 
     The candidate splits into two mutually-exclusive arms on whether we own the
-    input buffer; they share the same grow (``_grow_input_stick_dim``) but differ
-    in what they grow and whether growing can fail:
+    input buffer; they share the same grow (``_grow_input_stick_dim``, which
+    asserts a bumpable device dim exists) but differ in what they grow:
 
     - **Producer arm** -- the input is a ``ComputedBuffer`` we produced.  Grow it
       in place (cheap: no extra buffer, no copy, no HBM round-trip).  The grow
       cannot fail here: after the size-1 decline above, ``new_stick_dim`` carries a
       single non-size-1 free symbol, and ``is_restickify`` fired for this candidate
       (in-stick != out-stick), so that symbol must project onto a device dim other
-      than the within-stick one.  A False return is an invariant violation and
-      raises -- it never silently escalates to the clone arm.
+      than the within-stick one -- it never silently escalates to the clone arm.
     - **Clone arm** -- the input is a graph input whose allocation is not ours to
       widen (not a ``ComputedBuffer``).  Insert an identity clone ahead of the
       restickify, grow the clone device-size-only, and redirect the restickify to
-      read it.  A fresh contiguous clone always exposes the device dim, so its grow
-      is asserted too.
+      read it.  A fresh contiguous clone always exposes the device dim.
 
     The clone's grow is device_size-only (``grow_host_dim=None``) while the
     producer's also grows host_size -- see ``_grow_input_stick_dim`` for why.
@@ -1127,22 +1130,11 @@ def _pad_restickify_input(
     _assert_input_paddable(op, in_dep, in_layout, new_stick_dim)
 
     # Producer arm: a ComputedBuffer we produced.  Grow it in place (cheap: no
-    # extra buffer, no copy, no HBM round-trip).  The grow must succeed here --
-    # after the size-1 decline above, new_stick_dim carries a single non-size-1
-    # free symbol, and is_restickify fired for this candidate (in-stick !=
-    # out-stick), so _device_dim_carrying_sym finds a device dim other than the
-    # within-stick one.  A False is a can't-happen invariant violation, not a case
-    # to silently escalate to the clone arm.
+    # extra buffer, no copy, no HBM round-trip).  The grow cannot fail here (it
+    # asserts a bumpable device dim exists) -- it never silently escalates to the
+    # clone arm.
     if isinstance(in_buf, ComputedBuffer):
-        grew = _grow_input_stick_dim(in_buf, new_stick_dim, grow_host_dim=new_stick_dim)
-        assert grew, (
-            f"_pad_restickify_input: producer ComputedBuffer {in_buf.get_name()} "
-            f"exposed no bumpable device dim for new stick dim {new_stick_dim} -- "
-            f"after the size-1 decline this is a single non-size-1 free symbol on a "
-            f"restickified dim, which must project onto a device dim other than the "
-            f"within-stick one; a False here is a can't-happen invariant violation, "
-            f"not a case to clone-escalate."
-        )
+        _grow_input_stick_dim(in_buf, new_stick_dim, grow_host_dim=new_stick_dim)
         return
 
     # Clone arm (graph input only): in_buf is not a ComputedBuffer, so its
@@ -1167,11 +1159,7 @@ def _pad_restickify_input(
 
     # A clone we own always exposes the stick-carrying device dim; grow it
     # device-size-only (the clone copies just the real rows).
-    grew = _grow_input_stick_dim(clone_buf, new_stick_dim, grow_host_dim=None)
-    assert grew, (
-        f"_pad_restickify_input: no device dim carrying new stick dim "
-        f"{new_stick_dim} for clone {clone_buf.get_name()}"
-    )
+    _grow_input_stick_dim(clone_buf, new_stick_dim, grow_host_dim=None)
 
     # Move the clone op to just before the restickify (run_node appends).
     _move_ops_before(operations, new_ops, op)
