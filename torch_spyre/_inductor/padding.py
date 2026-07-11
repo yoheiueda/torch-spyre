@@ -335,13 +335,11 @@ def _device_coords(stl: SpyreTensorLayout, dep) -> list[Expr]:
 
     A padding-pass-local peer of ``pass_utils.host_coordinates`` /
     ``device_coordinates``: it shares the concretize-index + compute_coordinates
-    core but deliberately omits ``check_stick_expr_supported``.  The pass
-    projects an OUTPUT stick coord through an INPUT dep (cross-layout, see
-    ``_project_stick_host_dim``), which composes two stride patterns into
-    intermediate stick exprs like ``Mod(d2, 32)`` or ``2*(Mod(d1, 32)) + 1``
-    that are perfectly valid for the pass's free-*variable* analysis but are not
-    codegen-legal stick forms.  Only the free symbols matter here, so the
-    codegen validation would wrongly reject a real restickify candidate.
+    core but deliberately omits ``check_stick_expr_supported``.  Intermediate
+    stick exprs like ``Mod(d2, 32)`` or ``2*(Mod(d1, 32)) + 1`` are perfectly
+    valid for the pass's free-*variable* analysis but are not codegen-legal
+    stick forms.  Only the free symbols matter here, so the codegen validation
+    would wrongly reject a real restickify candidate.
 
     Returns ``[]`` for a scalar / zero-dim layout (empty ``device_size``).
     """
@@ -441,91 +439,19 @@ def _host_dim_carrying_sym(host_coords: list[Expr], sym) -> int | None:
     return None
 
 
-def _host_dim_for_stick_sym(host_coords: list[Expr], sym, sizes: list) -> int | None:
-    """Return the input host dim carrying stick symbol ``sym``, or None.
+def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
+    """Return dep's within-stick device coordinate's free symbol against stl,
+    or None if it has zero or many (e.g. a symbol-free size-1 stick, or a
+    scalar / zero-dim layout with no coords at all).
 
-    Shared tail of the two stick-projection helpers: once a within-stick symbol
-    has been isolated (from either the source layout's device coord or the op's
-    own write dep), the input host dim carrying it is the same lookup.  A
-    symbol-free stick (``sym is None``) means a size-1 host dim occupies the
-    stick, so fall back to a size-1 host dim (see the branch comment for why any
-    one is safe when several are size-1).
+    A constant coefficient or offset from a sliced stick device-dim size (e.g.
+    ``2*(Mod(var, 32)) + 1``) does not change the free variable, so such
+    rescaled coords need no shape special-case.
     """
-    if sym is None:
-        # A symbol-free stick means a size-1 host dim moved into stick position.
-        # With >=2 size-1 host dims the choice is ambiguous by symbol, but it is
-        # a zero-extent relabel: size-1 dims must not contribute to the device
-        # layout (tensors_and_layouts.md canonical-form rule), so every size-1
-        # dim maps to host_size 1 and the physical dim to pad is re-derived from
-        # device-side markers, not from this host index (see
-        # _restickify_input_device_dim / _pad_restickify_output).  So any
-        # size-1 dim yields the same device layout -- pick the first.  A genuine
-        # device-level ambiguity (>=2 size-1 device dims) still declines there.
-        ones = [i for i, s in enumerate(sizes) if concretize_expr(s) == 1]
-        return ones[0] if ones else None
-    return _host_dim_carrying_sym(host_coords, sym)
-
-
-def _project_stick_host_dim(
-    input_layout: FixedTiledLayout, stick_source_layout: FixedTiledLayout, dep
-) -> int | None:
-    """Return the input_layout host dim carrying stick_source_layout's
-    within-stick coord under dep, or None if it has no single free variable.
-
-    When the two layouts are the same this is the buffer's own within-stick
-    host dim; when they differ, stick_source_layout's stick coordinate is
-    projected through dep.  The projection is by free *variable*: the host dim
-    whose coordinate carries the stick coord's symbol.  The caller then reads a
-    restickify off ``in_stick_dim != new_stick_dim`` — the same test codegen
-    uses (the ``is_restickify`` predicate in pass_utils, which compares the
-    within-stick coords' free symbols).  A constant coefficient or offset from a
-    sliced stick
-    device-dim size (e.g. ``2*(Mod(var, 32)) + 1``) does not change the free
-    variable, so such rescaled coords need no shape special-case.
-
-    When the stick coord is symbol-free -- a size-1 host dim occupies the stick
-    (coord collapses to a constant 0) -- there is no symbol to project, so fall
-    back to matching the sole size-1 host dim by size (declining if the match is
-    ambiguous).  This lets a transpose that moves a size-1 dim into stick
-    position be recognised as a restickify.
-    """
-    host_coords = host_coordinates(input_layout, dep, None)
-    device_coords = _device_coords(stick_source_layout.device_layout, dep)
-    # No coords means a scalar / zero-dim layout: no stick dim to project.
-    if not host_coords or not device_coords:
+    device_coords = _device_coords(stl, dep)
+    if not device_coords:
         return None
-    sym = _single_free_sym(device_coords[-1])
-    return _host_dim_for_stick_sym(host_coords, sym, list(input_layout.size))
-
-
-def _output_stick_symbol(op, out_layout):
-    """Return the OUTPUT within-stick iteration symbol, or None if symbol-free.
-
-    The symbol comes from the op's own write dep against the output stl -- a
-    clean single symbol -- unlike a cross-layout projection through the input
-    dep, which composes two stride patterns into a multi-symbol coord whenever
-    both stick dims are sub-64 and alias the same physical region.
-    """
-    write_dep = _named_write_dep(op)
-    out_dev_coords = _device_coords(out_layout.device_layout, write_dep)
-    if not out_dev_coords:
-        return None
-    return _single_free_sym(out_dev_coords[-1])
-
-
-def _output_stick_input_host_dim(op, out_layout, in_layout, in_dep) -> int | None:
-    """Return the input host dim carrying the OUTPUT stick's iteration symbol.
-
-    Mirrors codegen (spyre_kernel.py): the output within-stick symbol comes from
-    the output layout's own write dep, then is located among the input's host
-    coords via the read dep.  A symbol-free output stick means a size-1 host dim
-    moved into stick position; fall back to matching the sole size-1 dim.
-    """
-    out_stick_sym = _output_stick_symbol(op, out_layout)
-    in_host_coords = host_coordinates(in_layout, in_dep, None)
-    if not in_host_coords:
-        return None
-    return _host_dim_for_stick_sym(in_host_coords, out_stick_sym, list(in_layout.size))
+    return _single_free_sym(device_coords[-1])
 
 
 def _identify_restickify(op: Operation, graph: GraphLowering):
@@ -584,14 +510,42 @@ def _identify_restickify(op: Operation, graph: GraphLowering):
     if not in_coords or not out_coords or not is_restickify(in_coords, out_coords):
         return None
 
-    # Resolve the two host dims the bump helpers need: the input's own within-stick
-    # dim (in_stick_dim) and the input dim carrying the output's stick symbol
-    # (new_stick_dim).  A confirmed restickify carries two distinct single stick
+    def _input_host_dim_for_symbol(sym) -> int | None:
+        """Return the input host dim carrying stick symbol ``sym`` (from either
+        stick), or None.
+        """
+        in_host_coords = host_coordinates(in_layout, in_dep, None)
+        if not in_host_coords:
+            return None
+        if sym is None:
+            # A symbol-free stick means a size-1 host dim moved into stick
+            # position.  With >=2 size-1 host dims the choice is ambiguous by
+            # symbol, but it is a zero-extent relabel: size-1 dims must not
+            # contribute to the device layout (tensors_and_layouts.md
+            # canonical-form rule), so every size-1 dim maps to host_size 1 and
+            # the physical dim to pad is re-derived from device-side markers,
+            # not from this host index (see ``_restickify_input_device_dim`` /
+            # ``_pad_restickify_output``).  So any size-1 dim yields the same
+            # device layout -- pick the first.  A genuine device-level
+            # ambiguity (>=2 size-1 device dims) still declines there.
+            ones = [i for i, s in enumerate(in_layout.size) if concretize_expr(s) == 1]
+            return ones[0] if ones else None
+        return _host_dim_carrying_sym(in_host_coords, sym)
+
+    # Resolve the two host dims the bump helpers need, symmetrically: the input's
+    # own within-stick dim (in_stick_dim) carries the input's own stick symbol,
+    # and the input dim that becomes the output's stick (new_stick_dim) carries
+    # the OUTPUT's stick symbol (mirrors codegen: spyre_kernel.py locates it the
+    # same way).  A confirmed restickify carries two distinct single stick
     # symbols (the single-symbol invariant finalize_layouts establishes), so both
     # must resolve and differ; a failure means the invariant broke, so refuse
     # loudly rather than skip and let codegen restickify an unpadded buffer.
-    in_stick_dim = _project_stick_host_dim(in_layout, in_layout, in_dep)
-    new_stick_dim = _output_stick_input_host_dim(op, out_layout, in_layout, in_dep)
+    in_stick_dim = _input_host_dim_for_symbol(
+        _stick_symbol(in_layout.device_layout, in_dep)
+    )
+    new_stick_dim = _input_host_dim_for_symbol(
+        _stick_symbol(out_layout.device_layout, _named_write_dep(op))
+    )
     if in_stick_dim is None or new_stick_dim is None or new_stick_dim == in_stick_dim:
         raise Unsupported(
             "restickify padding: codegen restickifies but the pass could not "
@@ -711,8 +665,7 @@ def _pad_restickify_output(
             #     rank), i.e. immediately before the tile-count dim.
             #   - SINGLE-BLOCK new stick: no real tile-count dim, so the old stick
             #     sits directly at ``new_stick_pos``.
-            dev_coords = _device_coords(stl, write_dep)
-            new_sym = _single_free_sym(dev_coords[-1])
+            new_sym = _stick_symbol(stl, write_dep)
             if new_sym is not None:
                 in_dev_coords = _device_coords(in_layout.device_layout, in_dep)
                 # Shared rule with codegen's _restore_elided_restickify_stick: the
