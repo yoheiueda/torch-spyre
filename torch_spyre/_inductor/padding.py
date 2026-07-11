@@ -333,31 +333,15 @@ def _single_free_sym(expr: Expr):
 def _device_coords(stl: SpyreTensorLayout, dep) -> list[Expr]:
     """Return device-space coordinate expressions for ``dep`` against ``stl``.
 
-    A padding-pass-local peer of ``pass_utils.host_coordinates`` /
-    ``device_coordinates``: it shares the concretize-index + compute_coordinates
-    core but deliberately omits ``check_stick_expr_supported``.  Intermediate
-    stick exprs like ``Mod(d2, 32)`` or ``2*(Mod(d1, 32)) + 1`` are perfectly
-    valid for the pass's free-*variable* analysis but are not codegen-legal
-    stick forms.  Only the free symbols matter here, so the codegen validation
-    would wrongly reject a real restickify candidate.
-
     Returns ``[]`` for a scalar / zero-dim layout (empty ``device_size``).
     """
     index = concretize_index(dep.index, set(dep.ranges.keys()))
     return compute_coordinates(stl.device_size, stl.stride_map, dep.ranges, index)
 
 
-def _size1_alloc_dim(stl: SpyreTensorLayout, tiebreak=None) -> int | None:
+def _locate_size1_grow_dim(stl: SpyreTensorLayout, tiebreak=None) -> int | None:
     """Locate the size-1 (singleton) non-stick device dim that a restickify
     grows to a stick, or None if the choice is ambiguous.
-
-    A size-1 host dim that moves into (input side) or out of (output side) stick
-    position carries no iteration symbol, so it cannot be tracked to a device dim
-    by symbol.  It is instead the singleton (``device_size == 1``) device dim
-    marked with ``stride_map == -1`` (the extent-1 / never-stepped marker
-    handled by ``coarse_tile._resize_device_layout``).
-    Several device dims can be size-1 (the host singleton plus a single-block
-    stick tile-count), so:
 
     - a sole ``-1`` marker isolates the dim -> return it;
     - no ``-1`` marker -> fall back to a sole size-1 dim, else decline;
@@ -368,6 +352,9 @@ def _size1_alloc_dim(stl: SpyreTensorLayout, tiebreak=None) -> int | None:
     device_size = [concretize_expr(s) for s in stl.device_size]
     stride_map = list(stl.stride_map)
     size1 = [d for d in range(len(device_size) - 1) if device_size[d] == 1]
+    # A size-1 host dim carries no iteration symbol, so it can't be tracked
+    # by symbol; it's instead the singleton device dim marked stride_map ==
+    # -1 (the extent-1 marker set by coarse_tile._resize_device_layout).
     grow = [d for d in size1 if stride_map[d] == -1]
     if len(grow) == 1:
         return grow[0]
@@ -376,30 +363,19 @@ def _size1_alloc_dim(stl: SpyreTensorLayout, tiebreak=None) -> int | None:
     return tiebreak(grow) if tiebreak is not None else None
 
 
-def _dep_range(dep, sym) -> int | None:
-    """Return the concretized iteration range of loop symbol ``sym`` on ``dep``,
-    or None if ``sym`` is None or absent from the dep's ranges.
-
-    The read's iteration range over a dim is that dim's true logical fill -- 64
-    for a full stick dim, 2/48 for a sub-stick one -- which is the quantity the
-    restickify padding decisions turn on ("is this dim already a whole stick?").
-    Reading it off the dep keys off the same loop symbol codegen uses instead of
-    re-projecting a stick back to a host dim and re-indexing ``host_size``; the
-    device extent cannot substitute (within-stick device dims are stick-rounded
-    to 64 and cannot distinguish a full stick from a padded sub-stick one).
+def _symbol_range_size(dep, sym) -> int | None:
+    """Return the concretized size of loop symbol ``sym``'s range on ``dep``,
+    or None if ``sym`` is None or absent from the dep's ranges.  Used to detect
+    a narrowing slice: compare against the dim's declared size.
     """
     if sym is None or sym not in dep.ranges:
         return None
     return concretize_expr(dep.ranges[sym])
 
 
-def _named_write_dep(op):
-    """Return ``op``'s sole named write dep.
-
-    Every ComputedBuffer on the restickify path (the candidate itself, or a
-    ComputedBuffer producer) has exactly one named write.  Fetch it loudly: an
-    empty writes set is an invariant violation, not a shape we silently skip.
-    """
+def _write_dep(op):
+    """Return op's write dependency on the buffer it produces."""
+    # Every ComputedBuffer here has exactly one named write; raise if not.
     return next(d for d in op.get_read_writes().writes if hasattr(d, "name"))
 
 
@@ -407,12 +383,9 @@ def _restickify_input(op, graph: GraphLowering):
     """Return ``(in_dep, in_buf, in_layout)`` for a restickify's single input, or
     ``(None, None, None)`` if ``op`` cannot be one (not a single-named-read
     pointwise copy whose input buffer has a FixedTiledLayout).
-
-    A restickify has exactly one named read.  ``_identify_restickify`` uses this
-    to gate and classify; the bump helpers re-derive the same three off ``op``
-    (rather than threading them through the driver), and can assume it succeeds --
-    ``_identify_restickify`` returned non-None for the same ``op``.
     """
+    # Callers that already know op is a confirmed restickify can assume this
+    # succeeds.
     reads = [r for r in op.get_read_writes().reads if hasattr(r, "name")]
     if len(reads) != 1:
         return None, None, None
@@ -427,12 +400,10 @@ def _restickify_input(op, graph: GraphLowering):
 
 
 def _host_dim_carrying_sym(host_coords: list[Expr], sym) -> int | None:
-    """Return the outermost host dim whose coordinate carries ``sym``, or None.
-
-    A loop symbol whose range straddles a tile boundary can appear in several
-    coordinates; the outermost (lowest-index) one is the governing dim, so we
-    return the first match.
-    """
+    """Return the outermost host dim whose coordinate carries ``sym``, or None."""
+    # A symbol whose range spans more than one tile can appear split across
+    # several coordinates (e.g. v // 64 in one, v % 64 in another); the
+    # outermost (lowest-index) one is the governing dim.
     for dim, coord in enumerate(host_coords):
         if sym in coord.free_symbols:
             return dim
@@ -443,14 +414,12 @@ def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
     """Return dep's within-stick device coordinate's free symbol against stl,
     or None if it has zero or many (e.g. a symbol-free size-1 stick, or a
     scalar / zero-dim layout with no coords at all).
-
-    A constant coefficient or offset from a sliced stick device-dim size (e.g.
-    ``2*(Mod(var, 32)) + 1``) does not change the free variable, so such
-    rescaled coords need no shape special-case.
     """
     device_coords = _device_coords(stl, dep)
     if not device_coords:
         return None
+    # A coefficient or offset on the coordinate doesn't add free symbols, so
+    # e.g. 2*(Mod(var, 32)) + 1 and Mod(var, 32) both resolve to {var}.
     return _single_free_sym(device_coords[-1])
 
 
@@ -458,35 +427,25 @@ def _identify_restickify(op: Operation, graph: GraphLowering):
     """Identify whether ``op`` is a restickify, and if so return its operands.
 
     A restickify is a single-input pointwise copy between two FixedTiledLayouts
-    that lands a *different* host dim within the stick.  After confirming the
-    shape (pointwise, one input, both FixedTiled), the classification is the
-    device-space ``is_restickify`` predicate (pass_utils) that codegen itself
-    calls -- one authoritative test, so the pass and codegen cannot drift apart
-    and skip an op codegen still restickifies (which would over-read
-    uninitialized stick lanes on an unpadded buffer).
-
-    This is purely the "is it a restickify?" question.  Which dim to grow and
-    which to leave alone -- notably skipping a broadcast dim (coeff 0) or an
-    already-aligned dim -- is decided downstream by the helpers that bump the
-    dims (``_pad_restickify_output`` / ``_pad_restickify_input``), not here.
+    that lands a *different* host dim within the stick.  This is purely the
+    "is it a restickify?" question; which dim to grow and which to leave
+    alone is decided downstream by ``_pad_restickify_output`` /
+    ``_pad_restickify_input``.
 
     Returns None if ``op`` is not a restickify, else ``(new_stick_dim,
-    in_stick_dim)``:
+    in_stick_dim)`` -- e.g. for a transpose that swaps which host dim sits in
+    the stick:
 
-    - ``new_stick_dim``: input host dim that becomes the output's stick dim.
-    - ``in_stick_dim``: input host dim that becomes the output's "old-stick"
-      non-stick device dim.
+    - ``new_stick_dim``: the input host dim that will occupy the *output's*
+      stick (it is not yet in the input's stick).
+    - ``in_stick_dim``: the input host dim currently in the *input's* stick
+      (it becomes a plain non-stick device dim, the "old stick", on the
+      output).
 
     Both are indices into the INPUT host dims (named for what they become on
     the output); neither is an output dim index, since a restickify re-tiles
-    rather than preserving ranks.  Once ``op`` is confirmed a restickify these
-    two dims must resolve to single symbols -- the single-symbol stick invariant
-    finalize_layouts establishes guarantees it -- so a failure to resolve either
-    is refused loudly (the invariant broke) rather than skipped, which would let
-    codegen restickify an unpadded buffer.
-
-    The input dep, buffer, and layout are not returned: the bump helpers derive
-    them from ``op`` themselves (``_restickify_input``).
+    rather than preserving ranks.  The input dep, buffer, and layout are not
+    returned: ``_restickify_input`` re-derives them from ``op``.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -500,14 +459,14 @@ def _identify_restickify(op: Operation, graph: GraphLowering):
     if in_dep is None:
         return None
 
-    # The one authoritative test, shared with codegen's store side: it is a
-    # restickify iff the two operands' within-stick device coords carry different
-    # free symbols (a broadcast, all-zero input coords, is excluded as an identity
-    # fill).  Classifying off this -- not a host-dim proxy -- keeps the pass and
-    # codegen from drifting apart.
     in_coords = _device_coords(in_layout.device_layout, in_dep)
-    out_coords = _device_coords(out_layout.device_layout, _named_write_dep(op))
-    if not in_coords or not out_coords or not is_restickify(in_coords, out_coords):
+    out_coords = _device_coords(out_layout.device_layout, _write_dep(op))
+    # A scalar / zero-dim layout has no coordinates, so it can't be a restickify.
+    if not in_coords or not out_coords:
+        return None
+    # is_restickify is the single source of truth for this check, shared with
+    # codegen's store side, so the two can't disagree on which ops restickify.
+    if not is_restickify(in_coords, out_coords):
         return None
 
     def _input_host_dim_for_symbol(sym) -> int | None:
@@ -519,32 +478,25 @@ def _identify_restickify(op: Operation, graph: GraphLowering):
             return None
         if sym is None:
             # A symbol-free stick means a size-1 host dim moved into stick
-            # position.  With >=2 size-1 host dims the choice is ambiguous by
-            # symbol, but it is a zero-extent relabel: size-1 dims must not
-            # contribute to the device layout (tensors_and_layouts.md
-            # canonical-form rule), so every size-1 dim maps to host_size 1 and
-            # the physical dim to pad is re-derived from device-side markers,
-            # not from this host index (see ``_restickify_input_device_dim`` /
-            # ``_pad_restickify_output``).  So any size-1 dim yields the same
-            # device layout -- pick the first.  A genuine device-level
-            # ambiguity (>=2 size-1 device dims) still declines there.
+            # position.  Size-1 dims don't contribute to the device layout, so
+            # any size-1 host dim yields the same device layout -- pick the
+            # first; the physical dim to pad is re-derived from device-side
+            # markers elsewhere (_restickify_input_device_dim /
+            # _pad_restickify_output), not from this host index.
             ones = [i for i, s in enumerate(in_layout.size) if concretize_expr(s) == 1]
             return ones[0] if ones else None
         return _host_dim_carrying_sym(in_host_coords, sym)
 
-    # Resolve the two host dims the bump helpers need, symmetrically: the input's
-    # own within-stick dim (in_stick_dim) carries the input's own stick symbol,
-    # and the input dim that becomes the output's stick (new_stick_dim) carries
-    # the OUTPUT's stick symbol (mirrors codegen: spyre_kernel.py locates it the
-    # same way).  A confirmed restickify carries two distinct single stick
-    # symbols (the single-symbol invariant finalize_layouts establishes), so both
-    # must resolve and differ; a failure means the invariant broke, so refuse
-    # loudly rather than skip and let codegen restickify an unpadded buffer.
+    # in_stick_dim carries the input's own stick symbol; new_stick_dim carries
+    # the OUTPUT's stick symbol (mirrors codegen: spyre_kernel.py locates it
+    # the same way).  Both must resolve and differ, or the layout invariant
+    # broke -- refuse loudly rather than skip and let codegen restickify an
+    # unpadded buffer.
     in_stick_dim = _input_host_dim_for_symbol(
         _stick_symbol(in_layout.device_layout, in_dep)
     )
     new_stick_dim = _input_host_dim_for_symbol(
-        _stick_symbol(out_layout.device_layout, _named_write_dep(op))
+        _stick_symbol(out_layout.device_layout, _write_dep(op))
     )
     if in_stick_dim is None or new_stick_dim is None or new_stick_dim == in_stick_dim:
         raise Unsupported(
@@ -558,13 +510,11 @@ def _identify_restickify(op: Operation, graph: GraphLowering):
 def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | None:
     """Return the outermost non-within-stick ``device_size`` dim whose device
     coordinate carries ``sym`` (the free symbol of some host dim), or None.
-
-    The dim is located by symbol match, not dim-size equality: two host dims can
-    share a dim size, and only the symbol is unambiguous.  A loop symbol whose
-    range straddles a tile boundary can appear in several coordinates; the
-    outermost (lowest-index) one is the governing dim, so we return the first
-    match.  The within-stick dim (the last device coordinate) is excluded.
     """
+    # Two host dims can share a dim size, so only the symbol unambiguously
+    # identifies the dim.  A symbol whose range spans more than one tile can
+    # appear split across several coordinates (e.g. v // 64 in one, v % 64 in
+    # another); the outermost (lowest-index) one is the governing dim.
     device_coords = _device_coords(stl, write_dep)
     for dim in range(len(device_coords) - 1):
         if sym in device_coords[dim].free_symbols:
@@ -578,21 +528,13 @@ def _pad_layout_device_dim(
     new_dim_size,
 ) -> FixedTiledLayout:
     """Return a copy of ``layout`` with one ``device_size`` dim grown to
-    ``new_dim_size``, leaving the host size logical.
-
-    Only the device allocation grows; the host size stays honest (a restickify's
-    stick-aligned over-read lands in the wider allocation, and the tail rows are
-    covered by the SDSC ``backGap`` path, never read back).
-
-    ``stride_map`` and ``host_stride`` are both left untouched: a ``stride_map``
-    entry is the *per-step* host stride along a device dim, and growing a dim's
-    extent does not change how far one step moves.  The identity
-    ``host_offset = dot(device_coordinates, stride_map)`` therefore still maps
-    device coordinates onto the same storage; only the allocation is wider.
+    ``new_dim_size``, leaving the host size unchanged.
     """
     stl = layout.device_layout
     new_device_size = list(stl.device_size)
     new_device_size[device_dim] = new_dim_size
+    # stride_map holds host strides, not host sizes, so it doesn't need to
+    # change when only a device dim's size grows.
     padded_stl = SpyreTensorLayout(
         new_device_size, list(stl.stride_map), stl.device_dtype, stl.element_arrangement
     )
@@ -606,30 +548,17 @@ def _pad_layout_device_dim(
 def _pad_restickify_output(
     op: Operation, graph: GraphLowering, in_stick_dim: int
 ) -> None:
-    """Pad the output dim carrying the input's old stick dim to a stick boundary,
+    """Pad the output dim carrying the input's old stick to a stick boundary,
     so the second+ stick block and every batch plane land at the correct offset.
 
-    Only the device layout grows (see ``_pad_layout_device_dim``); the tail rows
-    are covered by ``_create_sdsc_tensors``'s backGap path and never read back.
-    The dim carries the free symbol of ``in_stick_dim``'s host coord; padding is
-    needed whenever its device size is not a stick multiple.
+    Only the device layout grows; the tail rows are covered by
+    ``_create_sdsc_tensors``'s backGap path and never read back. Skipped when
+    the old stick's host coord has no surviving host dim, or its device dim is
+    already stick-aligned.
 
-    Two shapes of that dim, split on whether the old stick host dim carries a
-    symbol at all:
-
-    - **Size 1** (no symbol): the old stick collapses to a size-1 singleton
-      device dim, located by ``_size1_alloc_dim`` from the ``stride_map == -1``
-      marker (``_old_stick_size1_dim`` breaks a multi-marker tie by the new
-      stick's rank in the input device coords, mirroring the SDSC codegen's
-      ``_restore_elided_restickify_stick`` insert position).
-      It cannot grow in place -- a size-1 grow before ``align_tensors`` yields a
-      fractional coordinate ``normalize_coordinates`` rejects -- so tag it with
-      ``_size1_stick_alloc_dim`` for the scheduler to grow after align (see
-      ``_grow_size1_stick_allocations``).
-    - **Has a symbol**: track it to the non-stick device dim and, if unaligned,
-      grow the device layout in place.  A fused old-stick host coord (>1 symbol),
-      one that collapses to a const-0 output coord, or an already-aligned dim
-      needs no padding.
+    If the old stick collapsed to a size-1 device dim (no symbol), it can't
+    grow in place here -- see the comment at ``op._size1_stick_alloc_dim``
+    below -- so it's tagged for the scheduler to grow after ``align_tensors``.
     """
     assert isinstance(op, ComputedBuffer)
     in_dep, _in_buf, in_layout = _restickify_input(op, graph)
@@ -637,51 +566,32 @@ def _pad_restickify_output(
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     old_sym = _single_free_sym(in_host_coords[in_stick_dim])
     out_layout = op.get_layout()
-    write_dep = _named_write_dep(op)
+    write_dep = _write_dep(op)
     stl = out_layout.device_layout
 
     if old_sym is None:
 
         def _old_stick_size1_dim(grow: list[int]) -> int:
-            # Two-or-more collapsed size-1 device dims: pick the one that is the
-            # demoted old stick to grow to a full stick.
-            #
-            # The choice mirrors the SDSC codegen exactly.  When codegen restores
-            # the elided old stick (``_restore_elided_restickify_stick`` in
-            # superdsc.py) it inserts the restored symbol into the OUTPUT device
-            # coords at ``new_stick_pos`` -- the rank the NEW stick occupies among
-            # the INPUT device coords.  (A transpose swaps the two sticks' slots
-            # while every surviving batch/spatial dim keeps its place, so the old
-            # stick lands where the new stick used to sit.)  The device dim to grow
-            # here is that same slot, so allocation and descriptor agree: the
-            # grown 64-wide dim is exactly the one the descriptor writes 64 planes
-            # into.
-            #
-            # This covers both cases with one rule:
-            #   - MULTI-BLOCK new stick (host > 64): the output splits it into a
-            #     tile-count dim at ``new_stick_pos`` and a within-stick Mod term,
-            #     pushing the restored old stick one slot outer -- which is where
-            #     ``new_stick_pos`` already points (the input's un-split new-stick
-            #     rank), i.e. immediately before the tile-count dim.
-            #   - SINGLE-BLOCK new stick: no real tile-count dim, so the old stick
-            #     sits directly at ``new_stick_pos``.
+            # Two-or-more collapsed size-1 device dims: pick the demoted old stick to
+            # grow to a full stick. Mirrors codegen: _restore_elided_restickify_stick
+            # inserts the restored old-stick symbol at new_stick_pos -- the new
+            # stick's rank among the INPUT device coords (a transpose swaps the two
+            # sticks' slots, so the old stick lands where the new stick used to sit).
+            # Growing that same slot keeps allocation and descriptor in agreement.
             new_sym = _stick_symbol(stl, write_dep)
             if new_sym is not None:
                 in_dev_coords = _device_coords(in_layout.device_layout, in_dep)
-                # Shared rule with codegen's _restore_elided_restickify_stick: the
-                # new stick's rank among the INPUT device coords is where the
-                # demoted old stick lands.  See pass_utils.restickify_new_stick_pos.
                 new_stick_pos = restickify_new_stick_pos(in_dev_coords, {new_sym})
                 if new_stick_pos is not None and new_stick_pos in grow:
                     return new_stick_pos
-            # Defensive fallback for a new stick with no single symbol (e.g. an
-            # all-ones batch whose new stick coord collapses to a const): every
-            # candidate is a zero-extent relabel yielding the same layout, so the
-            # first candidate is safe.
+            # No single symbol (e.g. an all-ones batch): every candidate is a
+            # zero-extent relabel yielding the same layout, so the first is safe.
             return grow[0]
 
-        size1_dim = _size1_alloc_dim(stl, tiebreak=_old_stick_size1_dim)
+        size1_dim = _locate_size1_grow_dim(stl, tiebreak=_old_stick_size1_dim)
         if size1_dim is not None:
+            # A size-1 grow before align_tensors yields a fractional coordinate
+            # normalize_coordinates rejects; defer to _grow_size1_stick_allocations.
             op._size1_stick_alloc_dim = size1_dim
             logger.debug(
                 "insert_restickify_padding: tagged size-1 output %s device dim %d "
@@ -720,61 +630,36 @@ def _restickify_input_device_dim(
     producer: ComputedBuffer, new_stick_dim: int
 ) -> int | None:
     """Return the producer device-size dim index that carries the input host
-    dim ``new_stick_dim`` (the dim the restickify turns into its new stick dim),
-    or None if the producer geometry does not expose it as a bumpable non-stick
-    device dim.
+    dim ``new_stick_dim``, or None if the producer geometry does not expose it
+    as a bumpable non-stick device dim.
 
-    The restickify over-reads this dim to the stick boundary; bumping the
-    producer's device_size on the matching dim makes the producer allocate
-    (and its backGap path leave defined) the widened tail, so the over-read
-    lands inside the producer's own buffer instead of uninitialised HBM.
-
-    When ``new_stick_dim`` is a size-1 host dim (symbol-free coord), there is no
-    symbol to project onto a device dim, so fall back to the singleton device dim
-    located by ``_size1_alloc_dim`` (declining if ambiguous).  This size-1 branch
-    is now a defensive backstop: ``_pad_restickify_input`` declines a size-1
-    new-stick read up front, so the restickify's own read no longer reaches here.
+    The caller bumps this dim to the stick boundary so the restickify's
+    over-read lands inside the producer's own buffer instead of uninitialised
+    HBM.
     """
     layout = producer.get_layout()
-    write_dep = _named_write_dep(producer)
+    write_dep = _write_dep(producer)
     host_coords = host_coordinates(layout, write_dep, None)
     stl = layout.device_layout
     sym = _single_free_sym(host_coords[new_stick_dim])
     if sym is not None:
         return _device_dim_carrying_sym(stl, write_dep, sym)
     # Size-1 host dim: locate the singleton producer device dim (declining if two
-    # or more -1 markers make the choice ambiguous).
-    return _size1_alloc_dim(stl)
+    # or more -1 markers make the choice ambiguous). Defensive backstop only --
+    # _pad_restickify_input declines a size-1 new-stick read up front.
+    return _locate_size1_grow_dim(stl)
 
 
 def _grow_input_stick_dim(buf: ComputedBuffer, new_stick_dim: int, kind: str) -> None:
     """Grow ``buf``'s device_size on the dim carrying ``new_stick_dim`` up to the
-    stick boundary, so the restickify's stick-aligned over-read lands inside
-    ``buf``'s own (wider) allocation instead of uninitialised HBM.
+    stick boundary, so the restickify's over-read lands inside ``buf``'s own
+    allocation instead of uninitialised HBM.
 
-    The single read-side grow, shared by both input-padding entry points: the
-    producer we own (``buf`` is the input) and the identity clone of a graph
-    input (``buf`` is the clone).  Both grow device_size ONLY, leaving host_size
-    honest -- the widened tail is allocated but never iterated, and the SDSC
-    ``backGap`` path covers it on the write side (see ``_pad_layout_device_dim``).
-    The over-read into that tail is don't-care: every consumer iterates its
-    logical extent and stops before it, the same bound that discards the
-    restickify output's padded rows.
-
-    Keeping the producer's host_size honest is what lets a shared tracked named
-    dim (e.g. a matmul's contraction dim) survive: ``propagate_named_dims`` reads
-    host_size as the dim's declared size, so growing it would desync the mapping.
-    ``kind`` (``"producer"`` / ``"clone"``) is used only to label the debug log
-    and the invariant-violation assertion.
-
-    Asserts that the geometry exposes a bumpable device dim -- both callers hand
-    it a buffer where one must exist, so a missing dim is an invariant violation,
-    not a case to handle: a fresh contiguous clone always exposes the dim by
-    construction, and a producer reaching this point has a single non-size-1 free
-    symbol on a restickified dim (guaranteed by ``_pad_restickify_input``'s
-    up-front declines), which ``_device_dim_carrying_sym`` must be able to place.
-
-    stride_map and host_stride are unchanged (see ``_pad_layout_device_dim``).
+    Shared by both input-padding entry points: the producer we own, and the
+    identity clone of a graph input. Only device_size grows; host_size stays
+    honest so a shared tracked named dim (e.g. a matmul's contraction dim)
+    survives -- ``propagate_named_dims`` reads host_size as the dim's declared
+    size.
     """
     device_dim = _restickify_input_device_dim(buf, new_stick_dim)
     assert device_dim is not None, (
@@ -813,19 +698,13 @@ def lower_identity_clone(
     orig_stl: SpyreTensorLayout,
     insert_before: torch.fx.Node,
 ) -> tuple[ComputedBuffer, list[Operation]]:
-    """Lower an identity ``aten.clone`` of ``arg_fx_node`` (peer to
-    ``lower_pad_sequence``).
+    """Lower an identity ``aten.clone`` of ``arg_fx_node``, allocated at the
+    ORIGINAL unpadded ``host_size``.
 
-    Unlike ``lower_pad_sequence`` this allocates a buffer at the ORIGINAL
-    unpadded ``host_size`` and emits a single copy op -- no fill constant, no
-    fill-region mutation.  The clone's host geometry is identical to the input,
-    so its ``SpyreTensorLayout`` mirrors ``orig_stl`` verbatim; the caller bumps
+    The clone's host geometry is identical to the input, so its
+    ``SpyreTensorLayout`` mirrors ``orig_stl`` verbatim; the caller bumps
     ``device_size`` on the stick-carrying dim afterwards (keeping this helper
     generic).
-
-    ``insert_restickify_padding`` runs after ``propagate_spyre_tensor_layouts``,
-    so a ``run_node``-lowered op keeps a ``FlexibleLayout`` unless a
-    ``FixedTiledLayout`` is assigned immediately -- done here.
 
     Returns ``(clone_buf, new_ops)`` where ``clone_buf`` is the single new
     ComputedBuffer and ``new_ops`` is the (length-1) list of new IR operations.
@@ -845,8 +724,7 @@ def lower_identity_clone(
     graph_lowering.env[clone_fx] = clone_tb
 
     # aten.clone lowers to an identity Pointwise; force realization so it becomes
-    # a named ComputedBuffer (mirrors lower_restickify at lowering.py) rather than
-    # inlining into the consumer.
+    # a named ComputedBuffer rather than inlining into the consumer.
     clone_tb.data.realize()
     new_ops = graph_lowering.operations[ops_before:]
     assert len(new_ops) == 1 and isinstance(new_ops[0], ComputedBuffer), (
@@ -862,6 +740,9 @@ def lower_identity_clone(
         orig_stl.device_dtype,
         orig_stl.element_arrangement,
     )
+    # insert_restickify_padding runs after propagate_spyre_tensor_layouts, so
+    # run_node left this op with a FlexibleLayout; assign a FixedTiledLayout
+    # here so the clone carries a real device layout.
     clone_buf.layout = FixedTiledLayout(
         host_layout.device,
         host_layout.dtype,
@@ -870,8 +751,6 @@ def lower_identity_clone(
         clone_stl,
     )
 
-    # LX planning reads origin_node directly on the ComputedBuffer.
-    object.__setattr__(clone_buf, "origin_node", clone_fx)
     assert clone_buf.origins, "lower_identity_clone: clone buffer has no origins"
 
     return clone_buf, new_ops
@@ -881,38 +760,28 @@ def _assert_input_paddable(
     op: ComputedBuffer, in_dep, in_layout, new_stick_dim: int
 ) -> None:
     """Raise ``Unsupported`` for restickify inputs the stick-boundary grow cannot
-    pad, classifying each input dim's read by its coordinate.
+    pad yet, classifying each input dim's read by its coordinate.
 
-    The grow widens the read to a stick boundary; it cannot re-base a read that
-    begins partway into a stick (a stick has no start offset -- it always begins
-    at its first element), nor gather non-adjacent rows.  Two read shapes are
-    unpaddable and must fail loudly, not miscompile:
+    Not yet supported, and must fail loudly rather than miscompile:
 
     - **Strided** read of any dim (coord ``k*var``, k not in {0, 1}: step > 1 or
-      reversed), e.g. ``x[::2].transpose(1, 2).clone()``.  Codegen masks only a
-      *contiguous* tail, so it would silently read the wrong rows.
+      reversed), e.g. ``x[::2].transpose(1, 2).clone()``.
     - **Narrowing slice on the new-stick dim** (iter range < dim size), e.g.
-      ``x[:, :, 1:66, :].transpose(-2, -1).clone()``, whose slice becomes the new
-      stick and starts partway into a stick.  Both input-pad paths grow the read
-      feeding the restickify, so the displacement survives into codegen either way.
+      ``x[:, :, 1:66, :].transpose(-2, -1).clone()``.
 
-    TODO: both raises are removable by double-restickifying -- a re-base copy that
-    reads the sliced/strided source and materializes a fresh buffer starting at a
-    stick boundary, then restickifies that (the grow can pad such a buffer).
+    TODO: both are liftable by double-restickifying -- a re-base copy that reads
+    the sliced/strided source into a fresh stick-aligned buffer, then
+    restickifies that (the grow can pad such a buffer). Once implemented,
+    expressions that currently hit these raises would take that path instead
+    and never reach this guard.
 
-    Two read shapes are fine and flow through unchanged:
+    Fine, and flow through unchanged:
 
     - **Contiguous offset** on a non-stick dim (coord ``var + c``), e.g.
-      ``x[:, 1:, :]``: codegen's offset/gap primitive carries it.
-    - **Broadcast** read: a dim iterated wider than its size, so the same elements
-      are re-read, e.g. ``k.view(B, S, H, D).transpose(1, 2).transpose(2, 3)`` on a
-      ``[B, S, H, 2, 1, D/2]`` input, whose folded size-2 dim is read repeatedly.
-      Its coordinate has a zero coefficient (``floor(v/64)`` / ``Mod(v, 64)`` --
-      the loop var does not advance the read position), which is why it is not a
-      stride: codegen takes the read's strides from the device layout rather than
-      this coefficient, so the repeated block is read correctly.  The broadcast dim
-      is never the dim we grow, so it is left as-is while the new-stick dim is
-      padded (see ``test_broadcast_input_transpose_clone``).
+      ``x[:, 1:, :]``.
+    - **Broadcast** read (coeff 0), e.g.
+      ``k.view(B, S, H, D).transpose(1, 2).transpose(2, 3)`` on a
+      ``[B, S, H, 2, 1, D/2]`` input (see ``test_broadcast_input_transpose_clone``).
     """
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     for i, coord in enumerate(in_host_coords):
@@ -931,12 +800,12 @@ def _assert_input_paddable(
         # partway into a stick); a narrowed non-stick dim is a carried offset.
         if i != new_stick_dim:
             continue
-        iter_range = _dep_range(in_dep, sym)
+        range_size = _symbol_range_size(in_dep, sym)
         dim_size = concretize_expr(in_layout.size[i])
-        if iter_range is not None and iter_range != dim_size:
+        if range_size is not None and range_size != dim_size:
             raise Unsupported(
                 f"insert_restickify_padding: sliced input on host dim "
-                f"{i} of {op.get_name()} (iter range {iter_range} != "
+                f"{i} of {op.get_name()} (iter range {range_size} != "
                 f"dim size {dim_size}) is not supported"
             )
 
@@ -949,63 +818,27 @@ def _pad_restickify_input(
     """Read-side fix: ensure the restickify reads a grow-able ``ComputedBuffer``
     whose stick-carrying dim is padded to a stick boundary.
 
-    Both arms grow the device allocation ONLY, leaving host_size honest (see
-    ``_grow_input_stick_dim``).  A restickify whose output stick is carved from
-    the input's own already-full stick therefore needs no special skip: growing
-    its device dim to a stick boundary it is already at is a no-op, and the honest
-    host_size keeps any tracked named dim the input carries (a matmul's
-    contraction dim) intact for ``propagate_named_dims``.
-
-    Declines up front when there is no over-read to cover -- the new stick dim is
-    already a stick multiple (so the read never runs past the true dim size), or
-    it is a size-1 host dim (one real lane, nothing past it; codegen's
-    ``_restore_elided_restickify_stick`` supplies the padded lanes on the elided
-    output stick).
-
-    The candidate splits into two mutually-exclusive arms on whether we own the
-    input buffer; they share the same device-only grow (``_grow_input_stick_dim``,
-    which asserts a bumpable device dim exists) but differ in the buffer they grow:
-
-    - **Producer arm** -- the input is a ``ComputedBuffer`` we produced.  Grow it
-      in place (cheap: no extra buffer, no copy, no HBM round-trip).  The grow
-      cannot fail here: after the size-1 decline above, ``new_stick_dim`` carries a
-      single non-size-1 free symbol, and ``is_restickify`` fired for this candidate
-      (in-stick != out-stick), so that symbol must project onto a device dim other
-      than the within-stick one -- it never silently escalates to the clone arm.
-    - **Clone arm** -- the input is a graph input whose allocation is not ours to
-      widen (not a ``ComputedBuffer``).  Insert an identity clone ahead of the
-      restickify, grow the clone, and redirect the restickify to read it.  A fresh
-      contiguous clone always exposes the device dim.
-
-    A read the grow cannot carry (mid-stick start on the new-stick dim, or a
-    strided read) is refused loudly (``_assert_input_paddable``) up front, before
-    either arm: the read feeding the restickify is the same regardless of which
-    buffer we grow, so growing the producer we own does not undo it any more than
-    growing a clone would.  The producer arm is grown in place with no separate
-    read, so the guard is the only thing standing between it and a silent
-    miscompile.
+    Does nothing when there is no over-read to cover (the new-stick dim is
+    already a stick multiple, or is a size-1 host dim). Otherwise validates the
+    read is paddable (``_assert_input_paddable``), then grows the producer in
+    place if we own it, or inserts and grows an identity clone for a graph
+    input.
     """
     assert isinstance(op, ComputedBuffer)
     in_dep, in_buf, in_layout = _restickify_input(op, graph)
     assert in_dep is not None  # op is a confirmed restickify
-    # Skip when the new-stick DIM is already a stick multiple: the read never runs
-    # past the true dim size, so there is nothing to pad.  This keys off the dim's
-    # declared size, not the read's iteration range -- for a slice that lands on a
-    # dim the transpose turns non-stick, the range is the narrowed extent while the
-    # dim is a full stick (x[3:66].transpose(0, 1) -> new_stick_dim size 128, range
-    # 63); the aligned full dim must skip, and the narrowing is a carried offset a
-    # non-stick dim tolerates (test_sliced_transpose_stick_expr_compiles).
+    # Skip when the new-stick dim is already a stick multiple: the read never runs
+    # past the true dim size. Keyed off the declared size, not the iteration range
+    # (a slice landing here, e.g. x[3:66].transpose(0, 1), has range 63 < size 128
+    # but must still skip -- the narrowing is a carried offset, not an unaligned
+    # dim; test_sliced_transpose_stick_expr_compiles).
     host_size = [concretize_expr(s) for s in in_layout.size]
     if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
         return
-    # Skip when the new-stick dim is a size-1 host dim (symbol-free coord): there
-    # is no over-read to cover.  The read is fully described by the input's live
-    # OLD stick (already padded to a stick boundary); the new stick carries one
-    # real lane and no data past it, so there is nothing to pad.  Codegen's
-    # _restore_elided_restickify_stick inserts the 63 padded lanes on the elided
-    # output stick, and none of them is ever read.  Growing here would only widen
-    # a device dim that may carry a tracked named dim, and the size-1 device dim
-    # is the -1-marked singleton the codegen restore handles directly.
+    # Skip when the new-stick dim is size-1 (symbol-free coord): the read is fully
+    # covered by the input's already-padded old stick, and codegen's
+    # _restore_elided_restickify_stick supplies the padded lanes on the elided
+    # output stick without ever reading them -- nothing here needs padding.
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     if _single_free_sym(in_host_coords[new_stick_dim]) is None:
         return
@@ -1015,17 +848,14 @@ def _pad_restickify_input(
     # path.
     _assert_input_paddable(op, in_dep, in_layout, new_stick_dim)
 
-    # Producer arm: a ComputedBuffer we produced.  Grow it in place (cheap: no
-    # extra buffer, no copy, no HBM round-trip).  The grow cannot fail here (it
-    # asserts a bumpable device dim exists) -- it never silently escalates to the
-    # clone arm.
+    # Producer arm: grow the ComputedBuffer we produced in place (cheap -- no
+    # extra buffer or copy). Cannot fail here (see _grow_input_stick_dim's assert).
     if isinstance(in_buf, ComputedBuffer):
         _grow_input_stick_dim(in_buf, new_stick_dim, kind="producer")
         return
 
-    # Clone arm (graph input only): in_buf is not a ComputedBuffer, so its
-    # allocation is not ours to widen.  Materialise an identity clone ahead of the
-    # restickify, grow the clone device-size-only, and redirect the read to it.
+    # Clone arm (graph input only): materialise an identity clone ahead of the
+    # restickify, grow it, and redirect the read to it.
     device = in_buf.get_device()
     if device is None:
         return
@@ -1062,21 +892,18 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
     A restickify re-tiles a tensor so a different host dim lands within the
     stick.  Codegen widens both its read and its write to stick boundaries,
-    which exposes two independent hazards, each with its own fix:
+    which exposes two independent hazards, each with its own fix, attempted
+    independently since either can apply without the other:
 
-    - Write side (``_pad_restickify_output``): when the new stick dim spans
-      more than one stick block, the output's old-stick host dim becomes a
-      non-stick device dim; if its dim size is not a stick multiple the second+
-      block lands at the wrong physical offset.  Always attempted.
-    - Read side (``_pad_restickify_input``): when the new stick dim's size is not
-      a stick multiple the read runs past the true dim size.  Grows the producer
-      in place when we own the buffer (a ``ComputedBuffer``); for a graph input we
-      do not own, inserts a device-size-bumped identity clone and redirects the
-      restickify to read it.
+    - Write side (``_pad_restickify_output``): the output's old-stick host dim
+      can land at the wrong physical offset.
+    - Read side (``_pad_restickify_input``): the read can run past the true dim
+      size into uninitialized HBM.
 
-    The two are orthogonal — e.g. a 128x67 transpose has an aligned input
-    stick dim (128) but an unaligned non-stick dim (67), so only the write-side
-    fix fires.
+    Both fixes only grow a device dim size, never a host tensor dim size, so
+    later passes that key off host sizes (e.g. ``propagate_named_dims``) are
+    unaffected; the resulting host/device size gap is what codegen's backGap
+    path fills in.
     """
     for op in list(graph.operations):
         match = _identify_restickify(op, graph)
