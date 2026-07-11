@@ -700,11 +700,12 @@ def _pad_restickify_output(
     if device_dim is None:
         return
     # Already a stick multiple: stick blocks land aligned, no padding needed.
-    if stl.device_size[device_dim] % get_elem_in_stick(out_layout.dtype) == 0:
+    old_dim_size = stl.device_size[device_dim]
+    pad = compute_padding(old_dim_size, out_layout.dtype)
+    if pad == 0:
         return
 
-    old_dim_size = stl.device_size[device_dim]
-    new_dim_size = old_dim_size + compute_padding(old_dim_size, out_layout.dtype)
+    new_dim_size = old_dim_size + pad
     op.layout = _pad_layout_device_dim(out_layout, device_dim, new_dim_size)
     logger.debug(
         "insert_restickify_padding: padded output %s device dim %d %d -> %d",
