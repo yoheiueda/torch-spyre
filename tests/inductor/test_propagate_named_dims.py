@@ -209,7 +209,7 @@ def test_2d_add_transposed_unaligned_padded():
     already aligned, pad 0): it exercises the ``pad > 0`` path and asserts the
     named dims survive the layout grow.  Padding that dim used to relabel a
     tracked name to ``_untracked_*`` (the class of miscompile guarded against in
-    _identify_restickify_candidate); here padding is genuinely required, and the
+    _identify_restickify); here padding is genuinely required, and the
     names must be preserved, not dropped.
 
     No _spyre_hint here: tiling the padded dim collides with the restickify's

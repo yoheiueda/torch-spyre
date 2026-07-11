@@ -405,6 +405,29 @@ def _named_write_dep(op):
     return next(d for d in op.get_read_writes().writes if hasattr(d, "name"))
 
 
+def _restickify_input(op, graph: GraphLowering):
+    """Return ``(in_dep, in_buf, in_layout)`` for a restickify's single input, or
+    None if ``op`` cannot be one (not a single-named-read pointwise copy whose
+    input buffer has a FixedTiledLayout).
+
+    A restickify has exactly one named read.  ``_identify_restickify`` uses this
+    to gate and classify; the bump helpers re-derive the same three off ``op``
+    (rather than threading them through the driver), and can assume it succeeds --
+    ``_identify_restickify`` returned non-None for the same ``op``.
+    """
+    reads = [r for r in op.get_read_writes().reads if hasattr(r, "name")]
+    if len(reads) != 1:
+        return None
+    in_dep = reads[0]
+    in_buf = graph.get_buffer(in_dep.name)
+    if in_buf is None:
+        return None
+    in_layout = in_buf.get_layout()
+    if not isinstance(in_layout, FixedTiledLayout):
+        return None
+    return in_dep, in_buf, in_layout
+
+
 def _host_dim_carrying_sym(host_coords: list[Expr], sym) -> int | None:
     """Return the outermost host dim whose coordinate carries ``sym``, or None.
 
@@ -494,11 +517,11 @@ def _codegen_will_restickify(op, out_layout, in_layout, in_dep) -> bool:
     """Return whether codegen will emit a RESTICKIFY (vs IDENTITY) for ``op``.
 
     Delegates to the shared ``is_restickify`` predicate (pass_utils) that codegen
-    itself calls, so the pass and the store side cannot drift apart.  Used only by
-    the can't-happen backstop in ``_identify_restickify_candidate``: when no input
-    host dim carries the output stick, this decides skip (codegen won't restickify)
-    vs. refuse loudly (it would, so the unpadded buffer would over-read
-    uninitialized stick lanes).
+    itself calls, so the pass and the store side cannot drift apart.  This is the
+    classification ``_identify_restickify`` keys off: an op the pass would treat as
+    a restickify but codegen would not (or vice versa) is exactly the drift that
+    lets the pass skip an op codegen still restickifies, over-reading uninitialized
+    stick lanes.
 
     The pass supplies the two operands' device coords via ``_device_coords`` (the
     padding-local peer that omits ``check_stick_expr_supported`` -- only the free
@@ -527,31 +550,39 @@ def _output_stick_input_host_dim(op, out_layout, in_layout, in_dep) -> int | Non
     return _host_dim_for_stick_sym(in_host_coords, out_stick_sym, list(in_layout.size))
 
 
-def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
-    """Identify whether ``op`` is a restickify the padding pass may act on.
+def _identify_restickify(op: Operation, graph: GraphLowering):
+    """Identify whether ``op`` is a restickify, and if so return its operands.
 
-    A candidate is a single-input pointwise copy between two FixedTiledLayouts
+    A restickify is a single-input pointwise copy between two FixedTiledLayouts
     that lands a *different* host dim within the stick.  After confirming the
-    shape (pointwise, one input, both FixedTiled), it derives the two host dims
-    the padding logic needs and applies two gates that reject non-candidates:
-    the restickify test does not hold (same stick dim), or the read is a
-    broadcast.  A third branch is a can't-happen backstop: a recognized
-    restickify whose output stick maps to no input host dim is refused loudly
-    rather than skipped (see below).
+    shape (pointwise, one input, both FixedTiled), the classification is the
+    device-space ``is_restickify`` predicate codegen itself keys off
+    (``_codegen_will_restickify``) -- one authoritative test, so the pass and
+    codegen cannot drift apart and skip an op codegen still restickifies (which
+    would over-read uninitialized stick lanes on an unpadded buffer).
 
-    Returns None if ``op`` is not a candidate, else the tuple:
+    This is purely the "is it a restickify?" question.  Which dim to grow and
+    which to leave alone -- notably skipping a broadcast dim (coeff 0) or an
+    already-aligned dim -- is decided downstream by the helpers that bump the
+    dims (``_pad_restickify_output`` / ``_pad_restickify_input``), not here.
 
-    - ``in_dep`` / ``in_buf`` / ``in_layout``: the single input's dep, buffer,
-      and (FixedTiled) layout.
+    Returns None if ``op`` is not a restickify, else ``(new_stick_dim,
+    in_stick_dim)``:
+
     - ``new_stick_dim``: input host dim that becomes the output's stick dim.
     - ``in_stick_dim``: input host dim that becomes the output's "old-stick"
       non-stick device dim.
 
     Both are indices into the INPUT host dims (named for what they become on
-    the output), so they are directly comparable -- ``new_stick_dim ==
-    in_stick_dim`` is the not-a-restickify test.  Neither is an output dim
-    index: a restickify re-tiles rather than preserving ranks, so the output
-    dim carrying the new stick generally sits at a different index.
+    the output); neither is an output dim index, since a restickify re-tiles
+    rather than preserving ranks.  Once ``op`` is confirmed a restickify these
+    two dims must resolve to single symbols -- the single-symbol stick invariant
+    finalize_layouts establishes guarantees it -- so a failure to resolve either
+    is refused loudly (the invariant broke) rather than skipped, which would let
+    codegen restickify an unpadded buffer.
+
+    The input dep, buffer, and layout are not returned: the bump helpers derive
+    them from ``op`` themselves (``_restickify_input``).
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -561,61 +592,34 @@ def _identify_restickify_candidate(op: Operation, graph: GraphLowering):
     if not isinstance(op.data, Pointwise):
         return None
 
-    rw = op.get_read_writes()
-    reads = [r for r in rw.reads if hasattr(r, "name")]
-    if len(reads) != 1:
+    derived = _restickify_input(op, graph)
+    if derived is None:
         return None
-    in_dep = reads[0]
+    in_dep, _in_buf, in_layout = derived
 
-    in_buf = graph.get_buffer(in_dep.name)
-    if in_buf is None:
-        return None
-    in_layout = in_buf.get_layout()
-    if not isinstance(in_layout, FixedTiledLayout):
+    # The one authoritative test, shared with codegen's store side: it is a
+    # restickify iff the two operands' within-stick device coords carry different
+    # free symbols (a broadcast, all-zero input coords, is excluded as an identity
+    # fill).  Classifying off this -- not a host-dim proxy -- keeps the pass and
+    # codegen from drifting apart.
+    if not _codegen_will_restickify(op, out_layout, in_layout, in_dep):
         return None
 
-    # The restickify test, expressed as host dims: the input's own within-stick
-    # dim vs. the input dim that carries the output's stick symbol.  A restickify
-    # lands a *different* host dim in the stick, i.e. new_stick_dim != in_stick_dim
-    # (the free-symbol inequality is_restickify checks, projected onto host dims).
-    # These two host dims are the restickify test re-expressed in host-dim space
-    # (is_restickify compares the within-stick device symbols; the projection maps
-    # each to the input host dim carrying it).  Every skip below therefore means
-    # "not a restickify", which must agree with the device-space is_restickify
-    # codegen keys off -- else the pass would skip an op codegen still restickifies
-    # on an unpadded buffer (over-reading uninitialized stick lanes).  Agreement
-    # rests on the single-symbol stick invariant finalize_layouts establishes:
-    #
-    #   - in_stick_dim is None: the input stick coord has no single symbol.  A
-    #     symbol-free stick means a size-1 host dim in stick position (canonical
-    #     form), so the size-1 fallback resolves it; None with a real restickify
-    #     would need a symbol-free stick AND no size-1 host dim -- inconsistent.
-    #   - new_stick_dim == in_stick_dim: a restickify carries two DIFFERENT stick
-    #     symbols (is_restickify's inequality), so equal host dims would need one
-    #     input host coord to carry both -- the invariant gives one symbol per
-    #     stick dim, so it does not arise.
-    #
-    # Only new_stick_dim is None keeps a live is_restickify assertion, because it
-    # is the one path where the projection failing could plausibly hide a real
-    # restickify if the invariant ever broke (verified unreachable across the
-    # restickify + propagate suite for all three paths).
+    # Resolve the two host dims the bump helpers need: the input's own within-stick
+    # dim (in_stick_dim) and the input dim carrying the output's stick symbol
+    # (new_stick_dim).  A confirmed restickify carries two distinct single stick
+    # symbols (the single-symbol invariant finalize_layouts establishes), so both
+    # must resolve and differ; a failure means the invariant broke, so refuse
+    # loudly rather than skip and let codegen restickify an unpadded buffer.
     in_stick_dim = _project_stick_host_dim(in_layout, in_layout, in_dep)
     new_stick_dim = _output_stick_input_host_dim(op, out_layout, in_layout, in_dep)
-    if in_stick_dim is None:
-        return None
-    if new_stick_dim is None:
-        # If the invariant ever breaks and codegen would still restickify, the
-        # unpadded buffer over-reads uninitialized lanes -- refuse loudly, not skip.
-        if _codegen_will_restickify(op, out_layout, in_layout, in_dep):
-            raise Unsupported(
-                "restickify padding: output stick maps to no input host dim "
-                f"for {op.get_name()} (unexpected: layout invariant broken)"
-            )
-        return None
-    if new_stick_dim == in_stick_dim:
-        return None
-
-    return in_dep, in_buf, in_layout, new_stick_dim, in_stick_dim
+    if in_stick_dim is None or new_stick_dim is None or new_stick_dim == in_stick_dim:
+        raise Unsupported(
+            "restickify padding: codegen restickifies but the pass could not "
+            f"resolve its stick host dims for {op.get_name()} "
+            "(unexpected: layout invariant broken)"
+        )
+    return new_stick_dim, in_stick_dim
 
 
 def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | None:
@@ -667,7 +671,7 @@ def _pad_layout_device_dim(
 
 
 def _pad_restickify_output(
-    op: ComputedBuffer, in_dep, in_layout, in_stick_dim: int
+    op: Operation, graph: GraphLowering, in_stick_dim: int
 ) -> None:
     """Pad the output dim carrying the input's old stick dim to a stick boundary,
     so the second+ stick block and every batch plane land at the correct offset.
@@ -694,6 +698,10 @@ def _pad_restickify_output(
       one that collapses to a const-0 output coord, or an already-aligned dim
       needs no padding.
     """
+    assert isinstance(op, ComputedBuffer)
+    derived = _restickify_input(op, graph)
+    assert derived is not None  # op is a confirmed restickify
+    in_dep, _in_buf, in_layout = derived
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     old_sym = _single_free_sym(in_host_coords[in_stick_dim])
     out_layout = op.get_layout()
@@ -1002,11 +1010,8 @@ def _assert_input_paddable(
 
 
 def _pad_restickify_input(
-    op: ComputedBuffer,
-    operations: list[Operation],
-    in_dep,
-    in_buf,
-    in_layout,
+    op: Operation,
+    graph: GraphLowering,
     new_stick_dim: int,
 ) -> None:
     """Read-side fix: ensure the restickify reads a grow-able ``ComputedBuffer``
@@ -1048,6 +1053,10 @@ def _pad_restickify_input(
     read, so the guard is the only thing standing between it and a silent
     miscompile.
     """
+    assert isinstance(op, ComputedBuffer)
+    derived = _restickify_input(op, graph)
+    assert derived is not None  # op is a confirmed restickify
+    in_dep, in_buf, in_layout = derived
     # Skip when the new-stick DIM is already a stick multiple: the read never runs
     # past the true dim size, so there is nothing to pad.  This keys off the dim's
     # declared size, not the read's iteration range -- for a slice that lands on a
@@ -1108,10 +1117,12 @@ def _pad_restickify_input(
     _grow_input_stick_dim(clone_buf, new_stick_dim, kind="clone")
 
     # Move the clone op to just before the restickify (run_node appends).
-    _move_ops_before(operations, new_ops, op)
+    _move_ops_before(graph.operations, new_ops, op)
 
     # Redirect the restickify to read the clone (wrap-not-reconstruct).
-    redirect_computed_buffer_reads(op, {in_dep.name: clone_buf.get_name()}, operations)
+    redirect_computed_buffer_reads(
+        op, {in_dep.name: clone_buf.get_name()}, graph.operations
+    )
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
@@ -1136,14 +1147,11 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
     stick dim (128) but an unaligned non-stick dim (67), so only the write-side
     fix fires.
     """
-    operations = graph.operations
-    for op in list(operations):
-        match = _identify_restickify_candidate(op, graph)
+    for op in list(graph.operations):
+        match = _identify_restickify(op, graph)
         if match is None:
             continue
-        in_dep, in_buf, in_layout, new_stick_dim, in_stick_dim = match
-        # ComputedBuffer guaranteed by _identify_restickify_candidate
-        assert isinstance(op, ComputedBuffer)
+        new_stick_dim, in_stick_dim = match
 
-        _pad_restickify_output(op, in_dep, in_layout, in_stick_dim)
-        _pad_restickify_input(op, operations, in_dep, in_buf, in_layout, new_stick_dim)
+        _pad_restickify_output(op, graph, in_stick_dim)
+        _pad_restickify_input(op, graph, new_stick_dim)
