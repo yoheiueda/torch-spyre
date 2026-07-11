@@ -318,7 +318,7 @@ def is_restickify(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
 
     The one authoritative restickify test, shared by the codegen store side
     (``SpyreKernel.store`` in spyre_kernel.py) and the padding pass's candidate
-    matcher (``_codegen_will_restickify`` in padding.py) so the two cannot drift
+    matcher (``_identify_restickify`` in padding.py) so the two cannot drift
     apart -- a disagreement would let the pass skip an op codegen then
     restickifies on an unpadded buffer, over-reading uninitialized stick lanes.
 
