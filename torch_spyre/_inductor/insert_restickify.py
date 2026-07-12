@@ -155,7 +155,7 @@ def insert_restickify_on_node_inputs(
         op_index += 1  # consumer shifted right by 1
 
     # Patch inner_fn with the full name_map and reconstruct the consumer so its
-    # sizes/body cache is invalidated (carries _size1_stick_alloc_dim across).
+    # sizes/body cache is invalidated.
     redirect_computed_buffer_reads(op, name_map, operations)
 
 

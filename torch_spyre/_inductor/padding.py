@@ -43,6 +43,8 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
+import math
+
 import torch
 from sympy import Expr
 from torch._inductor.graph import GraphLowering
@@ -545,6 +547,33 @@ def _pad_layout_device_dim(
     )
 
 
+def _grow_size1_stick_dim(
+    layout: FixedTiledLayout, device_dim: int
+) -> FixedTiledLayout:
+    """Return a copy of ``layout`` with a collapsed size-1 old-stick device dim
+    grown to a full stick, giving it its real per-step host stride.
+
+    Unlike ``_pad_layout_device_dim`` (which only grows the extent), the size-1
+    collapse recorded the dim's host stride as the -1 singleton marker, so the
+    grown dim must also be given a real stride: the product of the host extents
+    (the size-1 host dim contributes 1).  This keeps DMA readback addressing the
+    right plane once the dim iterates a full stick.
+    """
+    stl = layout.device_layout
+    new_device_size = list(stl.device_size)
+    new_device_size[device_dim] = stl.elems_per_stick()
+    new_stride_map = list(stl.stride_map)
+    new_stride_map[device_dim] = math.prod(concretize_expr(s) for s in layout.size)
+    grown_stl = SpyreTensorLayout(
+        new_device_size, new_stride_map, stl.device_dtype, stl.element_arrangement
+    )
+    host_size = [concretize_expr(s) for s in layout.size]
+    host_stride = [concretize_expr(s) for s in layout.stride]
+    return FixedTiledLayout(
+        layout.device, layout.dtype, host_size, host_stride, grown_stl
+    )
+
+
 def _pad_restickify_output(
     op: Operation, graph: GraphLowering, in_stick_dim: int
 ) -> None:
@@ -556,9 +585,11 @@ def _pad_restickify_output(
     the old stick's host coord has no surviving host dim, or its device dim is
     already stick-aligned.
 
-    If the old stick collapsed to a size-1 device dim (no symbol), it can't
-    grow in place here -- see the comment at ``op._size1_stick_alloc_dim``
-    below -- so it's tagged for the scheduler to grow after ``align_tensors``.
+    If the old stick collapsed to a size-1 device dim (no symbol), the same grow
+    applies via ``_grow_size1_stick_dim``: the prealign restore
+    (_restore_elided_restickify_stick_prealign) mints the stick's iteration
+    symbol onto this grown dim, so growing it here keeps the allocation and the
+    restored descriptor in agreement.
     """
     assert isinstance(op, ComputedBuffer)
     in_dep, _in_buf, in_layout = _restickify_input(op, graph)
@@ -591,14 +622,19 @@ def _pad_restickify_output(
 
         size1_dim = _locate_size1_grow_dim(stl, tiebreak=_old_stick_size1_dim)
         if size1_dim is not None:
-            # A size-1 grow before align_tensors yields a fractional coordinate
-            # normalize_coordinates rejects; defer to _grow_size1_stick_allocations.
-            op._size1_stick_alloc_dim = size1_dim
+            # Grow the collapsed old-stick dim to a full stick so the allocation
+            # matches the restored descriptor's 64-plane write.  The prealign
+            # restore (_restore_elided_restickify_stick_prealign) lands the
+            # restored stick symbol on this same grown dim, so descriptor
+            # coordinates and physical allocation agree.  The dim's host stride
+            # was recorded as the -1 singleton marker (a size-1 host dim); its
+            # real per-step stride is the product of the host extents.
+            op.layout = _grow_size1_stick_dim(out_layout, size1_dim)
             logger.debug(
-                "insert_restickify_padding: tagged size-1 output %s device dim %d "
-                "for scheduler-window alloc grow",
+                "insert_restickify_padding: grew size-1 output %s device dim %d -> %d",
                 op.get_name(),
                 size1_dim,
+                stl.elems_per_stick(),
             )
         return
 

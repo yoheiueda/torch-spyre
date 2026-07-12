@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import Sequence, Union
 
 import sympy
@@ -39,65 +38,6 @@ from .logging_utils import get_inductor_logger
 from .op_spec import LoopSpec
 
 logger = get_inductor_logger("scheduler")
-
-
-def _grow_size1_stick_allocations(node_schedule) -> None:
-    """Grow a restickify output's collapsed size-1 old-stick device dim to a full
-    stick so the allocation matches the restored descriptor's 64-plane write.
-
-    ``insert_restickify_padding`` tags the exact dim with
-    ``op._size1_stick_alloc_dim`` (it cannot grow it there — a grown size-1 dim
-    yields the ``7*c0/64`` fractional coordinate that ``normalize_coordinates``
-    rejects).  This runs in the scheduler window after ``codegen_kernel``
-    (align_tensors has finished reading the size-1 STL) and before ``mark_run``
-    (which reprs the STL into ``spyre_empty_with_layout``), so the grown extent
-    reaches the allocation but never reaches align.
-
-    The grown dim gets its real per-step host stride (recovered from the host
-    layout, since the size-1 collapse recorded it as the -1 singleton marker) so
-    DMA readback addresses the right plane; only the physical allocation widens.
-    """
-    from torch_spyre._C import SpyreTensorLayout
-    from .ir import FixedTiledLayout
-    from .pass_utils import concretize_expr
-
-    seen: set[str] = set()
-    for snode in node_schedule:
-        for buf in getattr(snode, "get_outputs", lambda: [])():
-            op = buf.node
-            if op is None or op.get_name() in seen:
-                continue
-            seen.add(op.get_name())
-            device_dim = getattr(op, "_size1_stick_alloc_dim", None)
-            layout = getattr(op, "layout", None)
-            if device_dim is None or not isinstance(layout, FixedTiledLayout):
-                continue
-            stl = layout.device_layout
-            dsize = list(stl.device_size)
-            smap = list(stl.stride_map)
-            stick = stl.elems_per_stick()
-            dsize[device_dim] = stick
-            # The collapsed dim maps to a size-1 host dim, so its host stride was
-            # recorded as the -1 singleton marker.  The real per-step host stride
-            # is the product of the (non-collapsed) host extents — with the
-            # size-1 dim contributing 1, that is simply prod(host_size).
-            smap[device_dim] = math.prod(concretize_expr(s) for s in layout.size)
-            new_stl = SpyreTensorLayout(
-                dsize, smap, stl.device_dtype, stl.element_arrangement
-            )
-            op.layout = FixedTiledLayout(
-                layout.device,
-                layout.dtype,
-                list(layout.size),
-                list(layout.stride),
-                new_stl,
-            )
-            logger.debug(
-                "size1-stick alloc-grow: %s device dim %d -> extent %d",
-                op.get_name(),
-                device_dim,
-                stick,
-            )
 
 
 class CountedLoopSchedulerNode(FusedSchedulerNode):
@@ -382,15 +322,6 @@ class SuperDSCScheduling(BaseScheduling):
         kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)
         kernel.kernel_name = kernel_name
         kernel.code_hash = code_hash(src_code)
-
-        # Window between codegen_kernel (align_tensors has finished reading each
-        # output STL) and mark_run (which emits the allocation from that STL).
-        # A restickify whose input stick host dim is size 1 leaves the collapsed
-        # old-stick output dim at device_size 1 / stride_map -1, so the buffer
-        # allocates one plane while the restored descriptor writes 64.  Grow it
-        # here, after align but before allocation, so the allocation is wide
-        # enough and align never sees the grown (fractional-coordinate) form.
-        _grow_size1_stick_allocations(all_schedule_nodes)
 
         with V.set_kernel_handler(kernel):
             for snode in all_schedule_nodes:

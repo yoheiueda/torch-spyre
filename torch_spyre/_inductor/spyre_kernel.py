@@ -1118,6 +1118,12 @@ def _restore_elided_restickify_stick_prealign(op_spec) -> None:
     Restoring the stick *before* align (rather than at SDSC time) means align --
     not a downstream fixup -- mints the iteration symbol, so the size-1 case
     reduces to the ordinary N>=2 path.
+
+    For the INPUT-elided direction the restored stick lands on the live (output)
+    operand's old-stick device dim, which ``insert_restickify_padding`` has
+    already grown to a full stick (``_pad_restickify_output``).  We place ``rs``
+    on that same grown dim so the descriptor coordinates and the physical
+    allocation agree on which dim carries the stick.
     """
     if op_spec.op != RESTICKIFY_OP or len(op_spec.args) != 2:
         return
@@ -1186,10 +1192,16 @@ def _restore_elided_restickify_stick_prealign(op_spec) -> None:
             *(c.free_symbols for c in real_coords if s_live not in c.free_symbols),
             set(),
         )
+        # The collapsed old-stick dim is a const-0 slot: symbol-free, and either
+        # still size-1 (a leftover elide align will drop) or grown to a full stick
+        # by insert_restickify_padding (_pad_restickify_output grows the live
+        # operand's old-stick device dim to stick_size so the allocation matches
+        # the restored 64-plane descriptor).
         const0_slots = [
             i
             for i in range(len(live_coords) - 1)
-            if not live_coords[i].free_symbols and concretize_expr(live_size[i]) == 1
+            if not live_coords[i].free_symbols
+            and concretize_expr(live_size[i]) in (1, stick_size)
         ]
         anchor_live_rank = next(
             (
@@ -1199,7 +1211,15 @@ def _restore_elided_restickify_stick_prealign(op_spec) -> None:
             ),
             None,
         )
-        if anchor_live_rank is None:
+        # The padding pass already widened exactly the old-stick dim to a full
+        # stick, so if a grown slot exists rs must land on that same dim -- coords
+        # and allocation would otherwise disagree on which dim carries the stick.
+        grown_slots = [
+            i for i in const0_slots if concretize_expr(live_size[i]) == stick_size
+        ]
+        if grown_slots:
+            insert_slot = grown_slots[0]
+        elif anchor_live_rank is None:
             # No shared anchor (only rs and s_live participate): rs takes the
             # const-0 slot on the same end s_live sits among the reals.
             insert_slot = const0_slots[0] if s_live_real_rank == 0 else const0_slots[-1]

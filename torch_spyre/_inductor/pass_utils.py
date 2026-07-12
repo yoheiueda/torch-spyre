@@ -1133,8 +1133,6 @@ def replace_computed_buffer_body(
     new_buf.operation_name = op.operation_name
     new_buf.origins = op.origins
     new_buf.origin_node = op.origin_node
-    if hasattr(op, "_size1_stick_alloc_dim"):
-        new_buf._size1_stick_alloc_dim = op._size1_stick_alloc_dim
     copy_op_metadata(op, new_buf)
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
 
@@ -1177,11 +1175,6 @@ def redirect_computed_buffer_reads(
     cleanly invalidated (the reconstruct is the reason both this helper and
     ``replace_computed_buffer_body`` rebuild rather than mutate in place).
 
-    Carries every metadata field downstream passes depend on, including
-    ``_size1_stick_alloc_dim`` — the scheduler's size-1 stick-allocation grow
-    tag, which would otherwise be dropped by the reconstruct and leave the
-    descriptor writing a full stick into a one-plane allocation.
-
     Returns the replacement ComputedBuffer.
     """
     orig_inner = op.data.inner_fn
@@ -1204,8 +1197,6 @@ def redirect_computed_buffer_reads(
     new_buf.operation_name = op.operation_name
     new_buf.origins = op.origins
     new_buf.origin_node = op.origin_node
-    if hasattr(op, "_size1_stick_alloc_dim"):
-        new_buf._size1_stick_alloc_dim = op._size1_stick_alloc_dim
     copy_op_metadata(op, new_buf)
 
     op_idx = operations.index(op)
