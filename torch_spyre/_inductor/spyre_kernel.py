@@ -1149,9 +1149,6 @@ def _restore_elided_restickify_stick_prealign(op_spec) -> None:
         idx += 1
     rs = sympy.Symbol(f"rs{idx}")
 
-    # The live operand's own stick symbol -- the transpose target we must keep.
-    s_live = next(iter(live_arg.device_coordinates[-1].free_symbols))
-
     # ELIDED operand: keep its real (non-size-1) dims, drop the collapsed size-1
     # const-0 slots, and wrap the restored stick around them as
     # [floor(rs/64)] + reals + [Mod(rs, 64)] -- rs becomes this operand's stick.
@@ -1182,61 +1179,17 @@ def _restore_elided_restickify_stick_prealign(op_spec) -> None:
         live_coords.insert(0, rs)
         live_size.insert(0, stick_size)
     else:
-        # INPUT-elided: the restored OLD stick lands at the rank that mirrors where
-        # s_live sits bare among the ELIDED operand's real coords, so align matches
-        # the shared real dims by symbol and the transpose swaps rs <-> s_live.
-        s_live_real_rank = next(
-            i for i, c in enumerate(real_coords) if s_live in c.free_symbols
-        )
-        other_real_syms = set().union(
-            *(c.free_symbols for c in real_coords if s_live not in c.free_symbols),
-            set(),
-        )
-        # The collapsed old-stick dim is a const-0 slot: symbol-free, and either
-        # still size-1 (a leftover elide align will drop) or grown to a full stick
-        # by insert_restickify_padding (_pad_restickify_output grows the live
-        # operand's old-stick device dim to stick_size so the allocation matches
-        # the restored 64-plane descriptor).
-        const0_slots = [
+        # INPUT-elided: the restored OLD stick lands on the live (output) operand's
+        # old-stick device dim.  insert_restickify_padding (_pad_restickify_output)
+        # has already grown exactly that dim to a full stick, so it is the sole
+        # symbol-free device dim of size stick_size; place rs there so descriptor
+        # coordinates and physical allocation agree on which dim carries the stick.
+        insert_slot = next(
             i
             for i in range(len(live_coords) - 1)
             if not live_coords[i].free_symbols
-            and concretize_expr(live_size[i]) in (1, stick_size)
-        ]
-        anchor_live_rank = next(
-            (
-                i
-                for i in range(len(live_coords))
-                if live_coords[i].free_symbols & other_real_syms
-            ),
-            None,
+            and concretize_expr(live_size[i]) == stick_size
         )
-        # The padding pass already widened exactly the old-stick dim to a full
-        # stick, so if a grown slot exists rs must land on that same dim -- coords
-        # and allocation would otherwise disagree on which dim carries the stick.
-        grown_slots = [
-            i for i in const0_slots if concretize_expr(live_size[i]) == stick_size
-        ]
-        if grown_slots:
-            insert_slot = grown_slots[0]
-        elif anchor_live_rank is None:
-            # No shared anchor (only rs and s_live participate): rs takes the
-            # const-0 slot on the same end s_live sits among the reals.
-            insert_slot = const0_slots[0] if s_live_real_rank == 0 else const0_slots[-1]
-        else:
-            anchor_elided_rank = next(
-                i for i, c in enumerate(real_coords) if c.free_symbols & other_real_syms
-            )
-            if s_live_real_rank < anchor_elided_rank:
-                insert_slot = max(
-                    (i for i in const0_slots if i < anchor_live_rank),
-                    default=const0_slots[0],
-                )
-            else:
-                insert_slot = min(
-                    (i for i in const0_slots if i > anchor_live_rank),
-                    default=const0_slots[-1],
-                )
         live_coords[insert_slot] = rs
         live_size[insert_slot] = stick_size
 
