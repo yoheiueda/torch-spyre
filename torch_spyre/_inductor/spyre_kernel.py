@@ -1099,9 +1099,141 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("),")
 
 
+def _restore_elided_restickify_stick_prealign(op_spec) -> None:
+    """Restore a size-1 restickify stick BEFORE align_tensors (in place).
+
+    A restickify swaps which host dim lands inside the 128-byte stick.  When the
+    dim on EITHER side of the swap has host size 1, upstream Inductor never emits
+    a loop symbol for it, so exactly one operand's within-stick (last)
+    coordinate collapses to the constant ``0`` -- the "elided" operand.  With no
+    iteration symbol the two operands disagree on which dim carries the stick and
+    the backend cannot build a dimension mapping.
+
+    We mint a fresh range-64 symbol ``rs0`` for the elided stick and rewrite both
+    operands into the same N>=2 form align expects, so align matches them cleanly
+    (no synthesized range-1 var, no rank inflation) and emits the standard
+    3-symbol restickify descriptor.  The mirror-image OUTPUT-elided direction is
+    handled by the same code with the operand roles swapped.
+
+    Restoring the stick *before* align (rather than at SDSC time) means align --
+    not a downstream fixup -- mints the iteration symbol, so the size-1 case
+    reduces to the ordinary N>=2 path.
+    """
+    if op_spec.op != RESTICKIFY_OP or len(op_spec.args) != 2:
+        return
+
+    in_arg, out_arg = op_spec.args[0], op_spec.args[1]
+
+    def _within_stick_free(arg) -> bool:
+        return bool(arg.device_coordinates[-1].free_symbols)
+
+    in_free = _within_stick_free(in_arg)
+    out_free = _within_stick_free(out_arg)
+    # Exactly one operand's within-stick coord is the elided (symbol-free) 0.
+    # Both-live is the ordinary N>=2 case; both-elided is a producer-elision case
+    # handled separately in codegen.
+    if in_free == out_free:
+        return
+    elided_arg, live_arg = (in_arg, out_arg) if not in_free else (out_arg, in_arg)
+
+    stick_size = in_arg.device_dtype.elems_per_stick()
+    used = set(op_spec.iteration_space.keys())
+    idx = 0
+    while sympy.Symbol(f"rs{idx}") in used:
+        idx += 1
+    rs = sympy.Symbol(f"rs{idx}")
+
+    # The live operand's own stick symbol -- the transpose target we must keep.
+    s_live = next(iter(live_arg.device_coordinates[-1].free_symbols))
+
+    # ELIDED operand: keep its real (non-size-1) dims, drop the collapsed size-1
+    # const-0 slots, and wrap the restored stick around them as
+    # [floor(rs/64)] + reals + [Mod(rs, 64)] -- rs becomes this operand's stick.
+    elided_coords = list(elided_arg.device_coordinates)
+    elided_size = list(elided_arg.device_size)
+    real_coords, real_sizes = [], []
+    for i in range(len(elided_coords) - 1):  # exclude within-stick
+        if elided_coords[i].free_symbols:
+            real_coords.append(elided_coords[i])
+            real_sizes.append(elided_size[i])
+    new_elided_coords = (
+        [sympy.floor(rs / stick_size)] + real_coords + [sympy.Mod(rs, stick_size)]
+    )
+    new_elided_size = [1] + real_sizes + [stick_size]
+
+    # LIVE operand: keep its own stick (already floor/Mod-decomposed, or a bare
+    # within-stick symbol align will decompose to the front) and add rs as a
+    # size-64 pass-through dim.  align later collapses any leftover const-0 size-1
+    # dims, so we only need rs at the right rank.
+    live_coords = list(live_arg.device_coordinates)
+    live_size = list(live_arg.device_size)
+
+    if in_free:
+        # OUTPUT-elided (the elided operand is the output): the restored stick is
+        # the OUTPUT's new stick; in the N>=2 descriptor it lands OUTERMOST on the
+        # live (input) operand -- ahead of every surviving batch/spatial dim --
+        # mirroring the elided operand's leading floor(rs/64).  Insert at front.
+        live_coords.insert(0, rs)
+        live_size.insert(0, stick_size)
+    else:
+        # INPUT-elided: the restored OLD stick lands at the rank that mirrors where
+        # s_live sits bare among the ELIDED operand's real coords, so align matches
+        # the shared real dims by symbol and the transpose swaps rs <-> s_live.
+        s_live_real_rank = next(
+            i for i, c in enumerate(real_coords) if s_live in c.free_symbols
+        )
+        other_real_syms = set().union(
+            *(c.free_symbols for c in real_coords if s_live not in c.free_symbols),
+            set(),
+        )
+        const0_slots = [
+            i
+            for i in range(len(live_coords) - 1)
+            if not live_coords[i].free_symbols and concretize_expr(live_size[i]) == 1
+        ]
+        anchor_live_rank = next(
+            (
+                i
+                for i in range(len(live_coords))
+                if live_coords[i].free_symbols & other_real_syms
+            ),
+            None,
+        )
+        if anchor_live_rank is None:
+            # No shared anchor (only rs and s_live participate): rs takes the
+            # const-0 slot on the same end s_live sits among the reals.
+            insert_slot = const0_slots[0] if s_live_real_rank == 0 else const0_slots[-1]
+        else:
+            anchor_elided_rank = next(
+                i for i, c in enumerate(real_coords) if c.free_symbols & other_real_syms
+            )
+            if s_live_real_rank < anchor_elided_rank:
+                insert_slot = max(
+                    (i for i in const0_slots if i < anchor_live_rank),
+                    default=const0_slots[0],
+                )
+            else:
+                insert_slot = min(
+                    (i for i in const0_slots if i > anchor_live_rank),
+                    default=const0_slots[-1],
+                )
+        live_coords[insert_slot] = rs
+        live_size[insert_slot] = stick_size
+
+    op_spec.iteration_space = {rs: (stick_size, 1), **op_spec.iteration_space}
+    elided_arg.device_coordinates = new_elided_coords
+    elided_arg.device_size = new_elided_size
+    live_arg.device_coordinates = live_coords
+    live_arg.device_size = live_size
+
+
 def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     # Both parameters must be provided together for gather kernels — indirect_sizes
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
+    # Restore a restickify's elided size-1 stick before align (see the function
+    # docstring); align then mints the iteration symbol so the size-1 case reduces
+    # to the ordinary N>=2 path.
+    _restore_elided_restickify_stick_prealign(op_spec)
     it_space = op_spec.iteration_space
 
     new_op_space_splits, new_tensors = align_tensors(

@@ -573,11 +573,12 @@ def _pad_restickify_output(
 
         def _old_stick_size1_dim(grow: list[int]) -> int:
             # Two-or-more collapsed size-1 device dims: pick the demoted old stick to
-            # grow to a full stick. Mirrors codegen: _restore_elided_restickify_stick
-            # inserts the restored old-stick symbol at new_stick_pos -- the new
-            # stick's rank among the INPUT device coords (a transpose swaps the two
-            # sticks' slots, so the old stick lands where the new stick used to sit).
-            # Growing that same slot keeps allocation and descriptor in agreement.
+            # grow to a full stick. Mirrors the restickify descriptor restore
+            # (_restore_elided_restickify_stick_prealign): the restored old-stick
+            # symbol lands at new_stick_pos -- the new stick's rank among the INPUT
+            # device coords (a transpose swaps the two sticks' slots, so the old
+            # stick lands where the new stick used to sit).  Growing that same slot
+            # keeps allocation and descriptor in agreement.
             new_sym = _stick_symbol(stl, write_dep)
             if new_sym is not None:
                 in_dev_coords = _device_coords(in_layout.device_layout, in_dep)
@@ -836,9 +837,9 @@ def _pad_restickify_input(
     if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
         return
     # Skip when the new-stick dim is size-1 (symbol-free coord): the read is fully
-    # covered by the input's already-padded old stick, and codegen's
-    # _restore_elided_restickify_stick supplies the padded lanes on the elided
-    # output stick without ever reading them -- nothing here needs padding.
+    # covered by the input's already-padded old stick, and the restickify restore
+    # (_restore_elided_restickify_stick_prealign) supplies the padded lanes on the
+    # elided output stick without ever reading them -- nothing here needs padding.
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     if _single_free_sym(in_host_coords[new_stick_dim]) is None:
         return

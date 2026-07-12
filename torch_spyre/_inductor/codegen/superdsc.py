@@ -740,174 +740,12 @@ def _rebind_stick_coords(coords: list, sym: Symbol, stick_size: int, ctx: str) -
     coords[within_idx] = Mod(sym, stick_size)
 
 
-def _restore_elided_restickify_stick(op_spec: OpSpec) -> OpSpec:
-    """Restore the size-1 stick dim that upstream Inductor elided from one of a
-    restickify's two operands.
-
-    A restickify swaps which host dim lands within the stick.  When the dim on
-    EITHER side of that swap has host size 1, upstream Inductor never creates a
-    loop symbol for it, so the operand carrying it as its stick dim gets a
-    constant ``0`` within-stick coordinate where the N>=2 case carries a live
-    symbol.  The result is a 2-dim iteration space with no KERNEL data-stage; the
-    backend cannot build a dimension mapping for the transpose and aborts
-    (``dxp_standalone`` SIGABRT).
-
-    Two mirror-image cases reach this state, distinguished by which operand's
-    within-stick coordinate is the elided ``0``:
-
-      - INPUT elided (``x.transpose(0, -1).clone()`` whose transpose *source*
-        stick dim has host size 1): the input carries the ``0``; the output's
-        within-stick coord is the live NEW stick symbol.
-      - OUTPUT elided (``(x + x).transpose(1, 3).contiguous()`` moving a size-1
-        host dim INTO the stick): the output carries the ``0``; the input's
-        within-stick coord is the live OLD stick symbol.
-
-    The two are symmetric -- only the operand roles swap.  The SDSC does not
-    encode how many real items live inside a stick, so N=2 and N=63 emit
-    byte-identical descriptors; we reproduce that same 3-dim descriptor for the
-    size-1 case by restoring the elided stick as a fresh iteration symbol at the
-    padded stick size (64):
-
-      - the ELIDED operand's ``device_size`` already carries the padded-64 stick
-        slot (grown by ``insert_restickify_padding`` on the input side; already
-        128-on-the-old-stick + 64-within on the output side, where
-        ``_pad_restickify_output`` padded the old stick); only its within-stick /
-        outer-split coordinates are the constant ``0``.  We rebind them to
-        ``Mod(sym, 64)`` / ``floor(sym / 64)`` so the restored symbol becomes
-        this operand's stick dim (``_rebind_stick_coords``).
-      - the LIVE operand is genuinely missing the 64-wide non-stick slot (its
-        elided dim collapsed to ``device_size`` 1 with a ``0`` coordinate).  We
-        drop that collapsed slot and insert the restored symbol as a padded-64
-        pass-through non-stick dim at the right rank.
-
-    Both rewrites are done on ``dataclasses.replace`` copies; the shared
-    physical layouts are never mutated.  Returns ``op_spec`` unchanged unless the
-    tightly-gated elided-stick pattern is detected.
-    """
-    if len(op_spec.args) != 2:
-        return op_spec
-
-    in_arg, out_arg = op_spec.args[0], op_spec.args[1]
-
-    # Any indirect access disqualifies the pattern.
-    if _has_indirect_access((in_arg, out_arg)):
-        return op_spec
-
-    def _within_stick_free(arg: TensorArg) -> bool:
-        return bool(arg.device_coordinates[-1].free_symbols)
-
-    # Gate: exactly one operand's within-stick coord is the elided (symbol-free)
-    # 0 while the other's is a live symbol.  Both-live (normal N>=2) and
-    # both-elided (a distinct producer-elision case, see
-    # _restore_elided_producer_stick) are not our pattern.
-    in_free = _within_stick_free(in_arg)
-    out_free = _within_stick_free(out_arg)
-    if in_free == out_free:
-        return op_spec
-    # The elided operand gets its collapsed stick coords rebound; the live
-    # operand gets its collapsed size-1 slot deleted and the restored symbol
-    # inserted.  Only the roles swap between the two directions.
-    elided_arg, live_arg = (in_arg, out_arg) if not in_free else (out_arg, in_arg)
-
-    stick_size = in_arg.device_dtype.elems_per_stick()
-    sym = _fresh_restore_symbol(op_spec)
-
-    # Prepend the restored symbol as the outermost iteration dim so the SDSC
-    # dim labels resolve to [mb, ...] (matching the N>=2 descriptor).
-    new_iteration_space = {sym: (stick_size, 1), **op_spec.iteration_space}
-
-    # The live operand's within-stick coordinate carries the OTHER stick's
-    # symbol (the transpose target on the input-elided side, the surviving old
-    # stick on the output-elided side).  The restored stick must land in the live
-    # operand's middle coords at the right rank -- see the LIVE rewrite below.
-    # The in-elided rank rule is shared with the padding pass
-    # (pass_utils.restickify_new_stick_pos); local import avoids the pass_utils ->
-    # codegen.superdsc module cycle.
-    from torch_spyre._inductor.pass_utils import restickify_new_stick_pos
-
-    other_stick_syms = live_arg.device_coordinates[-1].free_symbols
-
-    # ELIDED operand: rebind the outer-split and within-stick coordinate slots
-    # (currently the constant 0) to carry the restored symbol as its stick dim.
-    elided_coords = list(elided_arg.device_coordinates)
-    _rebind_stick_coords(elided_coords, sym, stick_size, "restickify")
-    new_elided = dataclasses.replace(elided_arg, device_coordinates=elided_coords)
-
-    # LIVE operand: the elided dim collapsed to a (size-1, constant-0) slot; drop
-    # it and insert the restored symbol as a padded-64 pass-through non-stick dim.
-    #
-    # Position matters when a batch/spatial dim survives between the old and new
-    # sticks.  In the N>=2 descriptor the restored stick lands in the middle
-    # coords at the rank the OTHER stick occupies among the ELIDED operand's
-    # coords (transpose swaps the two sticks' slots; every surviving dim keeps its
-    # place).  Reproduce that rank instead of always sitting adjacent to the
-    # within-stick coord -- the latter mis-strides the surviving batch dim and
-    # zeroes its non-first planes (see
-    # test_size1_input_stick_surviving_batch_transpose_clone).
-    live_coords = list(live_arg.device_coordinates)
-    live_size = list(live_arg.device_size)
-    elided_slot = [
-        i
-        for i in range(len(live_coords) - 1)
-        if not live_coords[i].free_symbols and live_size[i] == 1
-    ]
-    if not elided_slot:
-        raise Unsupported(
-            "restickify: cannot restore elided stick dim "
-            "(no collapsed slot to widen on the live operand)"
-        )
-    live_idx = elided_slot[0]
-    del live_coords[live_idx]
-    del live_size[live_idx]
-    if in_free:
-        # OUTPUT-elided direction: the elided within-stick coord is the constant
-        # 0 (empty symbol set), so restickify_new_stick_pos (which keys off the
-        # live within-stick symbols against the elided coords) is meaningless
-        # here.  The restored stick simply refills the collapsed slot's own rank.
-        insert_at = min(live_idx, len(live_coords) - 1)
-    else:
-        # INPUT-elided direction: the restored old stick lands at the rank the
-        # new stick occupies among the (elided) input's coords.
-        new_stick_pos = restickify_new_stick_pos(
-            elided_arg.device_coordinates, other_stick_syms
-        )
-        insert_at = new_stick_pos if new_stick_pos is not None else len(live_coords) - 1
-    # A multi-block stick (host size > 64) splits into a tile-count device dim
-    # carrying floor(stick / 64) plus the within-stick Mod term.  That tile-count
-    # dim already occupies the target rank, so the restored stick belongs one slot
-    # EARLIER -- immediately outer to the block dim, reproducing the N>=2
-    # sibling's [.., old_stick, block, ..] device order.  Inserting at the rank
-    # itself would land the stick AFTER the block dim, giving the grown size-1
-    # alloc a stride that collides with the block/batch host mapping in
-    # get_dim_map and mis-places the 2nd+ stick block (see
-    # test_size1_multi_block_transpose_clone).  A single-block stick has no real
-    # tile-count dim (its floor(.) slot is degenerate, extent 1), so the rank is
-    # already correct and the surviving-batch rule above stands unchanged.
-    multi_block = any(
-        live_size[i] >= 2
-        and live_coords[i].has(floor)
-        and (live_coords[i].free_symbols & other_stick_syms)
-        for i in range(len(live_coords) - 1)  # exclude within-stick
-    )
-    if multi_block and insert_at > 0:
-        insert_at -= 1
-    live_coords.insert(insert_at, sym)
-    live_size.insert(insert_at, stick_size)
-    new_live = dataclasses.replace(
-        live_arg, device_coordinates=live_coords, device_size=live_size
-    )
-
-    new_in, new_out = (new_elided, new_live) if not in_free else (new_live, new_elided)
-    return dataclasses.replace(
-        op_spec, iteration_space=new_iteration_space, args=[new_in, new_out]
-    )
-
-
 def _restore_elided_producer_stick(op_spec: OpSpec) -> OpSpec:
     """Restore the size-1 stick iteration symbol that upstream Inductor elided
     from a pointwise producer whose output feeds a restickify.
 
-    Companion to ``_restore_elided_restickify_stick``.  When the transpose
+    Companion to ``_restore_elided_restickify_stick_prealign`` (spyre_kernel.py),
+    which restores the restickify's OWN elided stick.  When the transpose
     source stick dim has host size 1 (e.g. ``ones(5, 3, 1).exp().transpose(
     0, -1).clone()``), the restickify's *producer* (here the ``exp``) also loses
     the stick loop symbol: its output stick host dim is size 1, so upstream
@@ -918,7 +756,8 @@ def _restore_elided_producer_stick(op_spec: OpSpec) -> OpSpec:
     already grows the producer OUTPUT's device stick slot to the padded 64, so
     physically the buffer holds a full stick -- but with no iteration symbol
     only lane 0 is written, and the restickify (forced to the N>=2 3-symbol form
-    by ``_restore_elided_restickify_stick``) reads all 64 lanes across the wrong
+    by ``_restore_elided_restickify_stick_prealign``) reads all 64 lanes across the
+    wrong
     dim.  The two operands then disagree on which dim carries the stick and only
     the aligned plane survives.
 
@@ -994,9 +833,10 @@ def _extend_restickify_to_padded(
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_restickify = op_spec.op == RESTICKIFY_OP
-    if is_restickify:
-        op_spec = _restore_elided_restickify_stick(op_spec)
-    elif not is_matmul:
+    # A restickify's own elided size-1 stick is restored before align_tensors
+    # (see _restore_elided_restickify_stick_prealign in spyre_kernel.py), so here
+    # only its pointwise producer's elided stick still needs restoring.
+    if not is_restickify and not is_matmul:
         op_spec = _restore_elided_producer_stick(op_spec)
     ndim = len(op_spec.iteration_space)
     # Detect indirect access from device_coordinates: index tensors are those

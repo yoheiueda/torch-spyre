@@ -337,15 +337,11 @@ def restickify_new_stick_pos(in_coords: list[Expr], out_stick_syms: set) -> int 
     """Return the rank the restickify's NEW stick occupies among the INPUT device
     coords: the first index whose coord carries an ``out_stick_syms`` symbol.
 
-    The one shared rule behind two independently-reasoned uses that must not drift
-    (each keeps its own downstream adaptation of the returned rank):
-
-    - codegen ``_restore_elided_restickify_stick`` (superdsc.py) inserts the
-      restored old stick into the OUTPUT coords at this rank (with a multi-block
-      decrement it applies itself, post-deletion).
-    - the padding pass ``_pad_restickify_output`` size-1 tiebreak
-      (padding.py ``_old_stick_size1_dim``) grows the size-1 device dim at this
-      rank.
+    Used by the padding pass ``_pad_restickify_output`` size-1 tiebreak
+    (padding.py ``_old_stick_size1_dim``) to grow the size-1 device dim at this
+    rank.  The size-1 restickify descriptor itself is restored before align by
+    ``_restore_elided_restickify_stick_prealign`` (spyre_kernel.py), which reasons
+    about the same swap independently on aligned coords.
 
     A transpose swaps the two sticks' slots while every surviving batch/spatial
     dim keeps its place, so the old stick lands where the new stick used to sit --
