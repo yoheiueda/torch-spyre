@@ -337,9 +337,9 @@ def restickify_new_stick_pos(in_coords: list[Expr], out_stick_syms: set) -> int 
     """Return the rank the restickify's NEW stick occupies among the INPUT device
     coords: the first index whose coord carries an ``out_stick_syms`` symbol.
 
-    Used by the padding pass ``_pad_restickify_output`` size-1 tiebreak
-    (padding.py ``_old_stick_size1_dim``) to grow the size-1 device dim at this
-    rank.  The size-1 restickify descriptor itself is restored before align by
+    Used by the padding pass ``_pad_restickify_output`` to break the size-1
+    grow-dim tie -- growing the size-1 device dim at this rank.  The size-1
+    restickify descriptor itself is restored before align by
     ``_restore_elided_restickify_stick_prealign`` (spyre_kernel.py), which reasons
     about the same swap independently on aligned coords.
 

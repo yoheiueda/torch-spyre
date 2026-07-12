@@ -341,28 +341,26 @@ def _device_coords(stl: SpyreTensorLayout, dep) -> list[Expr]:
     return compute_coordinates(stl.device_size, stl.stride_map, dep.ranges, index)
 
 
-def _locate_size1_grow_dim(stl: SpyreTensorLayout, tiebreak=None) -> int | None:
-    """Locate the size-1 (singleton) non-stick device dim that a restickify
-    grows to a stick, or None if the choice is ambiguous.
+def _size1_grow_candidates(stl: SpyreTensorLayout) -> list[int]:
+    """Return the size-1 (singleton) non-stick device dims a restickify could
+    grow to a stick.
 
-    - a sole ``-1`` marker isolates the dim -> return it;
-    - no ``-1`` marker -> fall back to a sole size-1 dim, else decline;
-    - two-or-more ``-1`` markers -> hand the candidates to ``tiebreak`` (the
-      output side breaks the tie by geometry; the input side passes None and
-      declines).
+    A size-1 host dim carries no iteration symbol, so it can't be tracked by
+    symbol; it's instead the singleton device dim marked ``stride_map == -1``
+    (the extent-1 marker set by ``coarse_tile._resize_device_layout``).  When
+    exactly one dim carries that marker the choice is unambiguous; a caller with
+    two-or-more candidates must break the tie by its own geometry, and one with
+    none falls back to a sole size-1 dim (else there is nothing to grow).
     """
     device_size = [concretize_expr(s) for s in stl.device_size]
     stride_map = list(stl.stride_map)
     size1 = [d for d in range(len(device_size) - 1) if device_size[d] == 1]
-    # A size-1 host dim carries no iteration symbol, so it can't be tracked
-    # by symbol; it's instead the singleton device dim marked stride_map ==
-    # -1 (the extent-1 marker set by coarse_tile._resize_device_layout).
     grow = [d for d in size1 if stride_map[d] == -1]
-    if len(grow) == 1:
-        return grow[0]
-    if not grow:
-        return size1[0] if len(size1) == 1 else None
-    return tiebreak(grow) if tiebreak is not None else None
+    if grow:
+        return grow
+    # No -1 marker: a sole size-1 dim is still an unambiguous grow target;
+    # two-or-more are ambiguous without markers, so offer none.
+    return size1 if len(size1) == 1 else []
 
 
 def _symbol_range_size(dep, sym) -> int | None:
@@ -601,26 +599,30 @@ def _pad_restickify_output(
     stl = out_layout.device_layout
 
     if old_sym is None:
-
-        def _old_stick_size1_dim(grow: list[int]) -> int:
-            # Two-or-more collapsed size-1 device dims: pick the demoted old stick to
-            # grow to a full stick. Mirrors the restickify descriptor restore
+        # The old stick collapsed to a size-1 device dim (no iteration symbol).
+        # Find the singleton device dim to grow back to a full stick.
+        candidates = _size1_grow_candidates(stl)
+        if len(candidates) == 1:
+            size1_dim = candidates[0]
+        elif candidates:
+            # Two-or-more collapsed size-1 device dims: pick the demoted old
+            # stick.  Mirrors the restickify descriptor restore
             # (_restore_elided_restickify_stick_prealign): the restored old-stick
-            # symbol lands at new_stick_pos -- the new stick's rank among the INPUT
-            # device coords (a transpose swaps the two sticks' slots, so the old
-            # stick lands where the new stick used to sit).  Growing that same slot
-            # keeps allocation and descriptor in agreement.
+            # symbol lands at new_stick_pos -- the new stick's rank among the
+            # INPUT device coords (a transpose swaps the two sticks' slots, so
+            # the old stick lands where the new stick used to sit).  Growing that
+            # same slot keeps allocation and descriptor in agreement.
             new_sym = _stick_symbol(stl, write_dep)
+            new_stick_pos = None
             if new_sym is not None:
                 in_dev_coords = _device_coords(in_layout.device_layout, in_dep)
                 new_stick_pos = restickify_new_stick_pos(in_dev_coords, {new_sym})
-                if new_stick_pos is not None and new_stick_pos in grow:
-                    return new_stick_pos
-            # No single symbol (e.g. an all-ones batch): every candidate is a
-            # zero-extent relabel yielding the same layout, so the first is safe.
-            return grow[0]
-
-        size1_dim = _locate_size1_grow_dim(stl, tiebreak=_old_stick_size1_dim)
+            # No single symbol (e.g. an all-ones batch) or the pos is not itself a
+            # candidate: every candidate is a zero-extent relabel yielding the
+            # same layout, so the first is safe.
+            size1_dim = new_stick_pos if new_stick_pos in candidates else candidates[0]
+        else:
+            size1_dim = None
         if size1_dim is not None:
             # Grow the collapsed old-stick dim to a full stick so the allocation
             # matches the restored descriptor's 64-plane write.  The prealign
@@ -681,10 +683,11 @@ def _restickify_input_device_dim(
     sym = _single_free_sym(host_coords[new_stick_dim])
     if sym is not None:
         return _device_dim_carrying_sym(stl, write_dep, sym)
-    # Size-1 host dim: locate the singleton producer device dim (declining if two
-    # or more -1 markers make the choice ambiguous). Defensive backstop only --
-    # _pad_restickify_input declines a size-1 new-stick read up front.
-    return _locate_size1_grow_dim(stl)
+    # Size-1 host dim: locate the singleton producer device dim, declining if
+    # two-or-more candidates make the choice ambiguous. Defensive backstop only
+    # -- _pad_restickify_input declines a size-1 new-stick read up front.
+    candidates = _size1_grow_candidates(stl)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _grow_input_stick_dim(buf: ComputedBuffer, new_stick_dim: int, kind: str) -> None:
