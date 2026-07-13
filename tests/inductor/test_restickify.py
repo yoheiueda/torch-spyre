@@ -1033,7 +1033,7 @@ def _run_capturing_padding_log(fn, *args):
         _padding.logger.removeHandler(handler)
         _padding.logger.setLevel(prev_level)
 
-    fused = sum("fused pad into producer" in m for m in records)
+    fused = sum("bumped producer" in m for m in records)
     return result, fused, records
 
 
