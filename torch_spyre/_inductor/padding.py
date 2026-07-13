@@ -680,19 +680,26 @@ def _restickify_input_device_dim(
     The caller bumps this dim to the stick boundary so the restickify's
     over-read lands inside the producer's own buffer instead of uninitialised
     HBM.
+
+    ``new_stick_dim`` always carries a live symbol here: a size-1 new-stick dim
+    (symbol-free) is the OUTPUT-elided restickify, which ``_pad_restickify_input``
+    declines up front (no over-read to cover) and codegen's
+    ``_restore_elided_restickify_stick_prealign`` restores instead -- so this
+    grow path is never entered for it.  The assert makes that routing invariant
+    loud: if a future change ever brought a size-1 new-stick dim here, guessing a
+    producer dim to grow would be a silent miscompile.
     """
     layout = producer.get_layout()
     write_dep = _write_dep(producer)
     host_coords = host_coordinates(layout, write_dep, None)
     stl = layout.device_layout
     sym = _single_free_sym(host_coords[new_stick_dim])
-    if sym is not None:
-        return _device_dim_carrying_sym(stl, write_dep, sym)
-    # Size-1 host dim: locate the singleton producer device dim, declining if
-    # two-or-more candidates make the choice ambiguous. Defensive backstop only
-    # -- _pad_restickify_input declines a size-1 new-stick read up front.
-    candidates = _size1_grow_candidates(stl)
-    return candidates[0] if len(candidates) == 1 else None
+    assert sym is not None, (
+        f"_restickify_input_device_dim: size-1 new-stick dim {new_stick_dim} on "
+        f"{producer.get_name()} reached the input grow path -- it should have been "
+        f"declined as an OUTPUT-elided restickify in _pad_restickify_input"
+    )
+    return _device_dim_carrying_sym(stl, write_dep, sym)
 
 
 def _grow_input_stick_dim(buf: ComputedBuffer, new_stick_dim: int, kind: str) -> None:
