@@ -744,9 +744,9 @@ def _restore_elided_producer_stick(op_spec: OpSpec) -> OpSpec:
     """Restore the size-1 stick iteration symbol that upstream Inductor elided
     from a pointwise producer whose output feeds a restickify.
 
-    Companion to ``_restore_elided_restickify_stick_prealign`` (spyre_kernel.py),
-    which restores the restickify's OWN elided stick.  When the transpose
-    source stick dim has host size 1 (e.g. ``ones(5, 3, 1).exp().transpose(
+    Companion to ``_restickify_restore_elided_stick`` (spyre_kernel.py), which restores
+    the restickify's OWN elided stick.  When the transpose source stick dim
+    has host size 1 (e.g. ``ones(5, 3, 1).exp().transpose(
     0, -1).clone()``), the restickify's *producer* (here the ``exp``) also loses
     the stick loop symbol: its output stick host dim is size 1, so upstream
     Inductor never emits a within-stick iteration variable and every operand's
@@ -756,8 +756,7 @@ def _restore_elided_producer_stick(op_spec: OpSpec) -> OpSpec:
     already grows the producer OUTPUT's device stick slot to the padded 64, so
     physically the buffer holds a full stick -- but with no iteration symbol
     only lane 0 is written, and the restickify (forced to the N>=2 3-symbol form
-    by ``_restore_elided_restickify_stick_prealign``) reads all 64 lanes across the
-    wrong
+    by ``_restickify_restore_elided_stick``) reads all 64 lanes across the wrong
     dim.  The two operands then disagree on which dim carries the stick and only
     the aligned plane survives.
 
@@ -834,8 +833,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_restickify = op_spec.op == RESTICKIFY_OP
     # A restickify's own elided size-1 stick is restored before align_tensors
-    # (see _restore_elided_restickify_stick_prealign in spyre_kernel.py), so here
-    # only its pointwise producer's elided stick still needs restoring.
+    # (see _restickify_restore_elided_stick in spyre_kernel.py), so here only its
+    # pointwise producer's elided stick still needs restoring.
     if not is_restickify and not is_matmul:
         op_spec = _restore_elided_producer_stick(op_spec)
     ndim = len(op_spec.iteration_space)

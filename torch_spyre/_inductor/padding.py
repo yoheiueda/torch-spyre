@@ -466,11 +466,11 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     already stick-aligned.
 
     When the old stick collapsed to a size-1 device dim (no iteration symbol),
-    no output bump is needed: the prealign restore
-    (_restore_elided_restickify_stick_prealign) synthesizes the stick's
-    iteration symbol as an outermost dim, and align reconstructs a full 64-wide
-    stick plane in the descriptor from the elided operand's floor/Mod
-    decomposition -- so the allocation and descriptor already agree.
+    no output bump is needed: the prealign restore (_restickify_restore_elided_stick)
+    synthesizes the stick's iteration symbol as an outermost dim, and align
+    reconstructs a full 64-wide stick plane in the descriptor from the elided
+    operand's floor/Mod decomposition -- so the allocation and descriptor
+    already agree.
     """
     assert isinstance(op, ComputedBuffer)
     in_dep, _in_buf, in_layout = _restickify_input(op, graph)
@@ -683,8 +683,8 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     in_dep, in_buf, in_layout = _restickify_input(op, graph)
     assert in_dep is not None  # op is a confirmed restickify
     # A None new-stick symbol means it's a size-1 host dim: codegen's restore
-    # (_restore_elided_restickify_stick_prealign) covers the elided output stick
-    # without reading the input, so there's nothing here to pad.
+    # (_restickify_restore_elided_stick) covers the elided output stick without reading
+    # the input, so there's nothing here to pad.
     out_stick_sym = _stick_symbol(op.get_layout().device_layout, _write_dep(op))
     if out_stick_sym is None:
         return
