@@ -366,6 +366,21 @@ def _host_dim_carrying_sym(host_coords: list[Expr], sym) -> int | None:
     return None
 
 
+def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | None:
+    """Return the outermost non-within-stick ``device_size`` dim whose device
+    coordinate carries ``sym`` (the free symbol of some host dim), or None.
+    """
+    # Two host dims can share a dim size, so only the symbol unambiguously
+    # identifies the dim.  A symbol whose range spans more than one tile can
+    # appear split across several coordinates (e.g. v // 64 in one, v % 64 in
+    # another); the outermost (lowest-index) one is the governing dim.
+    device_coords = _device_coords(stl, write_dep)
+    for dim in range(len(device_coords) - 1):
+        if sym in device_coords[dim].free_symbols:
+            return dim
+    return None
+
+
 def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
     """Return dep's within-stick device coordinate's free symbol against stl,
     or None if it has none (e.g. a symbol-free size-1 stick, or a scalar /
@@ -416,21 +431,6 @@ def _identify_restickify(op: Operation, graph: GraphLowering) -> bool:
     # is_restickify is the single source of truth for this check, shared with
     # codegen's store side, so the two can't disagree on which ops restickify.
     return is_restickify(in_coords, out_coords)
-
-
-def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | None:
-    """Return the outermost non-within-stick ``device_size`` dim whose device
-    coordinate carries ``sym`` (the free symbol of some host dim), or None.
-    """
-    # Two host dims can share a dim size, so only the symbol unambiguously
-    # identifies the dim.  A symbol whose range spans more than one tile can
-    # appear split across several coordinates (e.g. v // 64 in one, v % 64 in
-    # another); the outermost (lowest-index) one is the governing dim.
-    device_coords = _device_coords(stl, write_dep)
-    for dim in range(len(device_coords) - 1):
-        if sym in device_coords[dim].free_symbols:
-            return dim
-    return None
 
 
 def _pad_layout_device_dim(
@@ -548,6 +548,69 @@ def _pad_input_new_stick_dim(buf: ComputedBuffer, new_stick_dim: int) -> None:
     buf.layout = _pad_layout_device_dim(layout, device_dim, new_dim_size)
 
 
+def _assert_input_paddable(
+    op: ComputedBuffer, in_dep, in_layout, new_stick_dim: int
+) -> None:
+    """Raise ``Unsupported`` for restickify inputs the stick-boundary bump cannot
+    pad yet, classifying each input dim's read by its coordinate.
+
+    Not yet supported, and must fail loudly rather than miscompile:
+
+    - **Strided** read of any dim (coord ``k*var``, k not in {0, 1}: step > 1 or
+      reversed), e.g. ``x[::2].transpose(1, 2).clone()``.
+    - **Narrowing slice on the new-stick dim** (iter range < dim size), e.g.
+      ``x[:, :, 1:66, :].transpose(-2, -1).clone()``.
+
+    TODO: both are liftable by double-restickifying -- a re-base copy that reads
+    the sliced/strided source into a fresh stick-aligned buffer, then
+    restickifies that (the bump can pad such a buffer). Once implemented,
+    expressions that currently hit these raises would take that path instead
+    and never reach this guard.
+
+    Fine, and flow through unchanged:
+
+    - **Contiguous offset** on a non-stick dim (coord ``var + c``), e.g.
+      ``x[:, 1:, :]``.
+    - **Broadcast** read (coeff 0), e.g.
+      ``k.view(B, S, H, D).transpose(1, 2).transpose(2, 3)`` on a
+      ``[B, S, H, 2, 1, D/2]`` input (see ``test_broadcast_input_transpose_clone``).
+    """
+    in_host_coords = host_coordinates(in_layout, in_dep, None)
+    for i, coord in enumerate(in_host_coords):
+        syms = coord.free_symbols
+        if not syms:  # degenerate size-1 host dim, nothing to slice
+            continue
+        assert len(syms) == 1, (
+            f"insert_restickify_padding: host dim {i} of {op.get_name()} "
+            f"(coord {coord}) carries multiple free symbols -- an interleaved "
+            f"index this pass's per-dim strided/sliced classification cannot "
+            f"read; a restickify input must not reach this shape"
+        )
+        sym = next(iter(syms))
+        # Strided (k not in {0, 1}), on any dim: codegen carries only a contiguous
+        # tail.  A broadcast (coeff 0) is read from the device layout, not this
+        # coefficient, so it is not a stride and is left to flow through.
+        if concretize_expr(coord.coeff(sym)) not in (0, 1):
+            raise Unsupported(
+                f"insert_restickify_padding: strided input on host dim "
+                f"{i} of {op.get_name()} (coord {coord}) is not supported"
+            )
+        # A narrowing slice matters only on the new-stick dim (it starts the read
+        # partway into a stick); a narrowed non-stick dim is a carried offset.
+        if i != new_stick_dim:
+            continue
+        range_size = (
+            concretize_expr(in_dep.ranges[sym]) if sym in in_dep.ranges else None
+        )
+        dim_size = concretize_expr(in_layout.size[i])
+        if range_size is not None and range_size != dim_size:
+            raise Unsupported(
+                f"insert_restickify_padding: sliced input on host dim "
+                f"{i} of {op.get_name()} (iter range {range_size} != "
+                f"dim size {dim_size}) is not supported"
+            )
+
+
 def lower_identity_clone(
     arg_fx_node: torch.fx.Node,
     host_size: list[int],
@@ -612,69 +675,6 @@ def lower_identity_clone(
     assert clone_buf.origins, "lower_identity_clone: clone buffer has no origins"
 
     return clone_buf, new_ops
-
-
-def _assert_input_paddable(
-    op: ComputedBuffer, in_dep, in_layout, new_stick_dim: int
-) -> None:
-    """Raise ``Unsupported`` for restickify inputs the stick-boundary bump cannot
-    pad yet, classifying each input dim's read by its coordinate.
-
-    Not yet supported, and must fail loudly rather than miscompile:
-
-    - **Strided** read of any dim (coord ``k*var``, k not in {0, 1}: step > 1 or
-      reversed), e.g. ``x[::2].transpose(1, 2).clone()``.
-    - **Narrowing slice on the new-stick dim** (iter range < dim size), e.g.
-      ``x[:, :, 1:66, :].transpose(-2, -1).clone()``.
-
-    TODO: both are liftable by double-restickifying -- a re-base copy that reads
-    the sliced/strided source into a fresh stick-aligned buffer, then
-    restickifies that (the bump can pad such a buffer). Once implemented,
-    expressions that currently hit these raises would take that path instead
-    and never reach this guard.
-
-    Fine, and flow through unchanged:
-
-    - **Contiguous offset** on a non-stick dim (coord ``var + c``), e.g.
-      ``x[:, 1:, :]``.
-    - **Broadcast** read (coeff 0), e.g.
-      ``k.view(B, S, H, D).transpose(1, 2).transpose(2, 3)`` on a
-      ``[B, S, H, 2, 1, D/2]`` input (see ``test_broadcast_input_transpose_clone``).
-    """
-    in_host_coords = host_coordinates(in_layout, in_dep, None)
-    for i, coord in enumerate(in_host_coords):
-        syms = coord.free_symbols
-        if not syms:  # degenerate size-1 host dim, nothing to slice
-            continue
-        assert len(syms) == 1, (
-            f"insert_restickify_padding: host dim {i} of {op.get_name()} "
-            f"(coord {coord}) carries multiple free symbols -- an interleaved "
-            f"index this pass's per-dim strided/sliced classification cannot "
-            f"read; a restickify input must not reach this shape"
-        )
-        sym = next(iter(syms))
-        # Strided (k not in {0, 1}), on any dim: codegen carries only a contiguous
-        # tail.  A broadcast (coeff 0) is read from the device layout, not this
-        # coefficient, so it is not a stride and is left to flow through.
-        if concretize_expr(coord.coeff(sym)) not in (0, 1):
-            raise Unsupported(
-                f"insert_restickify_padding: strided input on host dim "
-                f"{i} of {op.get_name()} (coord {coord}) is not supported"
-            )
-        # A narrowing slice matters only on the new-stick dim (it starts the read
-        # partway into a stick); a narrowed non-stick dim is a carried offset.
-        if i != new_stick_dim:
-            continue
-        range_size = (
-            concretize_expr(in_dep.ranges[sym]) if sym in in_dep.ranges else None
-        )
-        dim_size = concretize_expr(in_layout.size[i])
-        if range_size is not None and range_size != dim_size:
-            raise Unsupported(
-                f"insert_restickify_padding: sliced input on host dim "
-                f"{i} of {op.get_name()} (iter range {range_size} != "
-                f"dim size {dim_size}) is not supported"
-            )
 
 
 def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
