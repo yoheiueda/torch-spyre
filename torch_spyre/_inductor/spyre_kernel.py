@@ -1119,11 +1119,12 @@ def _restore_elided_restickify_stick_prealign(op_spec) -> None:
     not a downstream fixup -- mints the iteration symbol, so the size-1 case
     reduces to the ordinary N>=2 path.
 
-    For the INPUT-elided direction the restored stick lands on the live (output)
-    operand's old-stick device dim, which ``insert_restickify_padding`` has
-    already grown to a full stick (``_pad_restickify_output``).  We place ``rs``
-    on that same grown dim so the descriptor coordinates and the physical
-    allocation agree on which dim carries the stick.
+    In both directions we add ``rs`` as an OUTERMOST pass-through dim on the live
+    operand, mirroring the elided operand's leading ``floor(rs/64)``.  align
+    reconstructs the stick's true rank on each operand from the elided operand's
+    floor/Mod decomposition and the transpose relationship, so ``rs`` need not be
+    placed at any particular slot -- align lands it (e.g. innermost on the
+    output for the INPUT-elided direction) to match the physical allocation.
     """
     if op_spec.op != RESTICKIFY_OP or len(op_spec.args) != 2:
         return
@@ -1165,33 +1166,15 @@ def _restore_elided_restickify_stick_prealign(op_spec) -> None:
     new_elided_size = [1] + real_sizes + [stick_size]
 
     # LIVE operand: keep its own stick (already floor/Mod-decomposed, or a bare
-    # within-stick symbol align will decompose to the front) and add rs as a
-    # size-64 pass-through dim.  align later collapses any leftover const-0 size-1
-    # dims, so we only need rs at the right rank.
+    # within-stick symbol align will decompose to the front) and add rs OUTERMOST
+    # as a size-64 pass-through dim, mirroring the elided operand's leading
+    # floor(rs/64).  align later collapses any leftover const-0 size-1 dims and
+    # reconstructs rs's true rank on each operand from the elided operand's
+    # decomposition, so inserting at the front is correct for both directions.
     live_coords = list(live_arg.device_coordinates)
     live_size = list(live_arg.device_size)
-
-    if in_free:
-        # OUTPUT-elided (the elided operand is the output): the restored stick is
-        # the OUTPUT's new stick; in the N>=2 descriptor it lands OUTERMOST on the
-        # live (input) operand -- ahead of every surviving batch/spatial dim --
-        # mirroring the elided operand's leading floor(rs/64).  Insert at front.
-        live_coords.insert(0, rs)
-        live_size.insert(0, stick_size)
-    else:
-        # INPUT-elided: the restored OLD stick lands on the live (output) operand's
-        # old-stick device dim.  insert_restickify_padding (_pad_restickify_output)
-        # has already grown exactly that dim to a full stick, so it is the sole
-        # symbol-free device dim of size stick_size; place rs there so descriptor
-        # coordinates and physical allocation agree on which dim carries the stick.
-        insert_slot = next(
-            i
-            for i in range(len(live_coords) - 1)
-            if not live_coords[i].free_symbols
-            and concretize_expr(live_size[i]) == stick_size
-        )
-        live_coords[insert_slot] = rs
-        live_size[insert_slot] = stick_size
+    live_coords.insert(0, rs)
+    live_size.insert(0, stick_size)
 
     op_spec.iteration_space = {rs: (stick_size, 1), **op_spec.iteration_space}
     elided_arg.device_coordinates = new_elided_coords

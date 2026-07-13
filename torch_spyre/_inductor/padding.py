@@ -43,8 +43,6 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
-import math
-
 import torch
 from sympy import Expr
 from torch._inductor.graph import GraphLowering
@@ -72,7 +70,6 @@ from .pass_utils import (
     lower_pad_sequence,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
-    restickify_new_stick_pos,
 )
 from .views import compute_coordinates
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
@@ -341,33 +338,6 @@ def _device_coords(stl: SpyreTensorLayout, dep) -> list[Expr]:
     return compute_coordinates(stl.device_size, stl.stride_map, dep.ranges, index)
 
 
-def _size1_grow_candidates(stl: SpyreTensorLayout) -> list[int]:
-    """Return the size-1 (singleton) non-stick device dims a restickify could
-    grow to a stick.
-
-    A size-1 host dim carries no iteration symbol, so it can't be tracked by
-    symbol; it's instead the singleton device dim marked ``stride_map == -1``
-    (the extent-1 marker set by ``coarse_tile._resize_device_layout``).  When
-    exactly one dim carries that marker the choice is unambiguous; a caller with
-    two-or-more candidates must break the tie by its own geometry.
-    """
-    device_size = [concretize_expr(s) for s in stl.device_size]
-    stride_map = list(stl.stride_map)
-    size1 = [d for d in range(len(device_size) - 1) if device_size[d] == 1]
-    grow = [d for d in size1 if stride_map[d] == -1]
-    # Every real grow target carries the -1 extent marker (set by
-    # coarse_tile._resize_device_layout).  A measured sweep of the restickify
-    # suite (261 tests, 29 size-1 grows) found every grow marked, so a size-1
-    # dim without the marker is not a known-good target: refuse to guess and
-    # grow the wrong dim, which would be a silent miscompile.
-    if size1 and not grow:
-        raise Unsupported(
-            f"_size1_grow_candidates: size-1 dims {size1} carry no -1 extent "
-            f"marker (stride_map={stride_map}); refusing to guess a grow target"
-        )
-    return grow
-
-
 def _symbol_range_size(dep, sym) -> int | None:
     """Return the concretized size of loop symbol ``sym``'s range on ``dep``,
     or None if ``sym`` is None or absent from the dep's ranges.  Used to detect
@@ -550,33 +520,6 @@ def _pad_layout_device_dim(
     )
 
 
-def _grow_size1_stick_dim(
-    layout: FixedTiledLayout, device_dim: int
-) -> FixedTiledLayout:
-    """Return a copy of ``layout`` with a collapsed size-1 old-stick device dim
-    grown to a full stick, giving it its real per-step host stride.
-
-    Unlike ``_pad_layout_device_dim`` (which only grows the extent), the size-1
-    collapse recorded the dim's host stride as the -1 singleton marker, so the
-    grown dim must also be given a real stride: the product of the host extents
-    (the size-1 host dim contributes 1).  This keeps DMA readback addressing the
-    right plane once the dim iterates a full stick.
-    """
-    stl = layout.device_layout
-    new_device_size = list(stl.device_size)
-    new_device_size[device_dim] = stl.elems_per_stick()
-    new_stride_map = list(stl.stride_map)
-    new_stride_map[device_dim] = math.prod(concretize_expr(s) for s in layout.size)
-    grown_stl = SpyreTensorLayout(
-        new_device_size, new_stride_map, stl.device_dtype, stl.element_arrangement
-    )
-    host_size = [concretize_expr(s) for s in layout.size]
-    host_stride = [concretize_expr(s) for s in layout.stride]
-    return FixedTiledLayout(
-        layout.device, layout.dtype, host_size, host_stride, grown_stl
-    )
-
-
 def _pad_restickify_output(
     op: Operation, graph: GraphLowering, in_stick_dim: int
 ) -> None:
@@ -588,11 +531,12 @@ def _pad_restickify_output(
     the old stick's host coord has no surviving host dim, or its device dim is
     already stick-aligned.
 
-    If the old stick collapsed to a size-1 device dim (no symbol), the same grow
-    applies via ``_grow_size1_stick_dim``: the prealign restore
-    (_restore_elided_restickify_stick_prealign) mints the stick's iteration
-    symbol onto this grown dim, so growing it here keeps the allocation and the
-    restored descriptor in agreement.
+    When the old stick collapsed to a size-1 device dim (no iteration symbol),
+    no output grow is needed: the prealign restore
+    (_restore_elided_restickify_stick_prealign) synthesizes the stick's
+    iteration symbol as an outermost dim, and align reconstructs a full 64-wide
+    stick plane in the descriptor from the elided operand's floor/Mod
+    decomposition -- so the allocation and descriptor already agree.
     """
     assert isinstance(op, ComputedBuffer)
     in_dep, _in_buf, in_layout = _restickify_input(op, graph)
@@ -604,45 +548,8 @@ def _pad_restickify_output(
     stl = out_layout.device_layout
 
     if old_sym is None:
-        # The old stick collapsed to a size-1 device dim (no iteration symbol).
-        # Find the singleton device dim to grow back to a full stick.
-        candidates = _size1_grow_candidates(stl)
-        if len(candidates) == 1:
-            size1_dim = candidates[0]
-        elif candidates:
-            # Two-or-more collapsed size-1 device dims: pick the demoted old
-            # stick.  Mirrors the restickify descriptor restore
-            # (_restore_elided_restickify_stick_prealign): the restored old-stick
-            # symbol lands at new_stick_pos -- the new stick's rank among the
-            # INPUT device coords (a transpose swaps the two sticks' slots, so
-            # the old stick lands where the new stick used to sit).  Growing that
-            # same slot keeps allocation and descriptor in agreement.
-            new_sym = _stick_symbol(stl, write_dep)
-            new_stick_pos = None
-            if new_sym is not None:
-                in_dev_coords = _device_coords(in_layout.device_layout, in_dep)
-                new_stick_pos = restickify_new_stick_pos(in_dev_coords, {new_sym})
-            # No single symbol (e.g. an all-ones batch) or the pos is not itself a
-            # candidate: every candidate is a zero-extent relabel yielding the
-            # same layout, so the first is safe.
-            size1_dim = new_stick_pos if new_stick_pos in candidates else candidates[0]
-        else:
-            size1_dim = None
-        if size1_dim is not None:
-            # Grow the collapsed old-stick dim to a full stick so the allocation
-            # matches the restored descriptor's 64-plane write.  The prealign
-            # restore (_restore_elided_restickify_stick_prealign) lands the
-            # restored stick symbol on this same grown dim, so descriptor
-            # coordinates and physical allocation agree.  The dim's host stride
-            # was recorded as the -1 singleton marker (a size-1 host dim); its
-            # real per-step stride is the product of the host extents.
-            op.layout = _grow_size1_stick_dim(out_layout, size1_dim)
-            logger.debug(
-                "insert_restickify_padding: grew size-1 output %s device dim %d -> %d",
-                op.get_name(),
-                size1_dim,
-                stl.elems_per_stick(),
-            )
+        # Old stick collapsed to a size-1 device dim (no iteration symbol): the
+        # prealign restore mints and places the stick symbol, so nothing to grow.
         return
 
     # Old stick collapsed to a size-1 output host dim (const-0 coord, no symbol):
