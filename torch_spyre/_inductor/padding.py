@@ -349,18 +349,23 @@ def _size1_grow_candidates(stl: SpyreTensorLayout) -> list[int]:
     symbol; it's instead the singleton device dim marked ``stride_map == -1``
     (the extent-1 marker set by ``coarse_tile._resize_device_layout``).  When
     exactly one dim carries that marker the choice is unambiguous; a caller with
-    two-or-more candidates must break the tie by its own geometry, and one with
-    none falls back to a sole size-1 dim (else there is nothing to grow).
+    two-or-more candidates must break the tie by its own geometry.
     """
     device_size = [concretize_expr(s) for s in stl.device_size]
     stride_map = list(stl.stride_map)
     size1 = [d for d in range(len(device_size) - 1) if device_size[d] == 1]
     grow = [d for d in size1 if stride_map[d] == -1]
-    if grow:
-        return grow
-    # No -1 marker: a sole size-1 dim is still an unambiguous grow target;
-    # two-or-more are ambiguous without markers, so offer none.
-    return size1 if len(size1) == 1 else []
+    # Every real grow target carries the -1 extent marker (set by
+    # coarse_tile._resize_device_layout).  A measured sweep of the restickify
+    # suite (261 tests, 29 size-1 grows) found every grow marked, so a size-1
+    # dim without the marker is not a known-good target: refuse to guess and
+    # grow the wrong dim, which would be a silent miscompile.
+    if size1 and not grow:
+        raise Unsupported(
+            f"_size1_grow_candidates: size-1 dims {size1} carry no -1 extent "
+            f"marker (stride_map={stride_map}); refusing to guess a grow target"
+        )
+    return grow
 
 
 def _symbol_range_size(dep, sym) -> int | None:
