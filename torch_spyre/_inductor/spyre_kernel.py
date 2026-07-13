@@ -1113,6 +1113,14 @@ def _restickify_restore_elided_stick(op_spec) -> None:
     at SDSC time) lets align itself mint the iteration symbol, reducing the
     size-1 case to the ordinary N>=2 path.
 
+    Why this exact window: align_tensors matches operands by shared symbol, so
+    the symbol must exist before align runs. Bumping the collapsed dim earlier
+    (e.g. in the padding pass) hits a fractional coordinate
+    ``normalize_coordinates`` rejects, since there's no symbol yet to divide it
+    out; bumping it later (e.g. in the scheduler's ``mark_run``, which
+    allocates each buffer from its STL via ``spyre_empty_with_layout``) is too
+    late to affect the descriptor align already built.
+
     We create one fresh symbol ``new_sym`` shared by both operands, so align
     sees them as the same iteration var and matches them up:
 
@@ -1198,7 +1206,6 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
         _restickify_restore_elided_stick(op_spec)
 
     it_space = op_spec.iteration_space
-
     new_op_space_splits, new_tensors = align_tensors(
         it_space,
         [
