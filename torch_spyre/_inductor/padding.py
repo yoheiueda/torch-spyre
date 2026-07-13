@@ -566,14 +566,6 @@ def _assert_input_paddable(
     restickifies that (the bump can pad such a buffer). Once implemented,
     expressions that currently hit these raises would take that path instead
     and never reach this guard.
-
-    Fine, and flow through unchanged:
-
-    - **Contiguous offset** on a non-stick dim (coord ``var + c``), e.g.
-      ``x[:, 1:, :]``.
-    - **Broadcast** read (coeff 0), e.g.
-      ``k.view(B, S, H, D).transpose(1, 2).transpose(2, 3)`` on a
-      ``[B, S, H, 2, 1, D/2]`` input (see ``test_broadcast_input_transpose_clone``).
     """
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     for i, coord in enumerate(in_host_coords):
