@@ -774,6 +774,12 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
     later passes that key off host sizes (e.g. ``propagate_named_dims``) are
     unaffected; the resulting host/device size gap is what codegen's backGap
     path fills in.
+
+    Neither fix bumps a size-1 (elided) stick dim: with no iteration symbol,
+    upstream Inductor gives it no coordinate to bump here, and doing so before
+    align_tensors runs produces a fractional coordinate ``normalize_coordinates``
+    rejects (see ``_restickify_restore_elided_stick`` in spyre_kernel.py, which
+    bumps it later, right before align).
     """
     for op in list(graph.operations):
         if _identify_restickify(op, graph):

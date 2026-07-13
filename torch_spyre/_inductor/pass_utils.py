@@ -682,7 +682,7 @@ def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> 
     )
 
 
-def check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
+def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
     """Raise Unsupported for stick expressions may be valid but are not yet supported."""
     offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
     has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
@@ -722,7 +722,7 @@ def device_coordinates(
         index,
         indirect_sizes,
     )
-    check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
     return coords
 
 
