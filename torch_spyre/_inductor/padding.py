@@ -398,88 +398,36 @@ def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
     return _single_free_sym(device_coords[-1])
 
 
-def _identify_restickify(op: Operation, graph: GraphLowering):
-    """Identify whether ``op`` is a restickify, and if so return its operands.
+def _identify_restickify(op: Operation, graph: GraphLowering) -> bool:
+    """Return whether ``op`` is a restickify.
 
     A restickify is a single-input pointwise copy between two FixedTiledLayouts
-    that lands a *different* host dim within the stick.  This is purely the
-    "is it a restickify?" question; which dim to grow and which to leave
-    alone is decided downstream by ``_pad_restickify_output`` /
-    ``_pad_restickify_input``.
-
-    Returns None if ``op`` is not a restickify, else ``(new_stick_dim,
-    in_stick_dim)`` -- e.g. for a transpose that swaps which host dim sits in
-    the stick:
-
-    - ``new_stick_dim``: the input host dim that will occupy the *output's*
-      stick (it is not yet in the input's stick).
-    - ``in_stick_dim``: the input host dim currently in the *input's* stick
-      (it becomes a plain non-stick device dim, the "old stick", on the
-      output).
-
-    Both are indices into the INPUT host dims (named for what they become on
-    the output); neither is an output dim index, since a restickify re-tiles
-    rather than preserving ranks.  The input dep, buffer, and layout are not
-    returned: ``_restickify_input`` re-derives them from ``op``.
+    that lands a *different* host dim within the stick.  This answers only the
+    "is it a restickify?" question; each side then derives the stick dim it
+    cares about from its own operand's stick symbol
+    (``_pad_restickify_output`` from the input's old stick,
+    ``_pad_restickify_input`` from the output's new stick).
     """
     if not isinstance(op, ComputedBuffer):
-        return None
+        return False
     out_layout = op.get_layout()
     if not isinstance(out_layout, FixedTiledLayout):
-        return None
+        return False
     if not isinstance(op.data, Pointwise):
-        return None
+        return False
 
     in_dep, _in_buf, in_layout = _restickify_input(op, graph)
     if in_dep is None:
-        return None
+        return False
 
     in_coords = _device_coords(in_layout.device_layout, in_dep)
     out_coords = _device_coords(out_layout.device_layout, _write_dep(op))
     # A scalar / zero-dim layout has no coordinates, so it can't be a restickify.
     if not in_coords or not out_coords:
-        return None
+        return False
     # is_restickify is the single source of truth for this check, shared with
     # codegen's store side, so the two can't disagree on which ops restickify.
-    if not is_restickify(in_coords, out_coords):
-        return None
-
-    def _input_host_dim_for_symbol(sym) -> int | None:
-        """Return the input host dim carrying stick symbol ``sym`` (from either
-        stick), or None.
-        """
-        in_host_coords = host_coordinates(in_layout, in_dep, None)
-        if not in_host_coords:
-            return None
-        if sym is None:
-            # A symbol-free stick means a size-1 host dim moved into stick
-            # position.  Size-1 dims don't contribute to the device layout, so
-            # any size-1 host dim yields the same device layout -- pick the
-            # first; the physical dim to pad is re-derived from device-side
-            # markers elsewhere (_restickify_input_device_dim /
-            # _pad_restickify_output), not from this host index.
-            ones = [i for i, s in enumerate(in_layout.size) if concretize_expr(s) == 1]
-            return ones[0] if ones else None
-        return _host_dim_carrying_sym(in_host_coords, sym)
-
-    # in_stick_dim carries the input's own stick symbol; new_stick_dim carries
-    # the OUTPUT's stick symbol (mirrors codegen: spyre_kernel.py locates it
-    # the same way).  Both must resolve and differ, or the layout invariant
-    # broke -- refuse loudly rather than skip and let codegen restickify an
-    # unpadded buffer.
-    in_stick_dim = _input_host_dim_for_symbol(
-        _stick_symbol(in_layout.device_layout, in_dep)
-    )
-    new_stick_dim = _input_host_dim_for_symbol(
-        _stick_symbol(out_layout.device_layout, _write_dep(op))
-    )
-    if in_stick_dim is None or new_stick_dim is None or new_stick_dim == in_stick_dim:
-        raise Unsupported(
-            "restickify padding: codegen restickifies but the pass could not "
-            f"resolve its stick host dims for {op.get_name()} "
-            "(unexpected: layout invariant broken)"
-        )
-    return new_stick_dim, in_stick_dim
+    return is_restickify(in_coords, out_coords)
 
 
 def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | None:
@@ -520,9 +468,7 @@ def _pad_layout_device_dim(
     )
 
 
-def _pad_restickify_output(
-    op: Operation, graph: GraphLowering, in_stick_dim: int
-) -> None:
+def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     """Pad the output dim carrying the input's old stick to a stick boundary,
     so the second+ stick block and every batch plane land at the correct offset.
 
@@ -541,8 +487,9 @@ def _pad_restickify_output(
     assert isinstance(op, ComputedBuffer)
     in_dep, _in_buf, in_layout = _restickify_input(op, graph)
     assert in_dep is not None  # op is a confirmed restickify
-    in_host_coords = host_coordinates(in_layout, in_dep, None)
-    old_sym = _single_free_sym(in_host_coords[in_stick_dim])
+    # The old stick is the INPUT's own stick symbol (None when it collapsed to a
+    # size-1 device dim).
+    old_sym = _stick_symbol(in_layout.device_layout, in_dep)
     out_layout = op.get_layout()
     write_dep = _write_dep(op)
     stl = out_layout.device_layout
@@ -769,16 +716,12 @@ def _assert_input_paddable(
             )
 
 
-def _pad_restickify_input(
-    op: Operation,
-    graph: GraphLowering,
-    new_stick_dim: int,
-) -> None:
+def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     """Read-side fix: ensure the restickify reads a grow-able ``ComputedBuffer``
     whose stick-carrying dim is padded to a stick boundary.
 
-    Does nothing when there is no over-read to cover (the new-stick dim is
-    already a stick multiple, or is a size-1 host dim). Otherwise validates the
+    Does nothing when there is no over-read to cover (the new-stick dim is a
+    size-1 host dim, or is already a stick multiple). Otherwise validates the
     read is paddable (``_assert_input_paddable``), then grows the producer in
     place if we own it, or inserts and grows an identity clone for a graph
     input.
@@ -786,6 +729,26 @@ def _pad_restickify_input(
     assert isinstance(op, ComputedBuffer)
     in_dep, in_buf, in_layout = _restickify_input(op, graph)
     assert in_dep is not None  # op is a confirmed restickify
+    # The new stick is the OUTPUT's stick symbol, mapped to the input host dim it
+    # comes from.  A None symbol means the new stick is a size-1 host dim: the
+    # read is fully covered by the input's already-padded old stick, and the
+    # restickify restore (_restore_elided_restickify_stick_prealign) supplies the
+    # padded lanes on the elided output stick without ever reading them -- nothing
+    # here needs padding.
+    out_stick_sym = _stick_symbol(op.get_layout().device_layout, _write_dep(op))
+    if out_stick_sym is None:
+        return
+    # A live stick symbol is a single free symbol that maps unambiguously to one
+    # input host dim (verified across the split-symbol / multi-block restickify
+    # shapes: the input's and output's stick symbols never resolve to the same
+    # host dim).  A symbol that resolves to no host dim is a broken layout
+    # invariant, not an unsupported input -- assert rather than fall back.
+    in_host_coords = host_coordinates(in_layout, in_dep, None)
+    new_stick_dim = _host_dim_carrying_sym(in_host_coords, out_stick_sym)
+    assert new_stick_dim is not None, (
+        f"restickify padding: no input host dim carries new-stick symbol "
+        f"{out_stick_sym} for {op.get_name()} (layout invariant broken)"
+    )
     # Skip when the new-stick dim is already a stick multiple: the read never runs
     # past the true dim size. Keyed off the declared size, not the iteration range
     # (a slice landing here, e.g. x[3:66].transpose(0, 1), has range 63 < size 128
@@ -793,13 +756,6 @@ def _pad_restickify_input(
     # dim; test_sliced_transpose_stick_expr_compiles).
     host_size = [concretize_expr(s) for s in in_layout.size]
     if compute_padding(host_size[new_stick_dim], in_layout.dtype) == 0:
-        return
-    # Skip when the new-stick dim is size-1 (symbol-free coord): the read is fully
-    # covered by the input's already-padded old stick, and the restickify restore
-    # (_restore_elided_restickify_stick_prealign) supplies the padded lanes on the
-    # elided output stick without ever reading them -- nothing here needs padding.
-    in_host_coords = host_coordinates(in_layout, in_dep, None)
-    if _single_free_sym(in_host_coords[new_stick_dim]) is None:
         return
 
     # Guard both branches: the offending read is the restickify's, not the buffer
@@ -865,10 +821,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
     path fills in.
     """
     for op in list(graph.operations):
-        match = _identify_restickify(op, graph)
-        if match is None:
+        if not _identify_restickify(op, graph):
             continue
-        new_stick_dim, in_stick_dim = match
-
-        _pad_restickify_output(op, graph, in_stick_dim)
-        _pad_restickify_input(op, graph, new_stick_dim)
+        _pad_restickify_output(op, graph)
+        _pad_restickify_input(op, graph)
