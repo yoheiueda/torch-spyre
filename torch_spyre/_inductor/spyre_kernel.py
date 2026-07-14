@@ -1181,6 +1181,21 @@ def _restore_elided_producer_stick(op_spec) -> None:
     # Gate: the output's within-stick device slot is already the padded stick
     # size (bumped by insert_restickify_padding) but carries no iteration symbol
     # -- a state only the elided size-1 producer stick reaches.
+    #
+    # This excludes a reduction that collapses the stick into a size-1 (sparse)
+    # device slot: there device_size[-1] == 1 != 64, so we return here. Its bare
+    # 0 within-stick coord is intrinsic to the reduce-over-stick and must NOT be
+    # restored.
+    #
+    # It does NOT, however, exclude an op whose reduction is carried WITHIN a
+    # kept full-64 stick rather than collapsing it -- e.g. layernormscale, an
+    # EXX2 reduction mode ("two values per stick", see constants.py) whose output
+    # keeps a full stick slot. Its within-stick coord is a legitimate bare 0
+    # (the stick dim IS the reduction dim), so it passes both checks below and is
+    # wrongly restored here. op_spec structure alone cannot tell it apart from an
+    # elided size-1 producer stick -- superdsc's reduced-dim recognition
+    # (_create_sdsc_tensors, superdsc.py:440) is hardened to tolerate the
+    # spurious restore instead (f3e1180 layernorm SIGABRT regression, fix c216a54).
     if out_arg.device_size[-1] != stick_size:
         return
     if any(arg.device_coordinates[-1].free_symbols for arg in args):
