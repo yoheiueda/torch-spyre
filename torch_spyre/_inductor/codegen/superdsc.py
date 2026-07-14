@@ -438,7 +438,14 @@ def _create_sdsc_tensors(
                 dim_order = dim_order + [stick_dim]
 
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
-            reduced_dims = [stick_dim]
+            # The pre-align producer elided-stick restore (spyre_kernel.py) can
+            # collapse this arg's within-stick coord to a bare 0, so
+            # _get_device_dim_order returns stick_dim=None even though the op's
+            # reduction stick is real. Fall back to op_stick_dim (derived from
+            # the output ref_arg) so the reduced dim is marked correctly, mirroring
+            # the effective_stick fallback below. No-op on the genuine layernorm
+            # path, where this arg keeps a live stick symbol.
+            reduced_dims = [stick_dim if stick_dim is not None else op_stick_dim]
         stride_dim_order = [
             d for d in dim_order if d not in reduced_dims
         ] + reduced_dims
@@ -453,7 +460,8 @@ def _create_sdsc_tensors(
             elif dim in reduced_dims and op_spec.op != "layernormscale":
                 scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
             elif dim in reduced_dims and op_spec.op == "layernormscale":
-                scales[dim] = -2 if (dim is stick_dim) else -1
+                eff = stick_dim if stick_dim is not None else op_stick_dim
+                scales[dim] = -2 if (dim is eff) else -1
             else:
                 scales[dim] = 1
 
