@@ -1294,6 +1294,32 @@ def test_size1_input_stick_transpose_0_last_contiguous_producer(shape):
     _strict(lambda x: (x + x).transpose(0, -1).contiguous(), x)
 
 
+# A MULTI-STAGE pointwise producer (two or more fused ops) feeding the same
+# transpose + .contiguous() restickify.  When the restickify's stick-carrying dim
+# is padded, every stage of the producer chain must share the padded geometry;
+# growing only the last stage left the earlier intermediates unpadded and the
+# result came back as a lane permutation (same values, wrong positions).  The
+# single-stage case above never exposed this -- there is only one producer to
+# grow.  Not size-1-specific: the last-dim-2 shape below fails the same way when
+# only the direct producer is grown.  Ramp span 255 through x + x then *2 (or
+# +add) stays < 1024 (fp16-exact), so torch.equal pins a displaced lane exactly.
+MULTISTAGE_CONTIGUOUS = [
+    (2, 3, 4),  # the original repro shape
+    (5, 3, 2),  # last dim 2 -- confirms the bug is not size-1-specific
+    (5, 3, 1),  # size-1 last dim -- the size-1 chain still works
+]
+
+
+@pytest.mark.parametrize(
+    "shape", MULTISTAGE_CONTIGUOUS, ids=lambda p: "x".join(map(str, p))
+)
+def test_multistage_producer_transpose_contiguous(shape):
+    x = _arange(*shape, span=255)
+    _strict(lambda x: (x + x).mul(2.0).transpose(0, -1).contiguous(), x)
+    # A third stage extends the producer chain one more step.
+    _strict(lambda x: (x + x).mul(2.0).add(1.0).transpose(0, -1).contiguous(), x)
+
+
 # A size-1 dim moving INTO the stick (the mirror of SIZE1_INPUT_STICK): the
 # transpose destination stick dim has host size 1, so upstream Inductor elides
 # the OUTPUT operand's within-stick loop symbol.  This used to crash -- the pass

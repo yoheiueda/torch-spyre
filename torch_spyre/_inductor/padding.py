@@ -45,6 +45,7 @@ M=1 (decode phase) correctly.
 
 import torch
 from sympy import Expr
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
@@ -512,6 +513,11 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     )
 
 
+# Depth cap for the producer-chain walk: a defensive backstop against a cyclic or
+# pathologically deep buffer graph, far above any real fused pointwise chain.
+_MAX_PRODUCER_CHAIN_DEPTH = 64
+
+
 def _pad_input_new_stick_dim(buf: ComputedBuffer, new_stick_dim: int) -> None:
     """Bump ``buf``'s device_size on the dim carrying ``new_stick_dim`` up to the
     stick boundary, so the restickify's over-read lands inside ``buf``'s own
@@ -527,25 +533,96 @@ def _pad_input_new_stick_dim(buf: ComputedBuffer, new_stick_dim: int) -> None:
     new-stick dim is the OUTPUT-elided restickify, declined up front by
     ``_pad_restickify_input`` and restored by codegen instead, so it never
     reaches this bump path.
+
+    The direct producer we own is a confirmed, paddable restickify input, so a
+    missing single symbol or bumpable device dim is a broken invariant -- assert
+    rather than skip.  The softer ``_bump_device_dim`` variant used by the
+    producer-chain walk skips those cases instead.
     """
     layout = buf.get_layout()
     write_dep = _write_dep(buf)
     host_coords = host_coordinates(layout, write_dep, None)
-    stl = layout.device_layout
     syms = host_coords[new_stick_dim].free_symbols
     assert len(syms) == 1, (
         f"_pad_input_new_stick_dim: new-stick dim {new_stick_dim} on "
         f"{buf.get_name()} carries {len(syms)} free symbols, want exactly 1"
     )
-    device_dim = _device_dim_carrying_sym(stl, write_dep, next(iter(syms)))
+    device_dim = _device_dim_carrying_sym(
+        layout.device_layout, write_dep, next(iter(syms))
+    )
     assert device_dim is not None, (
         f"_pad_input_new_stick_dim: {buf.get_name()} exposed no bumpable device dim "
         f"for new stick dim {new_stick_dim}"
     )
+    _bump_device_dim(buf, layout, device_dim, new_stick_dim)
 
+
+def _bump_device_dim(
+    buf: ComputedBuffer,
+    layout: FixedTiledLayout,
+    device_dim: int,
+    new_stick_dim: int,
+) -> bool:
+    """Bump ``buf``'s ``device_size[device_dim]`` up to the stick boundary of its
+    host size at ``new_stick_dim``.  Returns whether the layout changed.
+
+    A no-op (returns ``False``) when the dim is already a stick multiple, so a
+    producer-chain walk can revisit a shared buffer in a diamond DAG idempotently.
+    """
     n = concretize_expr(layout.size[new_stick_dim])
     new_dim_size = n + compute_padding(n, layout.dtype)
+    if concretize_expr(layout.device_layout.device_size[device_dim]) == new_dim_size:
+        return False
     buf.layout = _pad_layout_device_dim(layout, device_dim, new_dim_size)
+    return True
+
+
+def _bump_producer_chain(
+    buf: ComputedBuffer, new_stick_dim: int, graph: GraphLowering, _depth: int = 0
+) -> None:
+    """Walk up from ``buf`` through same-shape pointwise producers, bumping each
+    on the new-stick host dim so a fused chain shares one device geometry.
+
+    ``_pad_input_new_stick_dim`` grows only the restickify's *direct* producer.
+    When that producer is itself the tail of a multi-stage pointwise chain (e.g.
+    ``(x + x).mul(2)``), the intermediate a compute op reads is left at the
+    unpadded device size while the op's output is padded -- the two then address
+    the shared bytes under mismatched geometries and lanes land wrong.  Bumping
+    every same-shape pointwise producer keeps the whole chain on one geometry.
+
+    Only same-host-size pointwise ``ComputedBuffer`` reads are followed: those are
+    the ops that share the stick device dim.  A broadcast operand (a size-1 dim)
+    has a different host size and is skipped -- it needs no stick padding.  A
+    transitive producer with no bumpable device dim (or already bumped) is
+    soft-skipped, never asserted, since -- unlike the direct producer -- it is not
+    a guaranteed-paddable restickify input.
+    """
+    if _depth > _MAX_PRODUCER_CHAIN_DEPTH:
+        return
+    buf_size = list(buf.get_layout().size)
+    for dep in buf.get_read_writes().reads:
+        if not isinstance(dep, MemoryDep):
+            continue
+        prod = graph.get_buffer(dep.name)
+        if not isinstance(prod, ComputedBuffer) or not isinstance(prod.data, Pointwise):
+            continue
+        prod_layout = prod.get_layout()
+        if not isinstance(prod_layout, FixedTiledLayout):
+            continue
+        if list(prod_layout.size) != buf_size:
+            continue
+        write_dep = _write_dep(prod)
+        host_coords = host_coordinates(prod_layout, write_dep, None)
+        syms = host_coords[new_stick_dim].free_symbols
+        if len(syms) != 1:
+            continue
+        device_dim = _device_dim_carrying_sym(
+            prod_layout.device_layout, write_dep, next(iter(syms))
+        )
+        if device_dim is None:
+            continue
+        if _bump_device_dim(prod, prod_layout, device_dim, new_stick_dim):
+            _bump_producer_chain(prod, new_stick_dim, graph, _depth + 1)
 
 
 def _assert_input_paddable(
@@ -722,6 +799,11 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     if isinstance(in_buf, ComputedBuffer):
         _pad_input_new_stick_dim(in_buf, new_stick_dim)
         log_bumped("producer", in_buf)
+        # Bumping only the direct producer leaves any earlier stage of a fused
+        # pointwise chain at the unpadded device size, so the two address the
+        # shared intermediate under mismatched geometries and lanes land wrong.
+        # Grow the whole same-shape pointwise chain to keep one geometry.
+        _bump_producer_chain(in_buf, new_stick_dim, graph)
         return
 
     # The input is a graph input: materialise, bump, and redirect the read to
