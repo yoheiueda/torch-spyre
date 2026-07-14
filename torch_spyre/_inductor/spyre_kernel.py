@@ -1100,6 +1100,119 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("),")
 
 
+def _is_matmul(op: str) -> bool:
+    return op in ("matmul", "batchmatmul", "batchmatmulfp8")
+
+
+def _has_indirect_access(args) -> bool:
+    """True if any arg carries an IndirectAccess in its device coordinates.
+
+    The elided-stick restore rewrites assume plain affine coordinates; any
+    indirect access disqualifies the pattern.
+    """
+    return any(
+        isinstance(c, IndirectAccess) for arg in args for c in arg.device_coordinates
+    )
+
+
+def _fresh_restore_symbol(op_spec) -> sympy.Symbol:
+    """Return an ``rs{n}`` symbol distinct from every iteration-space symbol."""
+    used = set(op_spec.iteration_space.keys())
+    idx = 0
+    while sympy.Symbol(f"rs{idx}") in used:
+        idx += 1
+    return sympy.Symbol(f"rs{idx}")
+
+
+def _restore_elided_producer_stick(op_spec) -> None:
+    """Restore the size-1 stick iteration symbol that upstream Inductor elided
+    from a pointwise producer whose output feeds a restickify (in place).
+
+    Runs BEFORE align_tensors (from ``simplify_op_spec``), the companion of
+    ``_restickify_restore_elided_stick``, which restores the restickify's OWN
+    elided stick.  When the transpose source stick dim has host size 1 (e.g.
+    ``ones(5, 3, 1).exp().transpose(0, -1).contiguous()``), the restickify's
+    *producer* (here the ``exp``) also loses the stick loop symbol: its output
+    stick host dim is size 1, so upstream Inductor never emits a within-stick
+    iteration variable and every operand's within-stick coordinate collapses to
+    the constant ``0``.
+
+    ``insert_restickify_padding`` (``_pad_restickify_input``, producer grow)
+    already grows the producer OUTPUT's device stick slot to the padded 64, so
+    physically the buffer holds a full stick -- but with no iteration symbol
+    only lane 0 is written, and the restickify (forced to the N>=2 3-symbol form
+    by ``_restickify_restore_elided_stick``) reads all 64 lanes across the wrong
+    dim.  The two operands then disagree on which dim carries the stick and only
+    the aligned plane survives.
+
+    We create one fresh symbol ``new_sym`` shared by every operand, mirroring
+    ``_restickify_restore_elided_stick``:
+
+    - ANCHOR operand (the first): ``new_sym`` is inserted as a plain, bare
+      coordinate in a NEW size-64 outermost device dim, with iteration RANGE 1.
+      This size-64 home is what lets ``align_tensors`` learn ``new_sym``'s split
+      table -- without it, align sees ``new_sym`` only inside ``Mod(new_sym,
+      64)`` and rejects the coordinate (``splits[new_sym]`` has no 64 to divide
+      by).  Because the range is 1, ``new_sym`` only ever takes the value 0, so
+      it contributes no real stride; the size-64 slot is just back-gap padding.
+    - EVERY OTHER operand: its collapsed within-stick coord is rebuilt as
+      ``[floor(new_sym/64)] + reals + [Mod(new_sym, 64)]`` (the ``floor`` slot
+      size 1, the within-stick slot size 64) -- the same 1x64 decomposition the
+      N>=2 path produces.  A pointwise op maps input to output coordinate-for-
+      coordinate, so this identical rebind applies to all of them.
+
+    Restoring before align (rather than at SDSC time) lets align itself mint the
+    iteration symbol, mirroring ``_restickify_restore_elided_stick``.
+
+    Gated to leave every other op untouched: the output stick device slot must
+    already be the padded stick size (only the bumped size-1 case reaches this)
+    and every operand's within-stick coordinate must be the symbol-free ``0``.
+    """
+    args = op_spec.args
+    if len(args) < 2:
+        return
+    out_arg = args[-1]
+
+    if _has_indirect_access(args):
+        return
+
+    stick_size = out_arg.device_dtype.elems_per_stick()
+
+    # Gate: the output's within-stick device slot is already the padded stick
+    # size (bumped by insert_restickify_padding) but carries no iteration symbol
+    # -- a state only the elided size-1 producer stick reaches.
+    if out_arg.device_size[-1] != stick_size:
+        return
+    if any(arg.device_coordinates[-1].free_symbols for arg in args):
+        return
+
+    new_sym = _fresh_restore_symbol(op_spec)
+    op_spec.iteration_space = {new_sym: (stick_size, 1), **op_spec.iteration_space}
+
+    # Anchor operand: bare new_sym in a new size-64 outermost dim (range 1, so
+    # value 0), giving align a size-64 home to learn new_sym's split from.
+    anchor = args[0]
+    anchor.device_coordinates = [new_sym, *anchor.device_coordinates]
+    anchor.device_size = [stick_size, *anchor.device_size]
+
+    # Remaining operands: rebuild the collapsed stick as
+    # [floor(new_sym/64)] + reals + [Mod(new_sym, 64)], the N>=2 1x64 form.
+    for arg in args[1:]:
+        coords = arg.device_coordinates
+        size = arg.device_size
+        real_coords, real_sizes = [], []
+        for i in range(len(coords) - 1):  # exclude within-stick
+            if coords[i].free_symbols:
+                real_coords.append(coords[i])
+                real_sizes.append(size[i])
+        arg.device_coordinates = (
+            [sympy.floor(new_sym / stick_size)]
+            + real_coords
+            + [sympy.Mod(new_sym, stick_size)]
+        )
+        arg.device_size = [1] + real_sizes + [stick_size]
+
+
 def _restickify_restore_elided_stick(op_spec) -> None:
     """Restore a restickify's size-1 elided stick BEFORE align_tensors (in place).
 
@@ -1203,7 +1316,11 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
 
     if op_spec.op == RESTICKIFY_OP:
+        # A restickify's own elided size-1 stick is restored here; its pointwise
+        # producer's elided stick is restored by the elif below.
         _restickify_restore_elided_stick(op_spec)
+    elif not _is_matmul(op_spec.op):
+        _restore_elided_producer_stick(op_spec)
 
     it_space = op_spec.iteration_space
     new_op_space_splits, new_tensors = align_tensors(

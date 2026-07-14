@@ -31,7 +31,6 @@ from torch_spyre._inductor.constants import (
     TOPK_OPS,
 )
 from torch_spyre._inductor import config as _spyre_config
-from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
@@ -700,110 +699,6 @@ def _extend_matmul_k_to_padded(
     )
 
 
-def _has_indirect_access(args) -> bool:
-    """True if any arg carries an IndirectAccess in its device coordinates.
-
-    The elided-stick restore rewrites assume plain affine coordinates; any
-    indirect access disqualifies the pattern.
-    """
-    return any(
-        isinstance(c, IndirectAccess) for arg in args for c in arg.device_coordinates
-    )
-
-
-def _fresh_restore_symbol(op_spec: OpSpec) -> Symbol:
-    """Return an ``rs{n}`` symbol distinct from every iteration-space symbol."""
-    used = set(op_spec.iteration_space.keys())
-    idx = 0
-    while Symbol(f"rs{idx}") in used:
-        idx += 1
-    return Symbol(f"rs{idx}")
-
-
-def _rebind_stick_coords(coords: list, sym: Symbol, stick_size: int, ctx: str) -> None:
-    """Rebind an operand's collapsed stick coords to carry ``sym`` in place.
-
-    The within-stick (last) coord and the outer-split slot are both the
-    constant ``0`` for an elided size-1 stick; rewrite them to the N>=2
-    ``[floor(sym/64), ..., Mod(sym, 64)]`` form so ``sym`` becomes this
-    operand's stick dim.  Mutates ``coords``; raises if no outer-split slot
-    (a symbol-free non-within coord) exists.
-    """
-    within_idx = len(coords) - 1
-    outer_candidates = [i for i in range(within_idx) if not coords[i].free_symbols]
-    if not outer_candidates:
-        raise Unsupported(
-            f"{ctx}: cannot restore elided stick dim "
-            "(no outer-split slot to carry the restored symbol)"
-        )
-    coords[outer_candidates[0]] = floor(sym / stick_size)
-    coords[within_idx] = Mod(sym, stick_size)
-
-
-def _restore_elided_producer_stick(op_spec: OpSpec) -> OpSpec:
-    """Restore the size-1 stick iteration symbol that upstream Inductor elided
-    from a pointwise producer whose output feeds a restickify.
-
-    Companion to ``_restickify_restore_elided_stick`` (spyre_kernel.py), which restores
-    the restickify's OWN elided stick.  When the transpose source stick dim
-    has host size 1 (e.g. ``ones(5, 3, 1).exp().transpose(
-    0, -1).clone()``), the restickify's *producer* (here the ``exp``) also loses
-    the stick loop symbol: its output stick host dim is size 1, so upstream
-    Inductor never emits a within-stick iteration variable and every operand's
-    within-stick coordinate collapses to the constant ``0``.
-
-    ``insert_restickify_padding`` (``_pad_restickify_input``, producer grow)
-    already grows the producer OUTPUT's device stick slot to the padded 64, so
-    physically the buffer holds a full stick -- but with no iteration symbol
-    only lane 0 is written, and the restickify (forced to the N>=2 3-symbol form
-    by ``_restickify_restore_elided_stick``) reads all 64 lanes across the wrong
-    dim.  The two operands then disagree on which dim carries the stick and only
-    the aligned plane survives.
-
-    Restoring a fresh outer iteration symbol bound to the (already 64-wide)
-    output stick slot makes the producer emit the same 3-symbol descriptor as
-    N>=2, so producer and restickify agree.  A pointwise op maps input to output
-    coordinate-for-coordinate, so the same rebind applies to every operand.
-
-    Gated to leave every other op untouched: the output stick device slot must
-    already be the padded stick size (only the bumped size-1 case reaches this)
-    and every operand's within-stick coordinate must be the symbol-free ``0``.
-    """
-    args = op_spec.args
-    if len(args) < 2:
-        return op_spec
-    out_arg = args[-1]
-
-    if _has_indirect_access(args):
-        return op_spec
-
-    stick_size = out_arg.device_dtype.elems_per_stick()
-
-    # Gate: the output's within-stick device slot is already the padded stick
-    # size (bumped by insert_restickify_padding) but carries no iteration symbol
-    # -- a state only the elided size-1 producer stick reaches.
-    if out_arg.device_size[-1] != stick_size:
-        return op_spec
-    if any(arg.device_coordinates[-1].free_symbols for arg in args):
-        return op_spec
-
-    sym = _fresh_restore_symbol(op_spec)
-    new_iteration_space = {sym: (stick_size, 1), **op_spec.iteration_space}
-
-    # Each operand's within-stick coord (last) and its outer-split slot are the
-    # constant 0; rebind them to carry the restored symbol as this operand's
-    # stick dim, mirroring the N>=2 [floor(sym/64), ..., Mod(sym, 64)] form.
-    new_args = []
-    for arg in args:
-        coords = list(arg.device_coordinates)
-        _rebind_stick_coords(coords, sym, stick_size, "restickify producer")
-        new_args.append(dataclasses.replace(arg, device_coordinates=coords))
-
-    return dataclasses.replace(
-        op_spec, iteration_space=new_iteration_space, args=new_args
-    )
-
-
 def _extend_restickify_to_padded(
     op_spec: OpSpec,
     sdsc_iteration_space: dict,
@@ -832,11 +727,6 @@ def _extend_restickify_to_padded(
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_restickify = op_spec.op == RESTICKIFY_OP
-    # A restickify's own elided size-1 stick is restored before align_tensors
-    # (see _restickify_restore_elided_stick in spyre_kernel.py), so here only its
-    # pointwise producer's elided stick still needs restoring.
-    if not is_restickify and not is_matmul:
-        op_spec = _restore_elided_producer_stick(op_spec)
     ndim = len(op_spec.iteration_space)
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
