@@ -513,11 +513,6 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     )
 
 
-# Depth cap for the producer-chain walk: a defensive backstop against a cyclic or
-# pathologically deep buffer graph, far above any real fused pointwise chain.
-_MAX_PRODUCER_CHAIN_DEPTH = 64
-
-
 def _pad_input_new_stick_dim(buf: ComputedBuffer, new_stick_dim: int) -> None:
     """Bump ``buf``'s device_size on the dim carrying ``new_stick_dim`` up to the
     stick boundary, so the restickify's over-read lands inside ``buf``'s own
@@ -577,28 +572,32 @@ def _bump_device_dim(
     return True
 
 
-def _bump_producer_chain(
-    buf: ComputedBuffer, new_stick_dim: int, graph: GraphLowering, _depth: int = 0
+def _bump_direct_producer_reads(
+    buf: ComputedBuffer, new_stick_dim: int, graph: GraphLowering
 ) -> None:
-    """Walk up from ``buf`` through same-shape pointwise producers, bumping each
-    on the new-stick host dim so a fused chain shares one device geometry.
+    """Bump the same-shape pointwise buffers that ``buf`` reads on the new-stick
+    host dim, so the buffer crossing the transpose shares one device geometry.
 
-    ``_pad_input_new_stick_dim`` grows only the restickify's *direct* producer.
-    When that producer is itself the tail of a multi-stage pointwise chain (e.g.
-    ``(x + x).mul(2)``), the intermediate a compute op reads is left at the
-    unpadded device size while the op's output is padded -- the two then address
-    the shared bytes under mismatched geometries and lanes land wrong.  Bumping
-    every same-shape pointwise producer keeps the whole chain on one geometry.
+    ``_pad_input_new_stick_dim`` grows only the restickify's *direct* producer
+    ``buf``.  In a fused chain the transpose is an index remap absorbed at exactly
+    one edge -- the boundary between the original-order segment and the
+    transposed-order segment.  The direct producer is the tail of the
+    transposed-order segment, so the buffer straddling that boundary is one of
+    ``buf``'s own reads: its writer iterates it in the original order and ``buf``
+    reads it transposed.  Left at the unpadded device size, that buffer is written
+    and read under mismatched interior geometries and lanes land wrong.  Bumping
+    it to match ``buf`` restores one geometry across the edge.
 
-    Only same-host-size pointwise ``ComputedBuffer`` reads are followed: those are
-    the ops that share the stick device dim.  A broadcast operand (a size-1 dim)
-    has a different host size and is skipped -- it needs no stick padding.  A
-    transitive producer with no bumpable device dim (or already bumped) is
-    soft-skipped, never asserted, since -- unlike the direct producer -- it is not
-    a guaranteed-paddable restickify input.
+    Buffers wholly inside either segment (writer and reader iterate in the same
+    order) are self-consistent regardless of device size, so a single level
+    suffices -- no walk further up the chain.
+
+    Only same-host-size pointwise ``ComputedBuffer`` reads are bumped: those share
+    the stick device dim.  A broadcast operand (a size-1 dim) has a different host
+    size and is skipped -- it needs no stick padding.  A read with no bumpable
+    device dim is soft-skipped, never asserted, since -- unlike the direct producer
+    -- it is not a guaranteed-paddable restickify input.
     """
-    if _depth > _MAX_PRODUCER_CHAIN_DEPTH:
-        return
     buf_size = list(buf.get_layout().size)
     for dep in buf.get_read_writes().reads:
         if not isinstance(dep, MemoryDep):
@@ -621,8 +620,7 @@ def _bump_producer_chain(
         )
         if device_dim is None:
             continue
-        if _bump_device_dim(prod, prod_layout, device_dim, new_stick_dim):
-            _bump_producer_chain(prod, new_stick_dim, graph, _depth + 1)
+        _bump_device_dim(prod, prod_layout, device_dim, new_stick_dim)
 
 
 def _assert_input_paddable(
@@ -799,11 +797,12 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     if isinstance(in_buf, ComputedBuffer):
         _pad_input_new_stick_dim(in_buf, new_stick_dim)
         log_bumped("producer", in_buf)
-        # Bumping only the direct producer leaves any earlier stage of a fused
-        # pointwise chain at the unpadded device size, so the two address the
-        # shared intermediate under mismatched geometries and lanes land wrong.
-        # Grow the whole same-shape pointwise chain to keep one geometry.
-        _bump_producer_chain(in_buf, new_stick_dim, graph)
+        # Bumping only the direct producer leaves the buffer crossing the
+        # transpose (one of the producer's reads: written in original order,
+        # read transposed) at the unpadded device size, so writer and reader
+        # address it under mismatched interior geometries and lanes land wrong.
+        # Bump those same-shape pointwise reads to keep one geometry.
+        _bump_direct_producer_reads(in_buf, new_stick_dim, graph)
         return
 
     # The input is a graph input: materialise, bump, and redirect the read to
