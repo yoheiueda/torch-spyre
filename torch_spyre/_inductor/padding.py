@@ -53,6 +53,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    Scatter,
     TensorBox,
 )
 from torch._inductor.virtualized import V
@@ -531,8 +532,7 @@ def _pad_input_new_stick_dim(buf: ComputedBuffer, new_stick_dim: int) -> None:
 
     The direct producer we own is a confirmed, paddable restickify input, so a
     missing single symbol or bumpable device dim is a broken invariant -- assert
-    rather than skip.  The softer ``_bump_device_dim`` variant used by the
-    producer-chain walk skips those cases instead.
+    rather than skip.
     """
     layout = buf.get_layout()
     write_dep = _write_dep(buf)
@@ -561,8 +561,7 @@ def _bump_device_dim(
     """Bump ``buf``'s ``device_size[device_dim]`` up to the stick boundary of its
     host size at ``new_stick_dim``.  Returns whether the layout changed.
 
-    A no-op (returns ``False``) when the dim is already a stick multiple, so a
-    producer-chain walk can revisit a shared buffer in a diamond DAG idempotently.
+    A no-op (returns ``False``) when the dim is already a stick multiple.
     """
     n = concretize_expr(layout.size[new_stick_dim])
     new_dim_size = n + compute_padding(n, layout.dtype)
@@ -572,68 +571,129 @@ def _bump_device_dim(
     return True
 
 
-def _bump_direct_producer_reads(
-    buf: ComputedBuffer, new_stick_dim: int, graph: GraphLowering
-) -> None:
-    """Bump the same-shape pointwise buffers that ``buf`` reads on the new-stick
-    host dim, so the buffer crossing the transpose shares one device geometry.
+def _recover_restickify_transpose_perm(
+    read_dep: MemoryDep, prod_write_dep: MemoryDep, ranges: list[int]
+) -> list[int] | None:
+    """Recover the permutation the restickify's transpose applies to its producer.
 
-    ``_pad_input_new_stick_dim`` grows only the restickify's *direct* producer
-    ``buf``.  In a fused chain the transpose is an index remap absorbed at exactly
-    one edge -- the boundary between the original-order segment and the
-    transposed-order segment.  The direct producer is the tail of the
-    transposed-order segment, so the buffer straddling that boundary is one of
-    ``buf``'s own reads: its writer iterates it in the original order and ``buf``
-    reads it transposed.  Left at the unpadded device size, that buffer is written
-    and read under mismatched interior geometries and lanes land wrong.  Bumping
-    it to match ``buf`` restores one geometry across the edge.
+    ``read_dep`` is the restickify's read into the producer buffer: an affine
+    index over the restickify's iteration vars, permuted by the transpose view.
+    ``prod_write_dep`` is the producer's write into that same buffer, in the
+    producer's own (original) storage order.  Both address the same buffer, so
+    they carry the SAME set of stride coefficients -- only the assignment of
+    coefficient to iteration var differs.  Matching them recovers the transpose.
 
-    Buffers wholly inside either segment (writer and reader iterate in the same
-    order) are self-consistent regardless of device size, so a single level
-    suffices -- no walk further up the chain.
-
-    ASSUMPTION (single level suffices): the boundary edge is always ``buf``'s own
-    read, i.e. one hop up.  Which edge absorbs the permute is a scheduler choice,
-    but inductor keeps the *transposed* segment minimal -- it fuses the permute
-    view at the read edge of the first op that needs the transposed shape, and the
-    restickify's ``.contiguous()`` fuses onto the tail of that segment, so the
-    direct producer's read is the top of it.  Verified against chains with several
-    pointwise stages before and/or after the transpose (the boundary never floats
-    further up).  This is empirical + a model of the scheduler, not guaranteed by
-    inductor's contract: if a future scheduler *maximised* the transposed segment
-    (pushed the boundary up, away from the restickify), a multi-stage pre-transpose
-    chain would miscompile again and this would need to walk up recursively (see
-    git history for the recursive ``_bump_producer_chain`` this replaced).
-
-    Only same-host-size pointwise ``ComputedBuffer`` reads are bumped: those share
-    the stick device dim.  A broadcast operand (a size-1 dim) has a different host
-    size and is skipped -- it needs no stick padding.  A read with no bumpable
-    device dim is soft-skipped, never asserted, since -- unlike the direct producer
-    -- it is not a guaranteed-paddable restickify input.
+    Returns ``perm`` with ``perm[i]`` = the producer storage dim that restickify
+    iteration dim ``i`` reads (so ``perm`` is the identity for a plain,
+    non-transposing restickify).  ``ranges`` is the restickify's full iteration
+    ranges (``op.data.ranges``); a size-1 iteration dim carries no symbol and is
+    dropped from ``read_dep``'s vars, so it is matched last against the leftover
+    producer dims.  Returns ``None`` when a coefficient does not map to a producer
+    stride (an unexpected read shape), so the caller can decline to rewrite.
     """
-    buf_size = list(buf.get_layout().size)
-    for dep in buf.get_read_writes().reads:
-        if not isinstance(dep, MemoryDep):
-            continue
-        prod = graph.get_buffer(dep.name)
-        if not isinstance(prod, ComputedBuffer) or not isinstance(prod.data, Pointwise):
-            continue
-        prod_layout = prod.get_layout()
-        if not isinstance(prod_layout, FixedTiledLayout):
-            continue
-        if list(prod_layout.size) != buf_size:
-            continue
-        write_dep = _write_dep(prod)
-        host_coords = host_coordinates(prod_layout, write_dep, None)
-        syms = host_coords[new_stick_dim].free_symbols
-        if len(syms) != 1:
-            continue
-        device_dim = _device_dim_carrying_sym(
-            prod_layout.device_layout, write_dep, next(iter(syms))
-        )
-        if device_dim is None:
-            continue
-        _bump_device_dim(prod, prod_layout, device_dim, new_stick_dim)
+    prod_index = prod_write_dep.index.expand()
+    coeff_to_prod_dim = {
+        prod_index.coeff(v): d for d, v in enumerate(prod_write_dep.var_names)
+    }
+    read_index = read_dep.index.expand()
+    read_vars = list(read_dep.var_names)
+    perm: list[int | None] = [None] * len(ranges)
+    used: set[int] = set()
+    var_i = 0
+    for i, extent in enumerate(ranges):
+        if extent == 1:
+            continue  # size-1 dim: no symbol in the dep, filled below
+        coeff = read_index.coeff(read_vars[var_i])
+        var_i += 1
+        prod_dim = coeff_to_prod_dim.get(coeff)
+        if prod_dim is None:
+            return None
+        perm[i] = prod_dim
+        used.add(prod_dim)
+    leftover = iter(d for d in range(len(ranges)) if d not in used)
+    return [next(leftover) if p is None else p for p in perm]
+
+
+def _make_restickify_scatter(data: Pointwise, perm: list[int]) -> Scatter:
+    """Rewrite a restickify ``Pointwise`` into a ``Scatter`` that reads its
+    producer in the producer's original order and carries the transpose on the
+    store.
+
+    ``perm[i]`` = the producer storage dim that the restickify's iteration dim
+    ``i`` reads (from ``_recover_restickify_transpose_perm``).  The new Scatter
+    iterates in producer (original) order, so:
+
+    - ``inner_fn`` maps the original-order index back to the transposed order the
+      original loader was built over (the loader resolves a transposed view), and
+    - ``output_indexer`` re-applies the transpose on the store into the contiguous
+      output.
+
+    With the read in producer order, no interior buffer in the fused chain is
+    written in one order and read in another, so the whole chain iterates one
+    order and only this terminal store is permuted.  That removes the transpose-
+    crossing buffer entirely -- no producer ``device_size`` walk, and no dependence
+    on where fusion lands the transpose boundary.
+    """
+    n = len(perm)
+    inv = [0] * n
+    for i, prod_dim in enumerate(perm):
+        inv[prod_dim] = i
+    old_ranges = list(data.ranges)
+    new_ranges = [old_ranges[inv[d]] for d in range(n)]
+    orig_inner_fn = data.inner_fn
+
+    def inner_fn(index):
+        return orig_inner_fn([index[perm[i]] for i in range(n)])
+
+    def output_indexer(index):
+        return [index[perm[i]] for i in range(n)]
+
+    return Scatter(
+        device=data.device,
+        dtype=data.dtype,
+        inner_fn=inner_fn,
+        ranges=new_ranges,
+        output_indexer=output_indexer,
+    )
+
+
+def _rewrite_restickify_to_scatter(op: ComputedBuffer, in_buf: ComputedBuffer) -> None:
+    """Rewrite the restickify ``op`` into a ``Scatter`` when its direct producer
+    ``in_buf`` is a same-shape pointwise buffer transposed on the read.
+
+    This replaces the old ``_bump_direct_producer_reads`` producer-``device_size``
+    walk with a structural fix: instead of reconciling the transpose-crossing
+    buffer's geometry (which relied on an empirical model of where fusion lands the
+    transpose boundary), we make the restickify read its producer in the producer's
+    own order and permute only the store (``_make_restickify_scatter``).
+
+    Declines to rewrite (leaving the read-side bump alone) when the producer is not
+    a same-host-size pointwise ``ComputedBuffer``, when the permutation cannot be
+    recovered, or when it is the identity (a plain, non-transposing restickify --
+    kept on its proven ``Pointwise`` codegen path).
+    """
+    data = op.data
+    if not isinstance(data, Pointwise):
+        return
+    if not isinstance(in_buf.data, Pointwise):
+        return
+    if not isinstance(in_buf.get_layout(), FixedTiledLayout):
+        return
+    reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
+    if len(reads) != 1 or reads[0].name != in_buf.get_name():
+        return
+    ranges = [concretize_expr(r) for r in data.ranges]
+    perm = _recover_restickify_transpose_perm(reads[0], _write_dep(in_buf), ranges)
+    if perm is None or perm == list(range(len(perm))):
+        return  # unrecoverable, or a plain (non-transposing) restickify
+    op.data = _make_restickify_scatter(data, perm)
+    logger.debug(
+        "insert_restickify_padding: rewrote restickify %s to Scatter (transpose "
+        "perm %s on producer %s)",
+        op.get_name(),
+        perm,
+        in_buf.get_name(),
+    )
 
 
 def _assert_input_paddable(
@@ -810,12 +870,13 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     if isinstance(in_buf, ComputedBuffer):
         _pad_input_new_stick_dim(in_buf, new_stick_dim)
         log_bumped("producer", in_buf)
-        # Bumping only the direct producer leaves the buffer crossing the
-        # transpose (one of the producer's reads: written in original order,
-        # read transposed) at the unpadded device size, so writer and reader
-        # address it under mismatched interior geometries and lanes land wrong.
-        # Bump those same-shape pointwise reads to keep one geometry.
-        _bump_direct_producer_reads(in_buf, new_stick_dim, graph)
+        # The read-side bump keeps this restickify's over-read in bounds, but in a
+        # fused chain the transpose is an index remap absorbed at one interior
+        # edge: a buffer written in the original order and read transposed, which
+        # then addresses under mismatched geometries and lands lanes wrong.
+        # Rewriting the restickify to read its producer in the producer's own
+        # order and permute only the store removes that crossing buffer entirely.
+        _rewrite_restickify_to_scatter(op, in_buf)
         return
 
     # The input is a graph input: materialise, bump, and redirect the read to
@@ -862,12 +923,16 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
     - Write side (``_pad_restickify_output``): the output's old-stick host dim
       can land at the wrong physical offset.
     - Read side (``_pad_restickify_input``): the read can run past the true dim
-      size into uninitialized HBM.
+      size into uninitialized HBM.  A transposing restickify additionally has its
+      producer read in the original order and its store permuted
+      (``_rewrite_restickify_to_scatter``), so no interior buffer of a fused chain
+      is written in one order and read in another.
 
-    Both fixes only bump a device dim size, never a host tensor dim size, so
-    later passes that key off host sizes (e.g. ``propagate_named_dims``) are
+    The padding fixes only bump a device dim size, never a host tensor dim size,
+    so later passes that key off host sizes (e.g. ``propagate_named_dims``) are
     unaffected; the resulting host/device size gap is what codegen's backGap
-    path fills in.
+    path fills in.  The Scatter rewrite likewise leaves host sizes untouched: it
+    reindexes iteration and the store, not the declared shape.
 
     Neither fix bumps a size-1 (elided) stick dim: with no iteration symbol,
     upstream Inductor gives it no coordinate to bump here, and doing so before

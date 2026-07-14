@@ -336,8 +336,10 @@ def is_restickify(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
 def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
     """Return names of deps whose loaded values are used as indices in scatter output_indexer.
 
-    For Scatter ops the indirect index is encoded in the output_indexer closure.
-    Extract the index buffer names directly from the 'indices' closure variable.
+    For a Scatter whose output_indexer loads index tensors, the indirect index is
+    encoded in the closure's 'indices' variable; extract the buffer names from it.
+    A Scatter with no 'indices' variable carries no index tensors (e.g. a
+    pure-permutation or constant-offset output_indexer) and returns empty.
     """
     from torch._inductor.ir import Scatter
 
@@ -357,10 +359,14 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
         return set()
 
     if "indices" not in cells:
-        logger.warning(
-            "Scatter.output_indexer closure has no 'indices' variable — "
-            "Inductor may have renamed it. Scatter index tensors will not be "
-            "excluded from stick compatibility checks. (freevars: %s)",
+        # A Scatter whose output_indexer carries no index tensors is a valid
+        # shape, not a rename artifact: the backend also builds pure-permutation
+        # Scatters (restickify transpose, padding.py) and constant-offset ones
+        # (chunk_large_tensors.py), neither of which loads index tensors. There
+        # is then nothing to exclude, so return empty silently.
+        logger.debug(
+            "Scatter.output_indexer closure has no 'indices' variable; treating "
+            "as an index-tensor-free Scatter. (freevars: %s)",
             list(freevars),
         )
         return set()

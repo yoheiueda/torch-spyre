@@ -1295,14 +1295,14 @@ def test_size1_input_stick_transpose_0_last_contiguous_producer(shape):
 
 
 # A MULTI-STAGE pointwise producer (two or more fused ops) feeding the same
-# transpose + .contiguous() restickify.  When the restickify's stick-carrying dim
-# is padded, every stage of the producer chain must share the padded geometry;
-# growing only the last stage left the earlier intermediates unpadded and the
+# transpose + .contiguous() restickify.  A fused chain iterates one order, but the
+# transpose flips it on one interior edge, so a buffer written in the original
+# order and read transposed used to address under mismatched geometries and the
 # result came back as a lane permutation (same values, wrong positions).  The
-# single-stage case above never exposed this -- there is only one producer to
-# grow.  Not size-1-specific: the last-dim-2 shape below fails the same way when
-# only the direct producer is grown.  Ramp span 255 through x + x then *2 (or
-# +add) stays < 1024 (fp16-exact), so torch.equal pins a displaced lane exactly.
+# single-stage case above never exposed this -- there is no interior buffer.  Not
+# size-1-specific: the last-dim-2 shape below fails the same way.  Ramp span 255
+# through x + x then *2 (or +add) stays < 1024 (fp16-exact), so torch.equal pins a
+# displaced lane exactly.
 MULTISTAGE_CONTIGUOUS = [
     (2, 3, 4),  # the original repro shape
     (5, 3, 2),  # last dim 2 -- confirms the bug is not size-1-specific
@@ -1318,6 +1318,25 @@ def test_multistage_producer_transpose_contiguous(shape):
     _strict(lambda x: (x + x).mul(2.0).transpose(0, -1).contiguous(), x)
     # A third stage extends the producer chain one more step.
     _strict(lambda x: (x + x).mul(2.0).add(1.0).transpose(0, -1).contiguous(), x)
+
+
+# The interior crossing buffer is independent of the producer's DAG shape and of
+# where the transpose sits in the chain, so the same transpose + .contiguous()
+# must come back bit-exact for a multi-input producer, a diamond producer, and a
+# chain with pointwise stages on BOTH sides of the transpose.  Each reads its
+# direct producer in the producer's own order and permutes only the store, so no
+# interior buffer is dual-ordered regardless of shape.  Span 255 keeps every
+# intermediate < 1024 (fp16-exact) for torch.equal.
+def test_multistage_producer_transpose_contiguous_dag_shapes():
+    x = _arange(2, 3, 4, span=255)
+    # Multi-input producer: the direct producer reads two operands.
+    _strict(lambda x: (x + x * 3.0).transpose(0, -1).contiguous(), x)
+    # Diamond producer: two branches reconverge before the transpose.
+    _strict(lambda x: ((x + 1.0) * (x + 2.0)).transpose(0, -1).contiguous(), x)
+    # Pointwise stages both before and after the transpose.
+    _strict(
+        lambda x: (x + x).mul(2.0).add(1.0).transpose(0, -1).mul(3.0).contiguous(), x
+    )
 
 
 # A size-1 dim moving INTO the stick (the mirror of SIZE1_INPUT_STICK): the
