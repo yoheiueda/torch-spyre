@@ -592,6 +592,19 @@ def _bump_direct_producer_reads(
     order) are self-consistent regardless of device size, so a single level
     suffices -- no walk further up the chain.
 
+    ASSUMPTION (single level suffices): the boundary edge is always ``buf``'s own
+    read, i.e. one hop up.  Which edge absorbs the permute is a scheduler choice,
+    but inductor keeps the *transposed* segment minimal -- it fuses the permute
+    view at the read edge of the first op that needs the transposed shape, and the
+    restickify's ``.contiguous()`` fuses onto the tail of that segment, so the
+    direct producer's read is the top of it.  Verified against chains with several
+    pointwise stages before and/or after the transpose (the boundary never floats
+    further up).  This is empirical + a model of the scheduler, not guaranteed by
+    inductor's contract: if a future scheduler *maximised* the transposed segment
+    (pushed the boundary up, away from the restickify), a multi-stage pre-transpose
+    chain would miscompile again and this would need to walk up recursively (see
+    git history for the recursive ``_bump_producer_chain`` this replaced).
+
     Only same-host-size pointwise ``ComputedBuffer`` reads are bumped: those share
     the stick device dim.  A broadcast operand (a size-1 dim) has a different host
     size and is skipped -- it needs no stick padding.  A read with no bumpable
