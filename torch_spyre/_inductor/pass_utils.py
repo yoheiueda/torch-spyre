@@ -29,6 +29,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    Scatter,
 )
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
@@ -333,18 +334,59 @@ def is_restickify(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
     return in_coords[-1].free_symbols != out_coords[-1].free_symbols
 
 
+# aten ops whose lowering produces a genuinely *indexed* Scatter -- its
+# output_indexer loads index tensors that must be excluded from stick-compatibility
+# checks. Any Scatter NOT from one of these is index-free (a pure-permutation
+# restickify transpose from padding.py, a constant-offset chunk from
+# chunk_large_tensors.py, or a future backend Scatter usecase), so it carries no
+# index tensors and needs no warning. We denylist the indexing ops rather than
+# allowlist the index-free ones so new backend Scatter usecases stay silent by
+# default -- only a genuine indexed scatter is expected to have index tensors.
+_INDEXED_SCATTER_OP_NAMES = frozenset(
+    {
+        "scatter",
+        "scatter_",
+        "scatter_add",
+        "scatter_add_",
+        "index_put",
+        "index_put_",
+        "index_copy",
+        "index_copy_",
+    }
+)
+
+
+def _is_indexed_scatter_origin(op: ComputedBuffer) -> bool:
+    """True if op originates from an aten indexing op (scatter / index_put / ...).
+
+    Keyed on the op's base name so both the functional and in-place overloads
+    (scatter / scatter_, index_put / index_put_) match. Only such a Scatter is
+    expected to carry index tensors in its output_indexer closure.
+    """
+    return any(
+        getattr(n.target, "_opname", None) in _INDEXED_SCATTER_OP_NAMES
+        for n in op.origins
+    )
+
+
 def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
     """Return names of deps whose loaded values are used as indices in scatter output_indexer.
 
-    For a Scatter whose output_indexer loads index tensors, the indirect index is
-    encoded in the closure's 'indices' variable; extract the buffer names from it.
-    A Scatter with no 'indices' variable carries no index tensors (e.g. a
-    pure-permutation or constant-offset output_indexer) and returns empty.
+    Only an *indexed* Scatter (scatter/index_put/...) has index tensors to
+    exclude: its output_indexer closure captures them under the 'indices' freevar.
+    The backend's own Scatters are pure permutations (restickify transpose,
+    padding.py) or constant offsets (chunk_large_tensors.py) and carry no index
+    tensors; they are told apart by origin (``_is_indexed_scatter_origin``) so only
+    a genuine indexed scatter proceeds to closure reflection. A missing 'indices'
+    freevar on such a scatter is then a real anomaly -- Inductor renamed the
+    closure out from under our reflection -- so its index tensors go unexcluded and
+    we warn.
     """
-    from torch._inductor.ir import Scatter
-
     if not isinstance(op.data, Scatter):
         return set()
+
+    if not _is_indexed_scatter_origin(op):
+        return set()  # permutation/offset Scatter: no index tensors to exclude
 
     fn = op.data.output_indexer
     if fn.__closure__ is None:
@@ -359,20 +401,16 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
         return set()
 
     if "indices" not in cells:
-        # A Scatter whose output_indexer carries no index tensors is a valid
-        # shape, not a rename artifact: the backend also builds pure-permutation
-        # Scatters (restickify transpose, padding.py) and constant-offset ones
-        # (chunk_large_tensors.py), neither of which loads index tensors. There
-        # is then nothing to exclude, so return empty silently.
-        logger.debug(
-            "Scatter.output_indexer closure has no 'indices' variable; treating "
-            "as an index-tensor-free Scatter. (freevars: %s)",
+        logger.warning(
+            "Scatter.output_indexer closure has no 'indices' variable — "
+            "Inductor may have renamed it. Scatter index tensors will not be "
+            "excluded from stick compatibility checks. (freevars: %s)",
             list(freevars),
         )
         return set()
-    indices = cells["indices"]
+
     names = set()
-    for idx_tensor in indices:
+    for idx_tensor in cells["indices"] or ():
         if idx_tensor is None:
             continue
         # Unwrap TensorBox -> StorageBox -> Buffer to get the name
