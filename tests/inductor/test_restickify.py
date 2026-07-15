@@ -1477,6 +1477,43 @@ def test_size1_extra_dim_transpose_clone(shape, dims):
     _strict(lambda x: x.transpose(*dims).clone(), x)
 
 
+# A REAL (extent > 1) dim moving into the stick when the restickify input is a
+# bare graph input (no producer op to grow in place).  This is the clone-arm
+# mirror of test_multistage_producer_transpose_contiguous: the pass inserts an
+# identity clone of the input, grows its new-stick dim, and expresses the
+# transpose as a Scatter that reads the clone straight and permutes on the store.
+# Before the fix this raised a bare "exposed no bumpable device dim" assertion,
+# because the clone reproduced the restickify's transposed view of the input
+# instead of the input's own layout, collapsing the relocated dim into the stick.
+#
+# Must use .permute(...).contiguous(): .clone() on a bare input folds to
+# reinterpret_tensor and never restickifies.  Each perm of [3,1,5,67] moves a real
+# dim (size 3 or 5) into the stick; the reordered variants ALSO permute the outer
+# real dims, so the store carries a compound transpose.  Ramp span 511 keeps every
+# value < 1024 (fp16-exact), so torch.equal pins a mis-placed lane exactly.
+REAL_DIM_INTO_STICK = [
+    (3, 1, 5, 67),  # one size-1 dim; a real dim relocates into the stick
+    (3, 2, 5, 67),  # no size-1 dim -- confirms the fix is not size-1-specific
+]
+REAL_DIM_INTO_STICK_PERMS = [
+    (0, 1, 3, 2),  # size-5 dim into stick, outer dims in order
+    (2, 1, 0, 3),  # size-3 dim into an outer slot, outer dims reordered
+    (0, 3, 1, 2),  # size-5 dim into stick, outer real dims reordered (compound)
+    (3, 2, 1, 0),  # full reversal -- size-3 dim into stick, all reordered
+]
+
+
+@pytest.mark.parametrize(
+    "shape", REAL_DIM_INTO_STICK, ids=lambda p: "x".join(map(str, p))
+)
+@pytest.mark.parametrize(
+    "perm", REAL_DIM_INTO_STICK_PERMS, ids=lambda p: "".join(map(str, p))
+)
+def test_real_dim_into_stick_transpose_clone_graph_input(shape, perm):
+    x = _arange(*shape, span=511)
+    _strict(lambda x: x.permute(*perm).contiguous(), x)
+
+
 # A size-1 dim in the input stick whose NEW stick dim spans >=2 stick blocks
 # (host size > 64), aligned or unaligned, with and without leading batch dims.
 # The second and later stick blocks used to be mis-placed even when aligned;

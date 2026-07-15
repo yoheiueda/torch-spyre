@@ -533,9 +533,11 @@ def _pad_input_new_stick_dim(buf: ComputedBuffer, new_stick_dim: int) -> None:
     ``_pad_restickify_input`` and restored by codegen instead, so it never
     reaches this bump path.
 
-    The direct producer we own is a confirmed, paddable restickify input, so a
-    missing single symbol or bumpable device dim is a broken invariant -- assert
-    rather than skip.
+    Both callers pass a confirmed, paddable restickify input whose new-stick dim
+    is a bumpable non-stick device dim by construction: the direct producer we own
+    is written in its natural order, and the identity clone replicates the graph
+    input's layout (same strides and STL). So a missing single symbol or bumpable
+    device dim is a broken invariant -- assert rather than skip.
     """
     layout = buf.get_layout()
     write_dep = _write_dep(buf)
@@ -863,18 +865,22 @@ def _assert_input_paddable(
 def lower_identity_clone(
     arg_fx_node: torch.fx.Node,
     host_size: list[int],
+    host_stride: list[int],
     device: torch.device,
     dtype: torch.dtype,
     orig_stl: SpyreTensorLayout,
     insert_before: torch.fx.Node,
 ) -> tuple[ComputedBuffer, list[Operation]]:
     """Lower an identity ``aten.clone`` of ``arg_fx_node``, allocated at the
-    ORIGINAL unpadded ``host_size``.
+    ORIGINAL unpadded ``host_size`` and ``host_stride``.
 
-    The clone's host geometry is identical to the input, so its
-    ``SpyreTensorLayout`` mirrors ``orig_stl`` verbatim; the caller bumps
-    ``device_size`` on the stick-carrying dim afterwards (keeping this helper
-    generic).
+    The clone replicates the graph input's layout: same host strides, and a
+    ``SpyreTensorLayout`` copied from ``orig_stl``. Matching the input's strides is
+    what lets the restickify's inherited read of the input still address the clone
+    correctly after the caller redirects the read (the read's affine coefficients
+    are the input's), and makes the clone's own write share those coefficients so
+    the Scatter rewrite can recover the transpose. The caller then bumps
+    ``device_size`` on the stick-carrying dim.
 
     Returns ``(clone_buf, new_ops)`` where ``clone_buf`` is the single new
     ComputedBuffer and ``new_ops`` is the (length-1) list of new IR operations.
@@ -888,7 +894,13 @@ def lower_identity_clone(
         clone_fx = fx_graph.create_node(
             "call_function", torch.ops.aten.clone.default, args=(arg_fx_node,)
         )
-        clone_fx.meta["val"] = torch.empty(host_size, dtype=dtype, device=device)
+        # Allocate at the input's strides, not contiguous: a contiguous clone would
+        # be written with different affine coefficients than the restickify's read
+        # of the input carries, breaking both the address match and the Scatter
+        # rewrite's transpose recovery (issue #1756).
+        clone_fx.meta["val"] = torch.empty_strided(
+            host_size, host_stride, dtype=dtype, device=device
+        )
 
     clone_tb = graph_lowering.run_node(clone_fx)
     graph_lowering.env[clone_fx] = clone_tb
@@ -917,7 +929,7 @@ def lower_identity_clone(
         host_layout.device,
         host_layout.dtype,
         host_layout.size,
-        host_layout.stride,
+        host_stride,
         clone_stl,
     )
 
@@ -1002,16 +1014,19 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
 
     in_fx = _find_arg_fx_node(in_dep.name)
     restickify_fx = next(iter(op.origins))
+    host_stride = [concretize_expr(s) for s in in_layout.stride]
+
     clone_buf, new_ops = lower_identity_clone(
         in_fx,
         host_size=host_size,
+        host_stride=host_stride,
         device=device,
         dtype=dtype,
         orig_stl=in_layout.device_layout,
         insert_before=restickify_fx,
     )
 
-    # The clone mirrors the input's layout, so the same dim can be bumped.
+    # The clone replicates the input's layout, so the same dim can be bumped.
     _pad_input_new_stick_dim(clone_buf, new_stick_dim)
     log_bumped("clone", clone_buf)
 
@@ -1022,6 +1037,14 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     redirect_computed_buffer_reads(
         op, {in_dep.name: clone_buf.get_name()}, graph.operations
     )
+
+    # The clone is written in the input's own order; if this restickify also
+    # transposes, its fused kernel would read that interior buffer in a different
+    # order than it was written. Express it as a Scatter that reads the clone
+    # straight and permutes on the store, keeping the kernel on one iteration
+    # order (mirrors the producer arm above). Runs AFTER the redirect so op's
+    # single read points at the clone (the rewrite asserts this).
+    _rewrite_restickify_to_scatter(op, clone_buf)
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
