@@ -549,26 +549,12 @@ def _pad_input_new_stick_dim(buf: ComputedBuffer, new_stick_dim: int) -> None:
         f"_pad_input_new_stick_dim: {buf.get_name()} exposed no bumpable device dim "
         f"for new stick dim {new_stick_dim}"
     )
-    _bump_device_dim(buf, layout, device_dim, new_stick_dim)
-
-
-def _bump_device_dim(
-    buf: ComputedBuffer,
-    layout: FixedTiledLayout,
-    device_dim: int,
-    new_stick_dim: int,
-) -> bool:
-    """Bump ``buf``'s ``device_size[device_dim]`` up to the stick boundary of its
-    host size at ``new_stick_dim``.  Returns whether the layout changed.
-
-    A no-op (returns ``False``) when the dim is already a stick multiple.
-    """
+    # Bump device_size[device_dim] up to the stick boundary of the host size at
+    # new_stick_dim; a no-op when the dim is already a stick multiple.
     n = concretize_expr(layout.size[new_stick_dim])
     new_dim_size = n + compute_padding(n, layout.dtype)
-    if concretize_expr(layout.device_layout.device_size[device_dim]) == new_dim_size:
-        return False
-    buf.layout = _pad_layout_device_dim(layout, device_dim, new_dim_size)
-    return True
+    if concretize_expr(layout.device_layout.device_size[device_dim]) != new_dim_size:
+        buf.layout = _pad_layout_device_dim(layout, device_dim, new_dim_size)
 
 
 def _recover_restickify_transpose_perm(
