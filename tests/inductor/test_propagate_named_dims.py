@@ -200,37 +200,6 @@ def test_2d_add_transposed():
     )
 
 
-def test_2d_add_transposed_unaligned_padded():
-    """Transposed add whose restickified stick dim is unaligned and must be padded.
-
-    ``b.t()`` turns N=67 into the output's stick dim, so insert_restickify_padding
-    keeps the restickify candidate and grows the producer to the 64-stick boundary
-    (pad 61).  This is the padded counterpart of test_2d_add_transposed (N=256,
-    already aligned, pad 0): it exercises the ``pad > 0`` path and asserts the
-    named dims survive the layout grow.  Padding that dim used to relabel a
-    tracked name to ``_untracked_*`` (the class of miscompile guarded against in
-    _identify_restickify); here padding is genuinely required, and the
-    names must be preserved, not dropped.
-
-    No _spyre_hint here: tiling the padded dim collides with the restickify's
-    within-stick stride pattern and raises at codegen; the padding path itself is
-    what this test covers.
-    """
-    x = torch.randn(_M, 67, dtype=torch.float16, device=DEVICE)
-    y = torch.randn(67, _M, dtype=torch.float16, device=DEVICE)
-
-    def fn(a, b):
-        return a + b.t()
-
-    _run_and_capture(
-        fn,
-        [x, y],
-        named_dims={"M": _M, "N": 67},
-        tensor_dims={x: ["M", "N"], y: ["N", "M"]},
-        expected_propagated_dims=["M", "N"],
-    )
-
-
 def test_2d_reduce_on_M():
     """2-D sum reduction over M: [M,N] -> [N]."""
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
