@@ -939,12 +939,17 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     assert isinstance(op, ComputedBuffer)
     in_dep, in_buf, in_layout = _restickify_input(op, graph)
     assert in_dep is not None  # op is a confirmed restickify
-    # A None new-stick symbol means it's a size-1 host dim: codegen's restore
-    # (_restickify_restore_elided_stick) covers the elided output stick without reading
-    # the input, so there's nothing here to pad.
+
+    # Skip padding for a size-1 new-stick dim. This also skips the Scatter rewrite,
+    # which is safe because the only re-tiling is a size-1 dim swapping with the stick
+    # -- permuting no lanes -- and the other non-stick dims keep their order.
     out_stick_sym = _stick_symbol(op.get_layout().device_layout, _write_dep(op))
     if out_stick_sym is None:
+        # TODO: a restickify that ALSO permutes the non-stick dims (e.g.
+        # permute(2,0,3,1) on [3,1,5,67]) would need the rewrite. That case currently
+        # fails to compile in the optimize_restickify pass; when supported, rewrite it.
         return
+
     # A resolving symbol maps to exactly one input host dim; a non-resolving one
     # is a broken layout invariant, not an unsupported input -- assert.
     in_host_coords = host_coordinates(in_layout, in_dep, None)
