@@ -22,6 +22,7 @@
 # Shapes use multiples of 64 (stick size = 64 fp16 elements) to ensure
 # stick-aligned inputs that exercise the restickify path rather than fallback.
 
+import itertools
 import math
 
 import pytest
@@ -1512,6 +1513,78 @@ REAL_DIM_INTO_STICK_PERMS = [
 def test_real_dim_into_stick_transpose_clone_graph_input(shape, perm):
     x = _arange(*shape, span=511)
     _strict(lambda x: x.permute(*perm).contiguous(), x)
+
+
+# Full sweep of every non-identity permutation of [3,1,5,67] via
+# permute(p).contiguous(), across both restickify input arms.  This generalises
+# test_real_dim_into_stick_transpose_clone_graph_input (which pins a subset of
+# perms for the clone arm) to the whole permutation group and to the producer arm.
+#
+#   clone arm:    x.permute(p).contiguous()            -- restickify reads a bare
+#                 graph input; the pass inserts + grows an identity clone.
+#   producer arm: (x + x * 3.0).permute(p).contiguous() -- a pointwise op
+#                 materialises a ComputedBuffer the pass grows in place.  x * 3.0
+#                 keeps the producer from folding away, so this exercises a path
+#                 the clone arm does not.
+#
+# Every clone-arm case is bit-exact.  The producer arm is bit-exact EXCEPT for the
+# six perms in PRODUCER_XFAIL_PERMS, which hit a separate LX scratchpad-planning
+# defect (NOT a restickify bug -- the restickify pass never fires for them; the
+# stick dim is unchanged and only the outer non-stick dims reorder).  See
+# PRODUCER_XFAIL_PERMS below.
+_SWEEP_SHAPE = (3, 1, 5, 67)
+_ALL_PERMS = [p for p in itertools.permutations(range(4)) if p != (0, 1, 2, 3)]
+
+
+@pytest.mark.parametrize("perm", _ALL_PERMS, ids=lambda p: "".join(map(str, p)))
+def test_full_perm_sweep_transpose_clone_graph_input(perm):
+    # Clone arm copies the input through unchanged, so any band <= 1024 is
+    # fp16-exact; span 511 widens distinct-lane coverage.
+    x = _arange(*_SWEEP_SHAPE, span=511)
+    _strict(lambda x: x.permute(*perm).contiguous(), x)
+
+
+# The six producer-arm perms that miscompile via the LX scratchpad defect.  In
+# each, the interposed pointwise output is staged in LX and read back in a
+# transposed iteration order, so the lanes come back permuted (a silent wrong-
+# number miscompile, not an error).  LX_PLANNING=0 fixes every one; the restickify
+# pass never fires for them.  This is the same defect as the reduction-upstream
+# and chain_531_t01 transpose-contiguous cases -- one LX bug, three front-ends.
+# xfail is non-strict: when the LX defect is fixed these will start passing, and a
+# non-strict xfail tolerates that (it will XPASS) without failing the suite -- flip
+# them to plain expected-pass then.
+PRODUCER_XFAIL_PERMS = {
+    (1, 2, 0, 3),  # dim3 (orig stick) stays; outer reals reordered
+    (2, 0, 1, 3),  # dim3 stays; outer reals reordered
+    (2, 1, 0, 3),  # dim3 stays; outer reals reordered
+    (2, 0, 3, 1),  # size-1 dim1 into stick; outer reals reordered
+    (2, 3, 0, 1),  # size-1 dim1 into stick; outer reals reordered
+    (3, 2, 0, 1),  # size-1 dim1 into stick; outer reals reordered
+}
+
+
+@pytest.mark.parametrize(
+    "perm",
+    [
+        pytest.param(
+            p,
+            marks=pytest.mark.xfail(
+                reason="LX scratchpad staging of a transpose-crossing buffer "
+                "permutes lanes; fixed by LX_PLANNING=0, not a restickify bug",
+                strict=False,
+            ),
+        )
+        if p in PRODUCER_XFAIL_PERMS
+        else p
+        for p in _ALL_PERMS
+    ],
+    ids=lambda p: "".join(map(str, p)),
+)
+def test_full_perm_sweep_transpose_contiguous_producer(perm):
+    # t + t * 3.0 == 4 * t, so the input band must satisfy 4 * span <= 1024 to stay
+    # fp16-exact (else CPU-fp16 vs device-DLFloat16 rounding is a false mismatch).
+    x = _arange(*_SWEEP_SHAPE, span=255)
+    _strict(lambda x: (x + x * 3.0).permute(*perm).contiguous(), x)
 
 
 # A size-1 dim in the input stick whose NEW stick dim spans >=2 stick blocks
