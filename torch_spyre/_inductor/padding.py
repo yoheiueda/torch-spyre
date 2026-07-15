@@ -695,30 +695,64 @@ def _rewrite_restickify_to_scatter(op: ComputedBuffer, in_buf: ComputedBuffer) -
     all share the ``[2, 3, 4]`` order.
 
     Recovers the transpose from the read vs. the producer's write
-    (``_recover_restickify_transpose_perm``) and rebuilds ``op.data``. Each guard
-    below declines to a no-op, leaving the read-side bump as the only fix, when this
-    is not the shape it handles.
+    (``_recover_restickify_transpose_perm``) and rebuilds ``op.data``. Declines to a
+    no-op, leaving the read-side bump as the only fix, when the producer is not a
+    Pointwise buffer or the read carries no transpose. Raises ``Unsupported`` when the
+    transpose is unrecoverable (an unexpected read shape), since leaving such a read as
+    a Pointwise could silently permute lanes. (Other properties this relies on --
+    op.data Pointwise, a tiled producer layout, a single indexed read of in_buf -- are
+    already guaranteed by restickify identification and asserted below.)
     """
     data = op.data
-    # Decline unless op and its producer are pointwise with a tiled layout: without
-    # that there is no producer buffer to read straight through.
-    if not isinstance(data, Pointwise):
-        return
+    assert isinstance(data, Pointwise), "a restickify's op.data is always Pointwise"
+    # The rewrite recovers the transpose by matching the restickify's read against the
+    # producer's affine write index (_recover_restickify_transpose_perm), which
+    # requires a producer that writes such an index -- a Pointwise ComputedBuffer with
+    # a tiled layout. Other producers (e.g. a Reduction, whose in_buf.data is a
+    # Reduction, a Loops sibling of Pointwise, not an instance of it) fall through to
+    # the read-side bump alone; the rewrite is not attempted for them.
+    #
+    # TODO: a non-Pointwise producer could be given the rewrite by cloning it into a
+    # Pointwise buffer (lower_identity_clone, as the graph-input arm does) and reading
+    # that. Not done here: the clone would likely re-fuse into the same bundle
+    # (spyre_fuse_nodes groups contiguous Spyre nodes regardless of realization), so
+    # whether it yields the interior boundary the rewrite needs is unvalidated.
     if not isinstance(in_buf.data, Pointwise):
         return
-    if not isinstance(in_buf.get_layout(), FixedTiledLayout):
-        return
-    # Decline unless op reads exactly in_buf: otherwise it is not a single-producer
-    # chain we can put on the producer's order.
+    # _restickify_input already required a FixedTiledLayout producer to confirm op is
+    # a restickify, so this is an invariant here.
+    assert isinstance(in_buf.get_layout(), FixedTiledLayout)
+    # op has exactly one indexed read, of in_buf: _restickify_input required a single
+    # name-bearing read (in_dep, from which in_buf was fetched), and
+    # _identify_restickify then took its device coordinates via dep.index -- which a
+    # StarDep does not have -- so in_dep is a MemoryDep of in_buf. Hence this is an
+    # invariant here, not a case to decline.
     reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
-    if len(reads) != 1 or reads[0].name != in_buf.get_name():
-        return
+    assert len(reads) == 1 and reads[0].name == in_buf.get_name()
     ranges = [concretize_expr(r) for r in data.ranges]
     perm = _recover_restickify_transpose_perm(reads[0], _write_dep(in_buf), ranges)
-    # Decline on an unrecoverable perm (unexpected read shape), or an identity perm
-    # -- a plain, non-transposing restickify with no crossing buffer, which stays on
-    # its Pointwise codegen path.
-    if perm is None or perm == list(range(len(perm))):
+    # A None perm means a read coefficient had no matching producer stride, so the
+    # read is a shape the recovery does not model. We cannot tell whether it hides a
+    # real transpose -- if it does, leaving op as a Pointwise would fuse a
+    # differently-ordered interior read into one kernel and silently permute lanes,
+    # the very miscompile this rewrite prevents. So fail loudly rather than risk it,
+    # matching _assert_input_paddable's treatment of reads it cannot pad.
+    if perm is None:
+        raise Unsupported(
+            f"insert_restickify_padding: could not recover the transpose of "
+            f"restickify {op.get_name()} from its read of {in_buf.get_name()} "
+            f"(unexpected read shape); refusing to risk a permuted-lane miscompile"
+        )
+    # An identity perm means op reads its producer in producer order, so there is no
+    # transpose to carry on the store. This covers a plain, non-transposing restickify
+    # (e.g. an insert_restickify retiling the same host layout), AND a restickify whose
+    # transpose was already absorbed upstream in the fused chain -- a pointwise op
+    # sitting between the transpose and this .contiguous() (e.g.
+    # ``x.transpose(0, -1).mul(3.0).contiguous()``) is the crossing edge, read in the
+    # transposed order it was written, so this restickify reads that op straight.
+    # Either way there is no crossing buffer here, so op stays on its Pointwise codegen
+    # path with the read-side bump as the only fix.
+    if perm == list(range(len(perm))):
         return
     op.data = _make_restickify_scatter(data, perm)
     logger.debug(
