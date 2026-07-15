@@ -1109,10 +1109,11 @@ def test_pad_multi_consumer_producer_fuses_with_coreader():
     compare_with_cpu(fn, x, z, target=result, run_eager=False)
 
 
-def test_pad_shared_all_restickify_consumers_fuse():
-    """A producer read only by restickify ops fuses even with several consumers.
-    Two transposes of the same producer take different new stick dims, so each
-    needs a different padding; both must apply and both results be correct."""
+def _shared_producer_two_restickify_case():
+    """The (inputs, fn) for a producer ``p = x * 2`` whose sole consumers are two
+    transposes taking different new stick dims -- so p fans out to two restickify
+    nodes with different paddings.  Shared by the two tests below, which assert
+    different things about it (fusion + correctness vs the two-node graph shape)."""
     x = torch.randn((67, 53, 128), dtype=torch.float16)
     za = torch.randn((128, 53, 67), dtype=torch.float16)
     zb = torch.randn((67, 128, 53), dtype=torch.float16)
@@ -1121,6 +1122,14 @@ def test_pad_shared_all_restickify_consumers_fuse():
         p = x * 2  # sole consumers are the two transposes below (restickifies)
         return p.transpose(0, 2) + za, p.transpose(1, 2) + zb
 
+    return (x, za, zb), fn
+
+
+def test_pad_shared_all_restickify_consumers_fuse():
+    """A producer read only by restickify ops fuses even with several consumers.
+    Two transposes of the same producer take different new stick dims, so each
+    needs a different padding; both must apply and both results be correct."""
+    (x, za, zb), fn = _shared_producer_two_restickify_case()
     result, fused, _ = _run_capturing_padding_log(fn, x, za, zb)
     assert fused >= 1, "all-restickify shared producer should fuse"
     compare_with_cpu(fn, x, za, zb, target=result, run_eager=False)
@@ -1168,14 +1177,7 @@ def test_shared_producer_gets_two_restickify_nodes():
     that fans out to two consumers each wanting a different layout gets a
     *separate* restickify node per consumer -- both reading the one producer.
     We assert the two-node shape directly rather than via the fusion log."""
-    x = torch.randn((67, 53, 128), dtype=torch.float16)
-    za = torch.randn((128, 53, 67), dtype=torch.float16)
-    zb = torch.randn((67, 128, 53), dtype=torch.float16)
-
-    def fn(x, za, zb):
-        p = x * 2  # sole consumers are the two transposes below (restickifies)
-        return p.transpose(0, 2) + za, p.transpose(1, 2) + zb
-
+    (x, za, zb), fn = _shared_producer_two_restickify_case()
     by_source = _restickify_readers_by_source(fn, x, za, zb)
     shared = [src for src, readers in by_source.items() if len(readers) >= 2]
     assert shared, (
@@ -1248,6 +1250,32 @@ def test_strict_transpose_0_last_clone(shape):
     _strict(lambda x: x.transpose(0, -1).clone(), x)
 
 
+# ======================================================================
+# Size-1 dims in and around the stick.
+#
+# A size-1 host dim collapses upstream Inductor's within-stick loop symbol, so
+# these transpose+clone/contiguous geometries used to abort or return zeroed
+# planes.  Each family below targets a distinct restickify arm/branch:
+#
+#   family                        arm / branch exercised
+#   ----------------------------  ------------------------------------------
+#   SIZE1_INPUT_STICK             size-1 leaves stick, real enters:
+#     _clone (.exp -> folds to reinterpret_tensor, allclose oracle)
+#     _contiguous_producer        in-place producer grow (_pad_restickify_input)
+#     _clone_graph_input          inserted identity clone we grow
+#   SIZE1_NEW_STICK               size-1 moves INTO stick; pass declines the
+#                                 read, codegen restores the elided OUTPUT stick
+#   SIZE1_MULTI_STICK             size-1 in stick + more size-1 dims (clone arm)
+#   SIZE1_SURVIVING_BATCH         real batch survives outside BOTH sticks; new
+#                                 stick a full 64 (no output-middle pad)
+#   REAL_DIM_INTO_STICK + sweeps  real dim into stick via bare-input clone;
+#                                 full 23-perm sweep across both arms
+#   SIZE1_MULTI_BLOCK             new stick spans >=2 stick blocks
+#   SIZE1_MULTI_BLOCK_MID_DIM     + real dim between old stick and plane
+#                                 (old-stick-selection tiebreak)
+# ======================================================================
+
+
 # A size-1 dim IN the input stick ((7, 67, 1) etc.): the transpose moves this
 # size-1 dim out of the stick and a real dim in.  These shapes used to abort in
 # the backend or return garbage for all but the first plane; every element must
@@ -1300,44 +1328,74 @@ def test_size1_input_stick_transpose_0_last_contiguous_producer(shape):
 # transpose flips it on one interior edge, so a buffer written in the original
 # order and read transposed used to address under mismatched geometries and the
 # result came back as a lane permutation (same values, wrong positions).  The
-# single-stage case above never exposed this -- there is no interior buffer.  Not
-# size-1-specific: the last-dim-2 shape below fails the same way.  Ramp span 255
-# through x + x then *2 (or +add) stays < 1024 (fp16-exact), so torch.equal pins a
-# displaced lane exactly.
-MULTISTAGE_CONTIGUOUS = [
-    (2, 3, 4),  # the original repro shape
-    (5, 3, 2),  # last dim 2 -- confirms the bug is not size-1-specific
-    (5, 3, 1),  # size-1 last dim -- the size-1 chain still works
+# single-stage case above never exposed this -- there is no interior buffer.  The
+# fix reads each direct producer in the producer's own order and permutes only the
+# store, so no interior buffer is dual-ordered.
+#
+# Two axes both matter and are swept independently (a full cross-product would add
+# nothing -- the crossing edge is the same regardless of the combination):
+#   * producer SHAPE, on a fixed linear 2-then-3-stage chain -- covers a size-1
+#     last dim and a non-size-1 last dim (dim 2), proving it is not size-1-specific;
+#   * producer DAG SHAPE, on the fixed [2,3,4] repro -- multi-input, diamond, and
+#     pointwise-stages-on-both-sides-of-the-transpose.
+# Ramp span 255 through the chains stays < 1024 (fp16-exact), so torch.equal pins
+# a displaced lane exactly.
+MULTISTAGE_PRODUCER_CASES = [
+    # (builder, shape, id): linear-chain shape sweep.
+    (
+        lambda x: (x + x).mul(2.0).transpose(0, -1).contiguous(),
+        (2, 3, 4),
+        "2stage_2x3x4",
+    ),
+    (
+        lambda x: (x + x).mul(2.0).transpose(0, -1).contiguous(),
+        (5, 3, 2),
+        "2stage_5x3x2",
+    ),
+    (
+        lambda x: (x + x).mul(2.0).transpose(0, -1).contiguous(),
+        (5, 3, 1),
+        "2stage_5x3x1",
+    ),
+    # A third stage extends the producer chain one more step.
+    (
+        lambda x: (x + x).mul(2.0).add(1.0).transpose(0, -1).contiguous(),
+        (2, 3, 4),
+        "3stage_2x3x4",
+    ),
+    (
+        lambda x: (x + x).mul(2.0).add(1.0).transpose(0, -1).contiguous(),
+        (5, 3, 2),
+        "3stage_5x3x2",
+    ),
+    (
+        lambda x: (x + x).mul(2.0).add(1.0).transpose(0, -1).contiguous(),
+        (5, 3, 1),
+        "3stage_5x3x1",
+    ),
+    # DAG-shape sweep on the [2,3,4] repro.
+    (lambda x: (x + x * 3.0).transpose(0, -1).contiguous(), (2, 3, 4), "multi_input"),
+    (
+        lambda x: ((x + 1.0) * (x + 2.0)).transpose(0, -1).contiguous(),
+        (2, 3, 4),
+        "diamond",
+    ),
+    (
+        lambda x: (x + x).mul(2.0).add(1.0).transpose(0, -1).mul(3.0).contiguous(),
+        (2, 3, 4),
+        "stages_both_sides",
+    ),
 ]
 
 
 @pytest.mark.parametrize(
-    "shape", MULTISTAGE_CONTIGUOUS, ids=lambda p: "x".join(map(str, p))
+    "builder,shape",
+    [(b, s) for b, s, _ in MULTISTAGE_PRODUCER_CASES],
+    ids=[i for _, _, i in MULTISTAGE_PRODUCER_CASES],
 )
-def test_multistage_producer_transpose_contiguous(shape):
+def test_multistage_producer_transpose_contiguous(builder, shape):
     x = _arange(*shape, span=255)
-    _strict(lambda x: (x + x).mul(2.0).transpose(0, -1).contiguous(), x)
-    # A third stage extends the producer chain one more step.
-    _strict(lambda x: (x + x).mul(2.0).add(1.0).transpose(0, -1).contiguous(), x)
-
-
-# The interior crossing buffer is independent of the producer's DAG shape and of
-# where the transpose sits in the chain, so the same transpose + .contiguous()
-# must come back bit-exact for a multi-input producer, a diamond producer, and a
-# chain with pointwise stages on BOTH sides of the transpose.  Each reads its
-# direct producer in the producer's own order and permutes only the store, so no
-# interior buffer is dual-ordered regardless of shape.  Span 255 keeps every
-# intermediate < 1024 (fp16-exact) for torch.equal.
-def test_multistage_producer_transpose_contiguous_dag_shapes():
-    x = _arange(2, 3, 4, span=255)
-    # Multi-input producer: the direct producer reads two operands.
-    _strict(lambda x: (x + x * 3.0).transpose(0, -1).contiguous(), x)
-    # Diamond producer: two branches reconverge before the transpose.
-    _strict(lambda x: ((x + 1.0) * (x + 2.0)).transpose(0, -1).contiguous(), x)
-    # Pointwise stages both before and after the transpose.
-    _strict(
-        lambda x: (x + x).mul(2.0).add(1.0).transpose(0, -1).mul(3.0).contiguous(), x
-    )
+    _strict(builder, x)
 
 
 # A size-1 dim moving INTO the stick (the mirror of SIZE1_INPUT_STICK): the
@@ -1345,7 +1403,8 @@ def test_multistage_producer_transpose_contiguous_dag_shapes():
 # the OUTPUT operand's within-stick loop symbol.  This used to crash -- the pass
 # asserted ``grew`` in _pad_restickify_input (padding.py) and, once that was made
 # to decline, the descriptor SIGABRT'd in dxp_standalone because
-# _restore_elided_restickify_stick only handled the mirror (elided INPUT stick).
+# _restickify_restore_elided_stick (spyre_kernel.py) only handled the mirror
+# (elided INPUT stick).
 # The pass now declines the size-1-new-stick read (no over-read to cover) and
 # codegen restores the elided OUTPUT stick, so both must come back bit-exact.
 #
@@ -1400,19 +1459,31 @@ def test_size1_input_stick_transpose_0_last_clone_graph_input(shape):
 
 
 # A size-1 dim in the input stick PLUS at least one more size-1 host dim
-# elsewhere, so more than one size-1 dim is present at once.  Result must be
-# correct regardless of where the extra size-1 dims sit; the interleaved
-# variants (a real dim between the size-1 dims) confirm placement does not
-# matter.
-#
-# Each entry is (shape, transpose_dims): the transpose swaps the size-1
-# input-stick dim with a real dim, and the two untouched dims are both size-1.
+# elsewhere, so more than one size-1 dim is present at once.  The transpose still
+# has to place every real batch plane correctly regardless of where the extra
+# size-1 dims sit (non-first planes used to come back zeroed).  This one clone
+# path (x.transpose(*dims).clone()) covers two arrangements that were originally
+# split across two tests:
+#   * the extra size-1 dims are the two UNTOUCHED dims, possibly interleaved with
+#     a real dim between them (the first five entries), and
+#   * an extra size-1 dim sits OUTSIDE both sticks, leading or middle, with one or
+#     two of them (the last five entries).
+# Each entry is (shape, transpose_dims); the transpose swaps the size-1
+# input-stick dim with a real dim.  Distinct-ramp + torch.equal catches a
+# mis-placed plane exactly.
 SIZE1_MULTI_STICK = [
+    # Extra size-1 dims are the untouched dims (or interleaved with a real dim).
     ((1, 1, 64, 1), (0, -1)),  # three size-1 dims (0, 1, 3)
     ((1, 1, 67, 1), (0, -1)),  # three size-1 dims, unaligned stick
     ((1, 5, 67, 1), (0, -1)),  # interleaved: size-1 at 0 and 3, real 5/67 between
     ((7, 1, 64, 1), (1, 3)),  # interleaved: size-1 at 1 and 3, real 7/64 between
     ((5, 1, 67, 1), (1, 3)),  # interleaved: size-1 at 1 and 3, real 5/67 between
+    # Extra size-1 dim(s) outside both sticks (leading or middle).
+    ((1, 4, 64, 1), (2, 3)),  # extra size-1 leading (dim0)
+    ((4, 1, 64, 1), (2, 3)),  # extra size-1 in the middle (dim1)
+    ((1, 4, 1, 64, 1), (3, 4)),  # two extra size-1, batch outer
+    ((4, 1, 1, 64, 1), (3, 4)),  # two extra size-1, batch/size-1 interleaved
+    ((1, 1, 4, 64, 1), (3, 4)),  # two extra size-1, batch inner
 ]
 
 
@@ -1454,30 +1525,6 @@ def test_size1_input_stick_surviving_batch_transpose_clone(shape, dims):
     _strict(lambda x: x.transpose(*dims).clone(), x)
 
 
-# A size-1 dim in the input stick PLUS a second size-1 host dim (leading or
-# middle) that is not itself part of either stick.  With two size-1 dims present
-# the transpose still has to place every real batch plane correctly regardless
-# of where the extra size-1 dim sits (non-first planes used to come back
-# zeroed).  Distinct-ramp + torch.equal catches a mis-placed plane exactly.
-SIZE1_EXTRA = [
-    ((1, 4, 64, 1), (2, 3)),  # extra size-1 leading (dim0)
-    ((4, 1, 64, 1), (2, 3)),  # extra size-1 in the middle (dim1)
-    ((1, 4, 1, 64, 1), (3, 4)),  # two extra size-1, batch outer
-    ((4, 1, 1, 64, 1), (3, 4)),  # two extra size-1, batch/size-1 interleaved
-    ((1, 1, 4, 64, 1), (3, 4)),  # two extra size-1, batch inner
-]
-
-
-@pytest.mark.parametrize(
-    "shape,dims",
-    SIZE1_EXTRA,
-    ids=[f"{'x'.join(map(str, s))}_t{d}" for s, d in SIZE1_EXTRA],
-)
-def test_size1_extra_dim_transpose_clone(shape, dims):
-    x = _arange(*shape)
-    _strict(lambda x: x.transpose(*dims).clone(), x)
-
-
 # A REAL (extent > 1) dim moving into the stick when the restickify input is a
 # bare graph input (no producer op to grow in place).  This is the clone-arm
 # mirror of test_multistage_producer_transpose_contiguous: the pass inserts an
@@ -1487,15 +1534,16 @@ def test_size1_extra_dim_transpose_clone(shape, dims):
 # because the clone reproduced the restickify's transposed view of the input
 # instead of the input's own layout, collapsing the relocated dim into the stick.
 #
+# Shape [3,2,5,67] has NO size-1 dim, so it confirms the fix is not
+# size-1-specific.  The size-1 shape [3,1,5,67] is covered exhaustively (every
+# perm) by test_full_perm_sweep_transpose_clone_graph_input below, so it is not
+# repeated here.
+#
 # Must use .permute(...).contiguous(): .clone() on a bare input folds to
-# reinterpret_tensor and never restickifies.  Each perm of [3,1,5,67] moves a real
-# dim (size 3 or 5) into the stick; the reordered variants ALSO permute the outer
-# real dims, so the store carries a compound transpose.  Ramp span 511 keeps every
-# value < 1024 (fp16-exact), so torch.equal pins a mis-placed lane exactly.
-REAL_DIM_INTO_STICK = [
-    (3, 1, 5, 67),  # one size-1 dim; a real dim relocates into the stick
-    (3, 2, 5, 67),  # no size-1 dim -- confirms the fix is not size-1-specific
-]
+# reinterpret_tensor and never restickifies.  Each perm moves a real dim (size 3
+# or 5) into the stick; the reordered variants ALSO permute the outer real dims,
+# so the store carries a compound transpose.  Ramp span 511 keeps every value
+# < 1024 (fp16-exact), so torch.equal pins a mis-placed lane exactly.
 REAL_DIM_INTO_STICK_PERMS = [
     (0, 1, 3, 2),  # size-5 dim into stick, outer dims in order
     (2, 1, 0, 3),  # size-3 dim into an outer slot, outer dims reordered
@@ -1505,13 +1553,10 @@ REAL_DIM_INTO_STICK_PERMS = [
 
 
 @pytest.mark.parametrize(
-    "shape", REAL_DIM_INTO_STICK, ids=lambda p: "x".join(map(str, p))
-)
-@pytest.mark.parametrize(
     "perm", REAL_DIM_INTO_STICK_PERMS, ids=lambda p: "".join(map(str, p))
 )
-def test_real_dim_into_stick_transpose_clone_graph_input(shape, perm):
-    x = _arange(*shape, span=511)
+def test_real_dim_into_stick_transpose_clone_graph_input(perm):
+    x = _arange(3, 2, 5, 67, span=511)
     _strict(lambda x: x.permute(*perm).contiguous(), x)
 
 
