@@ -333,8 +333,11 @@ def _device_coords(stl: SpyreTensorLayout, dep) -> list[Expr]:
 
 def _write_dep(op):
     """Return op's write dependency on the buffer it produces."""
-    # Every ComputedBuffer here has exactly one named write; raise if not.
-    return next(d for d in op.get_read_writes().writes if hasattr(d, "name"))
+    writes = [d for d in op.get_read_writes().writes if hasattr(d, "name")]
+    assert len(writes) == 1, (
+        f"_write_dep: {op.get_name()} has {len(writes)} named writes, want exactly 1"
+    )
+    return writes[0]
 
 
 def _restickify_input(op, graph: GraphLowering):
@@ -557,23 +560,21 @@ def _pad_input_new_stick_dim(buf: ComputedBuffer, new_stick_dim: int) -> None:
         buf.layout = _pad_layout_device_dim(layout, device_dim, new_dim_size)
 
 
-def _recover_restickify_transpose_perm(
+def _recover_restickify_read_perm(
     read_dep: MemoryDep, prod_write_dep: MemoryDep, ranges: list[int]
 ) -> list[int] | None:
-    """Recover which producer storage dim each restickify iteration dim reads,
-    by comparing the restickify's read against the producer's own write.
+    """Recover which producer storage dim each restickify iteration dim reads.
 
-    Returns ``perm`` with ``perm[i]`` = the producer storage dim that restickify
-    iteration dim ``i`` reads (identity for a plain, non-transposing restickify).
-    Returns ``None`` when a read coefficient has no matching producer stride (an
-    unexpected read shape), so the caller can decline to rewrite.
+    Returns ``perm`` with ``perm[i]`` = the producer storage dim read by iteration
+    dim ``i`` (identity for a non-transposing restickify), or ``None`` when a read
+    coefficient has no matching producer stride (an unexpected read shape).
 
-    read_dep (the restickify's read) and prod_write_dep (the producer's write)
-    index the same buffer, so their affine indices carry the SAME set of stride
-    coefficients; only which iteration var each coefficient multiplies differs, and
-    that difference IS the transpose.
+    ``read_dep`` (the restickify's read) and ``prod_write_dep`` (the producer's
+    write) index the same buffer, so their affine indices carry the same set of
+    stride coefficients; only which iteration var each coefficient multiplies
+    differs, and that difference is the transpose.
     """
-    # Map each producer stride coefficient to the storage dim it addresses...
+    # Map each producer stride coefficient to the storage dim it addresses.
     prod_index = prod_write_dep.index.expand()
     coeff_to_prod_dim = {
         prod_index.coeff(v): d for d, v in enumerate(prod_write_dep.var_names)
@@ -583,10 +584,9 @@ def _recover_restickify_transpose_perm(
     perm: list[int | None] = [None] * len(ranges)
     used: set[int] = set()
     var_i = 0
-    # ...then walk the restickify's iteration ranges, looking up the coefficient on
-    # each read var to find the producer dim that iteration dim reads. ranges drives
-    # the walk (not read_vars) because a size-1 iteration dim carries no symbol and
-    # so is absent from read_dep's vars.
+    # Walk the iteration ranges (not read_vars: a size-1 dim carries no symbol and is
+    # absent from the read's vars) and look up each read var's coefficient to find the
+    # producer dim it reads.
     for i, extent in enumerate(ranges):
         if extent == 1:
             continue  # size-1 dim: no symbol in the dep, filled from leftovers below
@@ -604,14 +604,11 @@ def _recover_restickify_transpose_perm(
 
 def _make_restickify_scatter(data: Pointwise, perm: list[int]) -> Scatter:
     """Build a ``Scatter`` equivalent to the transposing restickify ``data`` but
-    iterating in the producer's storage order rather than the transposed order.
-
-    This carries the transpose on the store instead of the read, so the whole
-    fused chain iterates one order. The ``Scatter`` reads the producer straight and
-    permutes only where it writes into the fresh output buffer.
+    iterating in the producer's storage order, carrying the transpose on the store
+    (see ``_rewrite_restickify_to_scatter`` for why).
 
     ``perm[i]`` = the producer storage dim read by original iteration dim ``i``
-    (from ``_recover_restickify_transpose_perm``).
+    (from ``_recover_restickify_read_perm``).
     """
     n = len(perm)
     # inv is perm's inverse: it maps a producer dim back to the original
@@ -654,107 +651,151 @@ def _rewrite_restickify_to_scatter(op: ComputedBuffer, in_buf: ComputedBuffer) -
     immediately upstream, whose output buffer ``op`` reads. This backend fuses ``op``,
     ``in_buf``, and any further pointwise ops around them into one kernel -- a single
     loop nest (one SDSC bundle) over one iteration space, with every op indexed by the
-    same loop variables. That one shared iteration order is a requirement of the fused
-    form: every op in the chain must be expressible over the one set of loop variables.
+    same loop variables.
 
-    The requirement is not intrinsic to the hardware; it comes from how this backend
-    fuses. Upstream Inductor fusion is disabled (the Spyre can_fuse heuristics all
-    return False); ``spyre_fuse_nodes`` instead groups contiguous Spyre ops into one
-    FusedSchedulerNode compiled to one SDSC bundle, reusing Inductor's fused-node and
-    ops-handler framework -- which calls every op's loader and store with the same
+    That one shared iteration order is not intrinsic to the hardware; it comes from how
+    this backend fuses. Upstream Inductor fusion is disabled (the Spyre can_fuse
+    heuristics all return False); ``spyre_fuse_nodes`` instead groups contiguous Spyre ops
+    into one FusedSchedulerNode compiled to one SDSC bundle, reusing Inductor's fused-node
+    and ops-handler framework -- which calls every op's loader and store with the same
     iteration vars. So a fused bundle cannot reindex between ops; a transpose can only
     ride a load or a store.
 
-    A transpose is a view, so it carries no op of its own; it survives only as the
-    order in which ``op`` reads ``in_buf``. As a plain copy ``op`` iterates the output
-    (transposed) order and reads a transposed view of ``in_buf``, while ``in_buf`` was
-    written in its own order -- so within that single loop the interior buffer is read
-    in a different order than it was written, and lanes land permuted. Rewriting ``op``
-    to read the producer straight and carry the transpose on its store instead
-    (``_make_restickify_scatter``) keeps the whole chain on one iteration order, with
-    no interior buffer read in an order other than it was written -- the store into the
-    fresh output buffer is the one place a reorder is safe, since it is not an interior
-    fused buffer.
+    A transpose is a view, so it carries no op of its own; it survives only as the order
+    in which one op indexes a buffer. Call each such load or store an *edge*, and the
+    one edge whose index is reordered relative to how its buffer was written the
+    *crossing edge* -- the single place in the fused chain where the iteration order
+    flips. The transpose must ride exactly one edge. It is safe on a graph-input load
+    (the input is not written inside the chain) or on the final store into the fresh
+    output buffer (not an interior fused buffer anyone reads back). It is a miscompile
+    only when the crossing edge is an *interior*-buffer read: a buffer written by one
+    fused op and then read by another in a different order, so within the one loop it is
+    read differently than it was written and lanes land permuted.
 
-    Example -- ``(x + x).mul(2.0).transpose(0, -1).contiguous()`` on ``[2, 3, 4]``
-    lowers to a sequence of buffers::
+    Whether the crossing edge is such an interior read depends on where the transpose
+    sits in the chain. When it sits after the pointwise ops
+    (``... .transpose().contiguous()``), the producers write their buffers straight and
+    ``op``'s own read of ``in_buf`` is the crossing edge -- an interior read, so the
+    rewrite is needed. When it sits before them (``x.transpose().mul().contiguous()``),
+    the first pointwise op's load of ``x`` is the crossing edge (a safe graph-input
+    load), every interior buffer after it is written and read in that same reordered
+    order, and ``op`` reads ``in_buf`` straight -- nothing to fix. Rewriting ``op`` to
+    read the producer straight and carry the transpose on its store instead
+    (``_make_restickify_scatter``) moves the crossing edge from an interior read to the
+    output store, the one reorder that is always safe.
+
+    Example (Pointwise producer -- the rewrite fires) --
+    ``(x + x).mul(2.0).transpose(0, -1).contiguous()`` on ``[2, 3, 4]`` lowers to a
+    sequence of buffers::
 
         buf0 = add(x, x)          # Pointwise
         buf1 = mul(buf0, 2.0)     # Pointwise, reads buf0
         buf2 = restickify(buf1)   # the .contiguous() after a transpose view
 
     The transpose survives only as the order in which ``buf2`` reads ``buf1``. Fusion
-    merges ``buf0``, ``buf1``, ``buf2`` into one kernel with one loop nest (one SDSC
-    bundle): for each iteration index the loop body computes ``add``, feeds it to
-    ``mul``, and feeds that to the restickify store, all indexed by the same loop
-    variables. As a plain copy the restickify iterates the output ``[4, 3, 2]`` order
-    and reads ``buf1`` transposed, while ``mul`` wrote ``buf1`` in ``[2, 3, 4]`` order
-    -- so ``buf1`` is the transpose-crossing buffer, read differently than written. As
-    a Scatter the restickify reads ``buf1`` straight in ``[2, 3, 4]`` order and applies
-    the transpose only when storing into ``buf2``, so ``add``, ``mul``, and the read
-    all share the ``[2, 3, 4]`` order.
+    merges the three into one loop nest over the same loop variables ``(p0, p1, p2)``. As
+    a plain copy the restickify walks the output ``[4, 3, 2]`` order and reads ``buf1``
+    transposed::
+
+        buf1 (mul):        writes buf1 at  12*p0 + 4*p1 + p2   # [2, 3, 4] order
+        buf2 (restickify): reads  buf1 at   4*p0 + 12*p2 + p1  # a TRANSPOSED view
+                           stores buf2 at  12*p0 + 4*p1 + p2   # contiguous output
+
+    ``mul`` wrote ``buf1`` in ``[2, 3, 4]`` order but the restickify reads it in a
+    reordered order -- so the restickify's read of ``buf1`` is the crossing edge, an
+    interior read differing from the write, and lanes land permuted. The rewrite flips
+    which side carries the transpose::
+
+        buf2 (as Scatter): reads  buf1 at  12*p0 + 4*p1 + p2   # STRAIGHT, matches mul
+                           stores buf2 at    p0 + 2*p1 + 6*p2  # transpose on the store
+
+    Now ``add``, ``mul``, and the read all share the ``[2, 3, 4]`` order, and the
+    transpose only reorders how results land in the fresh output ``buf2`` -- safe,
+    because ``buf2`` is not an interior fused buffer anyone reads back.
+
+    Example (transpose before the pointwise op -- already correct, nothing to rewrite) --
+    ``x.transpose(0, -1).mul(3.0).contiguous()`` on ``[2, 3, 4]`` looks similar but the
+    transpose sits earlier, so it is absorbed on ``mul``'s load of ``x``::
+
+        buf0 (mul):        reads  x    at  p0 + 4*p1 + 12*p2   # x read TRANSPOSED
+                           writes buf0 at  p0 + 4*p1 + 12*p2   # buf0 in [4, 3, 2] order
+        buf1 (restickify): reads  buf0 at  p0 + 4*p1 + 12*p2   # STRAIGHT, matches mul
+                           stores buf1 at 6*p0 + 2*p1 +    p2  # contiguous output
+
+    The crossing edge is ``mul``'s read of ``x`` (a safe graph-input load); ``buf0`` is
+    written and read in the same ``[4, 3, 2]`` order, so the restickify already reads it
+    straight. ``_recover_restickify_read_perm`` matches read against write and returns the
+    identity: the read is already in producer order, so the code is already correct and
+    this function returns without changing it.
+
+    Example (Reduction producer -- already correct, nothing to rewrite) --
+    ``x.sum(1, keepdim=True).transpose(2, 3).contiguous()`` on ``[2, 3, 4, 5]`` lowers
+    to::
+
+        buf0 = sum(x, dim=1)      # Reduction, output [2, 1, 4, 5]
+        buf1 = restickify(buf0)   # transpose(2, 3) then .contiguous(), output [2,1,5,4]
+
+    Here Inductor already emits the store-carried form, so there is nothing to fix::
+
+        buf0 (sum):        writes buf0 at  20*p0 + 5*p1 + p2   # surviving dims [2,4,5]
+        buf1 (restickify): reads  buf0 at  20*p0 + 5*p1 + p2   # IDENTICAL -- straight
+                           stores buf1 at  20*p0 +   p1 + 4*p2 # transpose on the store
+
+    The read index is byte-identical to the write index: ``buf0`` is read in the order
+    the reduction wrote it, and the transpose rides the store. Unlike a Pointwise
+    producer, ``keepdim`` collapsed dim 1 to size 1, dropping it from the iteration space,
+    so the restickify walks only the surviving dims and has no full transposed view to
+    read -- the transpose can only land on the store. A transposing restickify on a
+    Reduction is thus born in the very form the rewrite manufactures for Pointwise, so
+    returning it unchanged (below, on the non-Pointwise producer) is the correct outcome,
+    not a missed case: ``_recover_restickify_read_perm`` would report a non-identity perm
+    here (the host layouts do differ by a transpose), but that describes the host
+    geometry, not an out-of-order interior read -- there is none.
 
     Recovers the transpose from the read vs. the producer's write
-    (``_recover_restickify_transpose_perm``) and rebuilds ``op.data``. Declines to a
-    no-op, leaving the read-side bump as the only fix, when the producer is not a
-    Pointwise buffer or the read carries no transpose. Raises ``Unsupported`` when the
-    transpose is unrecoverable (an unexpected read shape), since leaving such a read as
-    a Pointwise could silently permute lanes. (Other properties this relies on --
-    op.data Pointwise, a tiled producer layout, a single indexed read of in_buf -- are
-    already guaranteed by restickify identification and asserted below.)
+    (``_recover_restickify_read_perm``) and rebuilds ``op.data`` when the read is the
+    crossing edge. Returns ``op`` unchanged -- it is already correct, there is no
+    interior read to move -- when the producer is not a Pointwise buffer or the read
+    already matches the producer's write order (identity perm).
+
+    Raises ``Unsupported`` only when the read is genuinely unrecoverable (an unexpected
+    read shape): that is the one failure, and it aborts rather than leave a Pointwise read
+    that could silently permute lanes. (Other properties this relies on -- op.data
+    Pointwise, a tiled producer layout, a single indexed read of in_buf -- are already
+    guaranteed by ``_identify_restickify`` and asserted below.)
     """
     data = op.data
     assert isinstance(data, Pointwise), "a restickify's op.data is always Pointwise"
-    # The rewrite recovers the transpose by matching the restickify's read against the
-    # producer's affine write index (_recover_restickify_transpose_perm), which
-    # requires a producer that writes such an index -- a Pointwise ComputedBuffer with
-    # a tiled layout. Other producers (e.g. a Reduction, whose in_buf.data is a
-    # Reduction, a Loops sibling of Pointwise, not an instance of it) fall through to
-    # the read-side bump alone; the rewrite is not attempted for them.
-    #
-    # TODO: a non-Pointwise producer could be given the rewrite by cloning it into a
-    # Pointwise buffer (lower_identity_clone, as the graph-input arm does) and reading
-    # that. Not done here: the clone would likely re-fuse into the same bundle
-    # (spyre_fuse_nodes groups contiguous Spyre nodes regardless of realization), so
-    # whether it yields the interior boundary the rewrite needs is unvalidated.
+
+    # A non-Pointwise producer (e.g. a Reduction) already emits the store-carried form,
+    # so it is correct as-is -- return it unchanged.
     if not isinstance(in_buf.data, Pointwise):
         return
-    # _restickify_input already required a FixedTiledLayout producer to confirm op is
-    # a restickify, so this is an invariant here.
+
+    # _identify_restickify guarantees these invariants.
     assert isinstance(in_buf.get_layout(), FixedTiledLayout)
-    # op has exactly one indexed read, of in_buf: _restickify_input required a single
-    # name-bearing read (in_dep, from which in_buf was fetched), and
-    # _identify_restickify then took its device coordinates via dep.index -- which a
-    # StarDep does not have -- so in_dep is a MemoryDep of in_buf. Hence this is an
-    # invariant here, not a case to decline.
     reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
     assert len(reads) == 1 and reads[0].name == in_buf.get_name()
+
+    # Recover which producer dim each iteration dim reads (None -> unrecoverable).
     ranges = [concretize_expr(r) for r in data.ranges]
-    perm = _recover_restickify_transpose_perm(reads[0], _write_dep(in_buf), ranges)
-    # A None perm means a read coefficient had no matching producer stride, so the
-    # read is a shape the recovery does not model. We cannot tell whether it hides a
-    # real transpose -- if it does, leaving op as a Pointwise would fuse a
-    # differently-ordered interior read into one kernel and silently permute lanes,
-    # the very miscompile this rewrite prevents. So fail loudly rather than risk it,
-    # matching _assert_input_paddable's treatment of reads it cannot pad.
+    perm = _recover_restickify_read_perm(reads[0], _write_dep(in_buf), ranges)
+
     if perm is None:
         raise Unsupported(
             f"insert_restickify_padding: could not recover the transpose of "
             f"restickify {op.get_name()} from its read of {in_buf.get_name()} "
             f"(unexpected read shape); refusing to risk a permuted-lane miscompile"
         )
-    # An identity perm means op reads its producer in producer order, so there is no
-    # transpose to carry on the store. This covers a plain, non-transposing restickify
-    # (e.g. an insert_restickify retiling the same host layout), AND a restickify whose
-    # transpose was already absorbed upstream in the fused chain -- a pointwise op
-    # sitting between the transpose and this .contiguous() (e.g.
-    # ``x.transpose(0, -1).mul(3.0).contiguous()``) is the crossing edge, read in the
-    # transposed order it was written, so this restickify reads that op straight.
-    # Either way there is no crossing buffer here, so op stays on its Pointwise codegen
-    # path with the read-side bump as the only fix.
+
+    # An identity perm means op reads its producer straight, so this interior read is
+    # not the crossing edge and no rewrite is needed.
     if perm == list(range(len(perm))):
         return
+
+    # Rebuild op as a Scatter that reads the producer straight, transposing on store.
     op.data = _make_restickify_scatter(data, perm)
+
     logger.debug(
         "insert_restickify_padding: rewrote restickify %s to Scatter (transpose "
         "perm %s on producer %s)",
