@@ -29,7 +29,6 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
-    Scatter,
 )
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
@@ -347,31 +346,21 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
 def is_restickify(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
     """Return whether a single-input pointwise copy is a RESTICKIFY (vs IDENTITY).
 
-    The one authoritative restickify test, shared by the codegen store side
-    (``SpyreKernel.store`` in spyre_kernel.py) and the padding pass's candidate
-    matcher (``_identify_restickify`` in padding.py) so the two cannot drift
-    apart -- a disagreement would let the pass skip an op codegen then
-    restickifies on an unpadded buffer, over-reading uninitialized stick lanes.
+    ``in_coords`` / ``out_coords`` are the operands' device-space coordinates.
+    It is a restickify iff a *different* host dim lands within the stick (the
+    within-stick coords carry different free symbols) -- except a broadcast (an
+    all-zero input expanding to non-scalar output), which is an identity fill.
 
-    ``in_coords`` / ``out_coords`` are the two operands' device-space coordinate
-    expressions.  It is a restickify iff a *different* host dim lands within the
-    stick, i.e. the within-stick (last) coords carry different free symbols --
-    except for a broadcast (an all-zero input expanding to a non-scalar output),
-    which is a plain identity fill, not a re-tiling.
+    The authoritative test, shared by the codegen store side and the padding
+    pass matcher (``_identify_restickify``) so the two cannot disagree.
     """
     if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
         return False  # broadcast: scalar input expanding to non-scalar output
     return in_coords[-1].free_symbols != out_coords[-1].free_symbols
 
 
-# aten ops whose lowering produces a genuinely *indexed* Scatter -- its
-# output_indexer loads index tensors that must be excluded from stick-compatibility
-# checks. Any Scatter NOT from one of these is index-free (a pure-permutation
-# restickify transpose from padding.py, a constant-offset chunk from
-# chunk_large_tensors.py, or a future backend Scatter usecase), so it carries no
-# index tensors and needs no warning. We denylist the indexing ops rather than
-# allowlist the index-free ones so new backend Scatter usecases stay silent by
-# default -- only a genuine indexed scatter is expected to have index tensors.
+# aten indexing ops whose lowering produces an *indexed* Scatter -- one that
+# loads index tensors in its output_indexer.
 _INDEXED_SCATTER_OP_NAMES = frozenset(
     {
         "scatter",
@@ -389,9 +378,7 @@ _INDEXED_SCATTER_OP_NAMES = frozenset(
 def _is_indexed_scatter_origin(op: ComputedBuffer) -> bool:
     """True if op originates from an aten indexing op (scatter / index_put / ...).
 
-    Keyed on the op's base name so both the functional and in-place overloads
-    (scatter / scatter_, index_put / index_put_) match. Only such a Scatter is
-    expected to carry index tensors in its output_indexer closure.
+    Keyed on the base name so both the functional and in-place overloads match.
     """
     return any(
         getattr(n.target, "_opname", None) in _INDEXED_SCATTER_OP_NAMES
@@ -402,16 +389,11 @@ def _is_indexed_scatter_origin(op: ComputedBuffer) -> bool:
 def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
     """Return names of deps whose loaded values are used as indices in scatter output_indexer.
 
-    Only an *indexed* Scatter (scatter/index_put/...) has index tensors to
-    exclude: its output_indexer closure captures them under the 'indices' freevar.
-    The backend's own Scatters are pure permutations (restickify transpose,
-    padding.py) or constant offsets (chunk_large_tensors.py) and carry no index
-    tensors; they are told apart by origin (``_is_indexed_scatter_origin``) so only
-    a genuine indexed scatter proceeds to closure reflection. A missing 'indices'
-    freevar on such a scatter is then a real anomaly -- Inductor renamed the
-    closure out from under our reflection -- so its index tensors go unexcluded and
-    we warn.
+    For Scatter ops the indirect index is encoded in the output_indexer closure.
+    Extract the index buffer names directly from the 'indices' closure variable.
     """
+    from torch._inductor.ir import Scatter
+
     if not isinstance(op.data, Scatter):
         return set()
 
@@ -439,8 +421,9 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
         )
         return set()
 
+    indices = cells["indices"]
     names = set()
-    for idx_tensor in cells["indices"] or ():
+    for idx_tensor in indices:
         if idx_tensor is None:
             continue
         # Unwrap TensorBox -> StorageBox -> Buffer to get the name

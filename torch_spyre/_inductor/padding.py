@@ -102,9 +102,9 @@ def _move_ops_before(
 ) -> None:
     """Relocate *new_ops* to sit immediately before *anchor* in *operations*.
 
-    ``lower_pad_sequence`` appends new ops at the end of ``operations``; this
-    helper moves them to just before the op that consumes them so topological
-    order is preserved.
+    ``run_node`` appends each newly lowered op at the end of ``operations``;
+    this helper moves them to just before the op that consumes them so
+    topological order is preserved.
     """
     for o in new_ops:
         operations.remove(o)
@@ -342,8 +342,8 @@ def _write_dep(op):
 
 def _restickify_input(op, graph: GraphLowering):
     """Return ``(in_dep, in_buf, in_layout)`` for a restickify's single input, or
-    ``(None, None, None)`` if ``op`` cannot be one (not a single-named-read
-    pointwise copy whose input buffer has a FixedTiledLayout).
+    ``(None, None, None)`` if ``op`` cannot be one: it must have exactly one
+    named read whose buffer has a FixedTiledLayout.
     """
     # Callers that already know op is a confirmed restickify can assume this
     # succeeds.
@@ -407,14 +407,9 @@ def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
 
 
 def _identify_restickify(op: Operation, graph: GraphLowering) -> bool:
-    """Return whether ``op`` is a restickify.
-
-    A restickify is a single-input pointwise copy between two FixedTiledLayouts
-    that lands a *different* host dim within the stick.  This answers only the
-    "is it a restickify?" question; each side then derives the stick dim it
-    cares about from its own operand's stick symbol
-    (``_pad_restickify_output`` from the input's old stick,
-    ``_pad_restickify_input`` from the output's new stick).
+    """Return whether ``op`` is a restickify: a single-input pointwise copy
+    between two FixedTiledLayouts that lands a *different* host dim within the
+    stick.
     """
     if not isinstance(op, ComputedBuffer):
         return False
@@ -871,19 +866,13 @@ def lower_identity_clone(
     orig_stl: SpyreTensorLayout,
     insert_before: torch.fx.Node,
 ) -> tuple[ComputedBuffer, list[Operation]]:
-    """Lower an identity ``aten.clone`` of ``arg_fx_node``, allocated at the
-    ORIGINAL unpadded ``host_size`` and ``host_stride``.
+    """Lower an identity ``aten.clone`` of ``arg_fx_node`` as a layout-preserving
+    copy: allocated at ``host_size`` / ``host_stride`` (not contiguous) with a
+    ``SpyreTensorLayout`` copied from ``orig_stl``, so it replicates the graph
+    input's layout. The caller then bumps ``device_size`` on the stick dim.
 
-    The clone replicates the graph input's layout: same host strides, and a
-    ``SpyreTensorLayout`` copied from ``orig_stl``. Matching the input's strides is
-    what lets the restickify's inherited read of the input still address the clone
-    correctly after the caller redirects the read (the read's affine coefficients
-    are the input's), and makes the clone's own write share those coefficients so
-    the Scatter rewrite can recover the transpose. The caller then bumps
-    ``device_size`` on the stick-carrying dim.
-
-    Returns ``(clone_buf, new_ops)`` where ``clone_buf`` is the single new
-    ComputedBuffer and ``new_ops`` is the (length-1) list of new IR operations.
+    Returns ``(clone_buf, new_ops)`` -- the single new ComputedBuffer and the
+    (length-1) list of new IR operations.
     """
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
@@ -894,10 +883,6 @@ def lower_identity_clone(
         clone_fx = fx_graph.create_node(
             "call_function", torch.ops.aten.clone.default, args=(arg_fx_node,)
         )
-        # Allocate at the input's strides, not contiguous: a contiguous clone would
-        # be written with different affine coefficients than the restickify's read
-        # of the input carries, breaking both the address match and the Scatter
-        # rewrite's transpose recovery (issue #1756).
         clone_fx.meta["val"] = torch.empty_strided(
             host_size, host_stride, dtype=dtype, device=device
         )
@@ -996,11 +981,8 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     if isinstance(in_buf, ComputedBuffer):
         _pad_input_new_stick_dim(in_buf, new_stick_dim)
         log_bumped("producer", in_buf)
-        # The bump only keeps the over-read in bounds. If this restickify also
-        # transposes, its fused kernel still reads an interior buffer in a
-        # different order than it was written; expressing it as a Scatter that
-        # reads the producer straight keeps the kernel on one iteration order (a
-        # no-op for a non-transposing restickify).
+        # Ensure the restickify reads the producer's output buffer in the order
+        # the producer wrote it, carrying any transpose on the store instead.
         _rewrite_restickify_to_scatter(op, in_buf)
         return
 
@@ -1038,12 +1020,9 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
         op, {in_dep.name: clone_buf.get_name()}, graph.operations
     )
 
-    # The clone is written in the input's own order; if this restickify also
-    # transposes, its fused kernel would read that interior buffer in a different
-    # order than it was written. Express it as a Scatter that reads the clone
-    # straight and permutes on the store, keeping the kernel on one iteration
-    # order (mirrors the producer arm above). Runs AFTER the redirect so op's
-    # single read points at the clone (the rewrite asserts this).
+    # Ensure the restickify reads the clone's output buffer in the order the
+    # clone wrote it. Runs AFTER the redirect so the restickify's single read
+    # points at the clone.
     _rewrite_restickify_to_scatter(op, clone_buf)
 
 

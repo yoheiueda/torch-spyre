@@ -1132,8 +1132,9 @@ def _restickify_restore_elided_stick(op_spec) -> None:
     other, unaffected operand is "intact"). With no iteration symbol the two
     operands disagree on which dim carries the stick and the backend cannot
     build a dimension mapping. Restoring the stick before align (rather than
-    at SDSC time) lets align itself mint the iteration symbol, reducing the
-    size-1 case to the ordinary N>=2 path.
+    at SDSC time) creates the iteration symbol in time for align to match the
+    operands by it, reducing the size-1 case to the ordinary path where both
+    operands carry a within-stick iteration symbol (N>=2 iteration dims).
 
     Why this exact window: align_tensors matches operands by shared symbol, so
     the symbol must exist before align runs. Bumping the collapsed dim earlier
@@ -1144,7 +1145,8 @@ def _restickify_restore_elided_stick(op_spec) -> None:
     late to affect the descriptor align already built.
 
     We create one fresh symbol ``new_sym`` shared by both operands, so align
-    sees them as the same iteration var and matches them up:
+    sees them as the same iteration var and matches them up (64 below is the
+    stick's element count for fp16):
 
     - ELIDED operand: its stick is rebuilt as
       ``[floor(new_sym/64)] + real_dims + [Mod(new_sym, 64)]``.
@@ -1225,8 +1227,9 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
 
     if op_spec.op == RESTICKIFY_OP:
-        # A restickify's own elided size-1 stick is restored here so align_tensors
-        # can mint its iteration symbol (the N>=2 path).
+        # Restore a restickify's elided size-1 stick, creating a shared iteration
+        # symbol on both operands, so align_tensors matches them by that symbol
+        # (the ordinary N>=2 path). See the function docstring for why here.
         _restickify_restore_elided_stick(op_spec)
 
     it_space = op_spec.iteration_space
