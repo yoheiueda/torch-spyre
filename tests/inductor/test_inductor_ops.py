@@ -5982,15 +5982,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             expected[:, :, start:end].copy_(y)
         torch.testing.assert_close(x_spyre.cpu(), expected, atol=0.1, rtol=0.1)
 
-    def test_slice_stick_mutation_1d_no_alt_dim_raises(self):
-        """A stick-dim mutation on a 1D buffer that needs relocation raises.
-
-        Relocating an unsupported stick write means moving the stick onto a
-        different dimension, but a 1D tensor has no other dimension to move it
-        to.  Both an offset write (``[32:96]``) and a sub-stick write
-        (``[:32]``) into a full-stick 1D buffer therefore fail with a clear
-        Unsupported error rather than miscompiling.
-        """
+    def test_slice_stick_mutation_no_alt_dim_raises(self):
+        """An offset stick-dim write raises when there is no other dim to move
+        the stick to."""
 
         def fn(x, y):
             x[32:96].copy_(y)
