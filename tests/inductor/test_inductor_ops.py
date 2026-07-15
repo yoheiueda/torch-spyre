@@ -5983,8 +5983,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch.testing.assert_close(x_spyre.cpu(), expected, atol=0.1, rtol=0.1)
 
     def test_slice_stick_mutation_no_alt_dim_raises(self):
-        """An offset stick-dim write raises when there is no other dim to move
-        the stick to."""
+        """Test that offset-stick slice mutation raises Unsupported when no alt dim is divisible by stick_size."""
 
         def fn(x, y):
             x[32:96].copy_(y)
