@@ -247,6 +247,38 @@ def test_bidirectional_roundtrip_fp32_start(device, fp16):
     print("✓ FP32→FP16→FP32 roundtrip works")
 
 
+# Shapes whose whole content fits in a single stick, so the tensor has no
+# spatial dim outside the stick dim for the conversion op to loop over.
+STICK_ONLY_SHAPES = [
+    (),
+    (1,),
+    (1, 1),
+    (1, 1, 1),
+]
+
+
+@pytest.mark.parametrize("shape", STICK_ONLY_SHAPES)
+@pytest.mark.parametrize("start_dtype", [torch.float32, torch.float16])
+def test_roundtrip_stick_only_shape(shape, start_dtype):
+    """A conversion round trip works when the tensor is a scalar or all size-1 dims.
+
+    A type conversion needs one spatial dim beyond the stick, which these shapes
+    do not have; codegen supplies a virtual one. Both directions are exercised
+    because a single fp16->fp32 output is staggered and not comparable to CPU.
+    """
+    other_dtype = torch.float16 if start_dtype == torch.float32 else torch.float32
+
+    def fn(t):
+        return t.to(other_dtype).to(start_dtype)
+
+    x = torch.ones(shape, dtype=start_dtype)
+    result = torch.compile(fn, backend="inductor")(x.to("spyre"))
+
+    ea = get_spyre_tensor_layout(result).element_arrangement
+    assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
+    torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
+
+
 def _stagger_fn(x, fp16):
     """fp32 → fp16(staggered) → stagger_to_standard_ea → standard EA fp16."""
     return torch.ops.spyre.stagger_to_standard_ea(x.to(dtype=fp16))
