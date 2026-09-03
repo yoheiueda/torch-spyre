@@ -14,11 +14,14 @@
 
 
 from contextlib import contextmanager
+import functools
+import itertools
 from warnings import warn
 
 import sympy
 import torch
 
+from torch._prims_common import is_integer_dtype
 from torch._inductor.ir import Reduction, Pointwise, StorageBox
 import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
@@ -1689,49 +1692,84 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
     )
 
 
-def with_int64_fallback(fn, *args, convert_output=True):
+def with_integer_fallback(fn=None, *, convert_output=True):
     """
-    Helper to handle int64 operations by converting to fp32.
+    Run a lowering in fp32 when type promotion would compute in an integer dtype.
+
+    The device has no integer arithmetic unit, so a decorated lowering computes
+    in fp32 instead and its result is converted back to the integer dtype its
+    arguments arrived in -- an int32 operation stays int32 rather than being
+    widened. The whole body runs in fp32, so tensors it builds from an argument's
+    dtype (an `alpha` constant, say) are fp32 as well.
+
+    The fallback is conditional on the dtype the operation *settles on* rather
+    than on any one argument being integral, so mixed cases are left to ordinary
+    promotion: `int64 + float16` promotes to fp16 and already computes in fp32, so
+    it needs no fallback. Boolean is left alone too -- the device treats it as
+    masking, not arithmetic.
+
+    That dtype is read straight off the arguments, which relies on being
+    registered with a promoting `type_promotion_kind`: every tensor argument has
+    then already been cast to one common dtype, making both the test and the dtype
+    to restore unambiguous. A promoted dtype is integral exactly when the
+    computation dtype is, fp16's widening to fp32 being on the same side of the
+    test, so the arguments answer the question on their own.
+
+    `INT_TO_FLOAT` is what promotion of the affected arguments amounts to, so
+    conversion is delegated to `lowering.transform_args` with that kind, which
+    also moves CPU scalars onto the device, rebuilds `ir.Constant` args at the
+    promoted dtype, and covers tensors passed by keyword.
+
+    Usable bare or with arguments:
+
+        @with_integer_fallback
+        def lower_mul(x, y): ...
+
+        @with_integer_fallback(convert_output=False)
+        def lower_div(x, y): ...
 
     Args:
-        fn: The lowering function to call
-        *args: Arguments to pass to fn
-        convert_output: If True, convert output back to int64.
-                       Set to False for operations like div that should return float.
+        convert_output: If False, leave the fp32 result alone instead of
+            converting it back to the integer dtype -- for operations such as div
+            whose integer inputs produce a float result.
     """
-    # Skip constants (int/float literals) that don't have get_dtype()
-    has_int64 = False
-    for x in args:
-        if isinstance(x, (int, float)):
-            continue
-        if hasattr(x, "get_dtype") and x.get_dtype() == torch.int64:
-            has_int64 = True
-            break
 
-    if not has_int64:
-        return fn(*args)
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            integer_dtypes = {
+                x.get_dtype()
+                for x in itertools.chain(args, kwargs.values())
+                if isinstance(x, ir.TensorBox) and is_integer_dtype(x.get_dtype())
+            }
+            if not integer_dtypes:
+                return fn(*args, **kwargs)
+            if len(integer_dtypes) > 1:
+                # Promotion should have left one dtype; more means it did not run.
+                raise NotImplementedError(f"mixed integer dtypes: {integer_dtypes}")
+            (integer_dtype,) = integer_dtypes
 
-    # Convert args, skipping constants
-    converted_args = []
-    for x in args:
-        if isinstance(x, (int, float)):
-            converted_args.append(x)
-        else:
-            converted_args.append(to_dtype(x, torch.float32))
+            # transform_args mutates the list it is handed.
+            args, kwargs = lowering.transform_args(
+                list(args),
+                dict(kwargs),
+                False,  # broadcast: left to the wrapped lowering
+                lowering.ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+                False,  # convert_input_to_bool
+            )
 
-    output = fn(*converted_args)
+            output = fn(*args, **kwargs)
+            if not convert_output:
+                return output
+            return to_dtype(output, integer_dtype)
 
-    if convert_output:
-        return to_dtype(output, torch.int64)
+        return wrapper
 
-    return output
+    return decorate if fn is None else decorate(fn)
 
 
-@register_spyre_lowering(
-    torch.ops.aten.add.Tensor,
-    type_promotion_kind=None,
-    broadcast=True,
-)
+@register_spyre_lowering(torch.ops.aten.add.Tensor, broadcast=True)
+@with_integer_fallback
 def lower_add(x, y, *, alpha=1):
     if alpha != 1:
         alpha_tensor = lower_full(
@@ -1741,25 +1779,19 @@ def lower_add(x, y, *, alpha=1):
             device=y.get_device(),
         )
         alpha_tensor.realize()
-        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y = lowering.mul(y, alpha_tensor)
         y.realize()
-    return with_int64_fallback(lowering.add, x, y)
+    return lowering.add(x, y)
 
 
-@register_spyre_lowering(
-    torch.ops.aten.mul.Tensor,
-    type_promotion_kind=None,
-    broadcast=True,
-)
+@register_spyre_lowering(torch.ops.aten.mul.Tensor, broadcast=True)
+@with_integer_fallback
 def lower_mul(x, y):
-    return with_int64_fallback(lowering.mul, x, y)
+    return lowering.mul(x, y)
 
 
-@register_spyre_lowering(
-    torch.ops.aten.sub.Tensor,
-    type_promotion_kind=None,
-    broadcast=True,
-)
+@register_spyre_lowering(torch.ops.aten.sub.Tensor, broadcast=True)
+@with_integer_fallback
 def lower_sub(x, y, *, alpha=1):
     if alpha != 1:
         alpha_tensor = lower_full(
@@ -1769,27 +1801,21 @@ def lower_sub(x, y, *, alpha=1):
             device=y.get_device(),
         )
         alpha_tensor.realize()
-        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y = lowering.mul(y, alpha_tensor)
         y.realize()
-    return with_int64_fallback(lowering.sub, x, y)
+    return lowering.sub(x, y)
 
 
-@register_spyre_lowering(
-    torch.ops.aten.minimum.default,
-    type_promotion_kind=None,
-    broadcast=True,
-)
+@register_spyre_lowering(torch.ops.aten.minimum.default, broadcast=True)
+@with_integer_fallback
 def lower_minimum(x, y):
-    return with_int64_fallback(lowering.minimum, x, y)
+    return lowering.minimum(x, y)
 
 
-@register_spyre_lowering(
-    torch.ops.aten.maximum.default,
-    type_promotion_kind=None,
-    broadcast=True,
-)
+@register_spyre_lowering(torch.ops.aten.maximum.default, broadcast=True)
+@with_integer_fallback
 def lower_maximum(x, y):
-    return with_int64_fallback(lowering.maximum, x, y)
+    return lowering.maximum(x, y)
 
 
 @register_spyre_lowering(torch.ops.spyre.qfp8ch)
@@ -1844,20 +1870,15 @@ def lower_qfp8wt(x):
     return pw
 
 
-@register_spyre_lowering(
-    torch.ops.spyre.prod_dim_int,
-    type_promotion_kind=None,
-)
+@register_spyre_lowering(torch.ops.spyre.prod_dim_int)
+@with_integer_fallback
 def lower_prod_dim(x, dim, keepdim=False):
-    def _prod_dim_impl(x):
-        kwargs = lowering._make_reduction_inner(
-            x, axis=[dim], keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
-        )
-        result = Reduction.create(reduction_type="prod", input_node=x, **kwargs)
-        result.realize()
-        return result
-
-    return with_int64_fallback(_prod_dim_impl, x)
+    kwargs = lowering._make_reduction_inner(
+        x, axis=[dim], keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
+    )
+    result = Reduction.create(reduction_type="prod", input_node=x, **kwargs)
+    result.realize()
+    return result
 
 
 @register_spyre_lowering(torch.ops.aten.any.dim, type_promotion_kind=None)
