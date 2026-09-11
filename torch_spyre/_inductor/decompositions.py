@@ -2055,7 +2055,8 @@ def tril_decomp(self: torch.Tensor, diagonal=0) -> torch.Tensor:
     """``torch.tril`` as device compute, masking instead of copying to host.
 
     Computes the cases ``_triangular_mask`` cannot serve on the host instead
-    (see ``_on_host``); the result is device-correct either way.
+    (see ``_on_host``), a route that does not yet work -- a declined case
+    recurses until the stack is gone.
     """
     if not _triangular_is_supported(self, diagonal):
         return _on_host(torch.tril, self, diagonal)
@@ -2121,7 +2122,8 @@ def cumsum_decomp(self: torch.Tensor, dim: int, *, dtype=None) -> torch.Tensor:
     happens in the matmul, which is what the hardware is fastest at.
 
     Computes the cases ``_cumsum_is_supported`` declines on the host instead
-    (see ``_on_host``); the result is device-correct either way.
+    (see ``_on_host``), a route that does not yet work -- a declined case
+    recurses until the stack is gone.
     """
     if (dtype is not None and dtype != self.dtype) or not _cumsum_is_supported(
         self, dim
