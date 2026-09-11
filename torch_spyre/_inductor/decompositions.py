@@ -1780,26 +1780,51 @@ _ARANGE_SEED_LEN = 64
 
 
 def _arange_seed(length: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """``[0, length)`` for a length of at most one stick, via the eager path.
+    """``[0, length)`` for a length of at most one stick, computed on device.
 
-    Deliberately calls ``aten.arange`` rather than building the values here: a
-    decomposition body is traced, not executed, so host data written inline
-    (``torch.tensor([...])``) becomes a graph constant, and this backend gives
-    a tiled device layout only to *scalar* constants -- a 64-lane ramp fails
-    layout propagation with "does not have FixedTiledLayout".
+    Builds a square whose row ``i`` is uniformly ``i`` and reads back its first
+    column, which is the ramp:
 
-    Reaching ``aten.arange`` from inside its own decomposition is safe because
-    ``_arange_decomp`` only ever asks for at most ``_ARANGE_SEED_LEN``
-    elements, and ``arange_start_step_decomp`` declines that range, so the call
-    lands on the registered eager fallback instead of recursing.
+        cat([full((1, 64), i) for i in range(64)]).transpose(0, 1)[:1, :]
 
-    TODO: produce the seed on device once a sub-stick-safe construction or a
-    coordinate primitive exists; today every device-side route is blocked --
-    ``cumsum``/``iota`` need ``ops.index_expr``, ``eye`` needs a bool output
-    format, and assembling a stick from scalars is rejected as a sub-stick
-    ``cat`` ("Unexpected stick expression").
+    Only *scalar* constants get a tiled device layout on this backend -- a
+    64-lane ramp written inline becomes a graph constant that fails layout
+    propagation with "does not have FixedTiledLayout" -- so every value here
+    enters as its own ``full``, and the rotation is what turns 64 uniform
+    blocks into one varying one.
+
+    Each block is a full stick wide on purpose. A ``[1, 1]`` block holds its
+    value in a whole stick too, but then the 64 values sit one per stick and
+    rotating them would have to gather across sticks, which codegen rejects
+    ("No mechanism to gather elements from multiple sticks into single stick").
+    At a full stick per row the same rotation is an ordinary dense transpose.
+
+    Slice before materializing, never after: ``transpose(0, 1)[:1, :]`` keeps a
+    64-stick intermediate and emits a real rotate, whereas forcing the whole
+    square contiguous first lets the slice collapse into host stride algebra
+    and the rotate is elided, leaving one value per stick again.
     """
-    return torch.arange(length, dtype=dtype, device=device)
+    blocks = [
+        torch.full((1, _ARANGE_SEED_LEN), float(i), dtype=dtype, device=device)
+        for i in range(_ARANGE_SEED_LEN)
+    ]
+    ramp = torch.cat(blocks, dim=0).transpose(0, 1)[:1, :]
+    return ramp.reshape(_ARANGE_SEED_LEN).clone()[:length]
+
+
+def _arange_seed_dtype_supported(dtype: torch.dtype) -> bool:
+    """Whether ``_arange_seed``'s rotate is available for this output dtype.
+
+    The rotate is realized by ``ReStickifyOpHBM``, which the backend implements
+    only for ``float16``.
+
+    TODO: serve ``float32`` on device once restickify supports it. Building the
+    seed at ``float16`` and converting does not work around this today: the
+    conversion misreads the rotated buffer (taking 4 of every 8 lanes, the fp32
+    half-stick stride), and the same conversion faults natively on an ordinary
+    host-sourced ramp, so the gap is in the conversion rather than here.
+    """
+    return dtype == torch.float16
 
 
 def _arange_decomp(
@@ -1831,15 +1856,20 @@ def _arange_decomp(
     return result[:length] if size != length else result
 
 
-def _arange_is_supported(start, end, step, dtype: Optional[torch.dtype]) -> bool:
+def _arange_is_supported(start, end, step, out_dtype: torch.dtype) -> bool:
     """Whether ``_arange_decomp`` can serve this request.
 
-    Restricted to what the float construction actually computes exactly:
-    a float output dtype, and static bounds. Integer outputs would need the
+    Restricted to what the construction actually computes exactly: a dtype the
+    seed's rotate supports, and static bounds. Integer outputs would need the
     missing ``float -> int`` casts, and a symbolic length cannot drive the
     doubling loop; both keep the eager CPU fallback instead.
+
+    Takes the *resolved* output dtype, not the caller's optional one, so an
+    omitted ``dtype`` is judged by the default it will actually produce.
     """
-    if dtype is not None and not dtype.is_floating_point:
+    if not out_dtype.is_floating_point:
+        return False
+    if not _arange_seed_dtype_supported(out_dtype):
         return False
     if any(isinstance(v, torch.SymInt) for v in (start, end, step)):
         return False
@@ -1862,27 +1892,20 @@ def arange_start_step_decomp(
     """``torch.arange(start, end, step)`` as device compute, not a host copy.
 
     Falls back to the eager (CPU) path for anything ``_arange_decomp`` cannot
-    compute exactly -- integer dtypes and dynamic bounds -- by deferring to
-    the original operator, which the fallback registration routes to the host.
+    compute exactly -- integer dtypes, non-``float16`` floats, and dynamic
+    bounds -- by deferring to the original operator, which the fallback
+    registration routes to the host.
     """
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
 
-    if not _arange_is_supported(start, end, step, dtype):
-        return NotImplemented
-
     out_dtype = dtype if dtype is not None else torch.get_default_dtype()
-    if not out_dtype.is_floating_point:
+    if not _arange_is_supported(start, end, step, out_dtype):
         return NotImplemented
 
     length = math.ceil((end - start) / step)
     if length <= 0:
         return torch.empty(0, dtype=out_dtype, device=device)
-
-    # A result within one stick IS the seed, which only the eager path can
-    # build; decomposing it would recurse. Doubling only pays off beyond that.
-    if length <= _ARANGE_SEED_LEN and step == 1 and start == 0:
-        return NotImplemented
 
     ramp = _arange_decomp(length, out_dtype, device)
     if step != 1:
