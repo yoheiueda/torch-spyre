@@ -1944,6 +1944,17 @@ def _on_host(fn, self: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     the dispatcher, which raises ``Unable to cast NotImplemented to Tensor`` --
     and the op is deliberately absent from ``fallback_ops``, since
     ``get_spyre_decomp_table`` drops those from the decomposition table.
+
+    TODO: this route does not work and every caller below is a known gap. There
+    is no host inside a traced graph: ``self.cpu()`` becomes a graph node, the
+    tensor stays fake, and ``fn`` on it re-enters the decomposition table and
+    dispatches back here until the interpreter runs out of stack. Measured as
+    ``RecursionError`` on every declined case, compiled and eager alike;
+    entering through the ATen overload rather than the public wrapper recurses
+    identically, so a lower-level entry point is not the fix. Declining has to
+    be expressed in a way Inductor understands, which today means
+    ``fallback_ops`` membership -- mutually exclusive with holding a
+    decomposition at all.
     """
     return fn(self.cpu(), *args, **kwargs).to(self.device)
 
