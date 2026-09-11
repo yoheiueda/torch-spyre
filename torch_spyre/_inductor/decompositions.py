@@ -1772,3 +1772,150 @@ def spyre_index_add(
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
     return torch.index_put(self, indices, updated, accumulate=False)
+
+
+# Elements per 128-byte stick at fp16 -- the granularity every device buffer
+# is allocated and processed at, and the smallest width ``cat`` accepts.
+_ARANGE_SEED_LEN = 64
+
+
+def _arange_seed(length: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """``[0, length)`` for a length of at most one stick, via the eager path.
+
+    Deliberately calls ``aten.arange`` rather than building the values here: a
+    decomposition body is traced, not executed, so host data written inline
+    (``torch.tensor([...])``) becomes a graph constant, and this backend gives
+    a tiled device layout only to *scalar* constants -- a 64-lane ramp fails
+    layout propagation with "does not have FixedTiledLayout".
+
+    Reaching ``aten.arange`` from inside its own decomposition is safe because
+    ``_arange_decomp`` only ever asks for at most ``_ARANGE_SEED_LEN``
+    elements, and ``arange_start_step_decomp`` declines that range, so the call
+    lands on the registered eager fallback instead of recursing.
+
+    TODO: produce the seed on device once a sub-stick-safe construction or a
+    coordinate primitive exists; today every device-side route is blocked --
+    ``cumsum``/``iota`` need ``ops.index_expr``, ``eye`` needs a bool output
+    format, and assembling a stick from scalars is rejected as a sub-stick
+    ``cat`` ("Unexpected stick expression").
+    """
+    return torch.arange(length, dtype=dtype, device=device)
+
+
+def _arange_decomp(
+    length: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """``[0, length)`` in a float dtype, computed on device.
+
+    Doubles a seed stick until it covers ``length``, then trims:
+
+        A(2N) = cat(A(N), A(N) + N)
+
+    so the result costs ``ceil(log2(length / 64))`` ``cat``/``add`` pairs and
+    stays in ``dtype`` throughout -- deliberately never forming an integer
+    intermediate, because the device supports neither ``int64 -> float`` nor
+    ``int32 -> float16`` (see ``DtypeOpTable``), which is what makes the
+    obvious ``iota``-then-convert lowering unusable here.
+
+    Doubling starts from a whole stick rather than a single element so that no
+    intermediate is ever narrower than one stick, which codegen would reject.
+    The final trim to ``length`` may be sub-stick, which is fine on the read
+    side. A ``length`` within one stick never enters the loop and is served by
+    the seed alone.
+    """
+    size = min(length, _ARANGE_SEED_LEN)
+    result = _arange_seed(size, dtype, device)
+    while size < length:
+        result = torch.cat([result, result + float(size)])
+        size *= 2
+    return result[:length] if size != length else result
+
+
+def _arange_is_supported(start, end, step, dtype: Optional[torch.dtype]) -> bool:
+    """Whether ``_arange_decomp`` can serve this request.
+
+    Restricted to what the float construction actually computes exactly:
+    a float output dtype, and static bounds. Integer outputs would need the
+    missing ``float -> int`` casts, and a symbolic length cannot drive the
+    doubling loop; both keep the eager CPU fallback instead.
+    """
+    if dtype is not None and not dtype.is_floating_point:
+        return False
+    if any(isinstance(v, torch.SymInt) for v in (start, end, step)):
+        return False
+    if any(isinstance(v, torch.Tensor) for v in (start, end, step)):
+        return False
+    return step != 0
+
+
+@register_spyre_decompositions([torch.ops.aten.arange.start_step])
+def arange_start_step_decomp(
+    start,
+    end,
+    step=1,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    layout: Optional[torch.layout] = None,
+    device: Optional[torch.device] = None,
+    pin_memory: Optional[bool] = None,
+) -> torch.Tensor:
+    """``torch.arange(start, end, step)`` as device compute, not a host copy.
+
+    Falls back to the eager (CPU) path for anything ``_arange_decomp`` cannot
+    compute exactly -- integer dtypes and dynamic bounds -- by deferring to
+    the original operator, which the fallback registration routes to the host.
+    """
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+
+    if not _arange_is_supported(start, end, step, dtype):
+        return NotImplemented
+
+    out_dtype = dtype if dtype is not None else torch.get_default_dtype()
+    if not out_dtype.is_floating_point:
+        return NotImplemented
+
+    length = math.ceil((end - start) / step)
+    if length <= 0:
+        return torch.empty(0, dtype=out_dtype, device=device)
+
+    # A result within one stick IS the seed, which only the eager path can
+    # build; decomposing it would recurse. Doubling only pays off beyond that.
+    if length <= _ARANGE_SEED_LEN and step == 1 and start == 0:
+        return NotImplemented
+
+    ramp = _arange_decomp(length, out_dtype, device)
+    if step != 1:
+        ramp = ramp * float(step)
+    if start != 0:
+        ramp = ramp + float(start)
+    return ramp
+
+
+@register_spyre_decompositions([torch.ops.aten.arange.default])
+def arange_decomp(
+    end,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    layout: Optional[torch.layout] = None,
+    device: Optional[torch.device] = None,
+    pin_memory: Optional[bool] = None,
+) -> torch.Tensor:
+    return arange_start_step_decomp(
+        0, end, 1, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory
+    )
+
+
+@register_spyre_decompositions([torch.ops.aten.arange.start])
+def arange_start_decomp(
+    start,
+    end,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    layout: Optional[torch.layout] = None,
+    device: Optional[torch.device] = None,
+    pin_memory: Optional[bool] = None,
+) -> torch.Tensor:
+    return arange_start_step_decomp(
+        start, end, 1, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory
+    )
