@@ -237,15 +237,19 @@ def register_fallback_default(ops):
 
 register_fallback_default(
     [
-        aten.cumsum,
+        # WIP: tril, triu and cumsum are omitted here so the Spyre
+        # decompositions in _inductor/decompositions.py stay reachable --
+        # get_spyre_decomp_table() drops every fallback_ops entry from the
+        # decomposition table, and an eager kernel registered for ["spyre"]
+        # claims the op at dispatch before Inductor sees the graph. Each
+        # decomposition serves the cases it declines on host itself. Restore
+        # the three entries to fall back on host unconditionally again.
         aten.repeat.out,
         aten.arange,
         aten.sin,
         aten.cos,
         aten.ne.Scalar_out,
         aten.isin,
-        aten.tril,
-        aten.triu,
         aten.bitwise_xor.Tensor,
         aten.bitwise_xor.Tensor_out,
         aten.bitwise_or.Tensor,

@@ -1929,6 +1929,200 @@ def arange_decomp(
     )
 
 
+# Rows of ``full`` blocks the mask construction is allowed to emit per square.
+# Beyond this the fallback's host copy is cheaper than the graph width.
+_TRIANGULAR_MAX_EXTENT = 256
+
+
+def _on_host(fn, self: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    """Compute ``fn(self, ...)`` on the host and return the result on ``self``'s
+    device.
+
+    The declined-case path for a decomposition that also serves as the op's
+    eager PrivateUse1 kernel (see ``register_spyre_decompositions``). Such a
+    kernel must return a real tensor -- the ``NotImplemented`` sentinel reaches
+    the dispatcher, which raises ``Unable to cast NotImplemented to Tensor`` --
+    and the op is deliberately absent from ``fallback_ops``, since
+    ``get_spyre_decomp_table`` drops those from the decomposition table.
+    """
+    return fn(self.cpu(), *args, **kwargs).to(self.device)
+
+
+def _index_square(
+    rows: int, cols: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """``out[i][j] = i``, as a materialized ``[rows, cols]`` buffer.
+
+    This is the intermediate ``_arange_seed`` builds and then rotates away, kept
+    whole. A comparison needs it in this form rather than as a broadcast ramp:
+    a ``[N]`` vector admits exactly one device layout (stick on its only dim),
+    so comparing ``ramp[:, None]`` against ``ramp[None, :]`` leaves no feasible
+    assignment -- whichever output layout is chosen, one of the two reads has to
+    gather across sticks or scatter within one, and neither mechanism exists
+    ("no mechanism to resolve stick incompatibility"). A real ``[rows, cols]``
+    buffer has genuine layout freedom, so the comparison is satisfiable.
+
+    Costs ``rows`` blocks of ``cols`` elements. Callers that need the transpose
+    can take it directly; a physical copy is not required.
+    """
+    blocks = [
+        torch.full((1, cols), float(i), dtype=dtype, device=device) for i in range(rows)
+    ]
+    return torch.cat(blocks, dim=0)
+
+
+def _triangular_mask(
+    rows: int,
+    cols: int,
+    diagonal: int,
+    keep_lower: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """``1`` where an element is kept by ``tril``/``triu``, ``0`` elsewhere.
+
+    ``tril`` keeps ``col <= row + diagonal`` and ``triu`` keeps
+    ``col >= row + diagonal``. The offset is folded into the row square as a
+    scalar add rather than into the comparison, so the two operands stay a
+    materialized square and a transposed view of one (see ``_index_square``).
+
+    Returned in ``dtype`` rather than ``bool``: the backend has no bool buffer
+    format, and the comparison's result is consumed by the cast before it is
+    ever stored.
+    """
+    row_index = _index_square(rows, cols, dtype, device)
+    col_index = _index_square(cols, rows, dtype, device).transpose(0, 1)
+    if diagonal != 0:
+        # TODO: support a non-zero diagonal; a scalar offset here lowers to the
+        # unimplemented ``index_expr``. ``_triangular_is_supported`` rejects
+        # this case, so the branch is unreachable from the decomps today.
+        raise NotImplementedError(f"unsupported diagonal: {diagonal}")
+    kept = col_index <= row_index if keep_lower else col_index >= row_index
+    return kept.to(dtype)
+
+
+def _triangular_is_supported(self: torch.Tensor, diagonal) -> bool:
+    """Whether ``_triangular_mask`` can serve a ``tril``/``triu`` on ``self``.
+
+    Restricted to what the construction was measured to compile, which is
+    narrower than what it can express. Everything else keeps the eager CPU
+    fallback, which is correct today.
+
+    TODO: serve a non-zero ``diagonal``. Offsetting the row square by a scalar
+    makes the comparison lower to ``index_expr`` ("Cannot resolve target for
+    'index_expr'"), the same unimplemented primitive that blocks a coordinate
+    lowering of ``arange``; a mask offset by slicing rather than by arithmetic
+    may avoid it.
+
+    TODO: serve extents that are not a whole number of sticks. A square whose
+    trailing extent is not a multiple of 64 fails an internal assertion during
+    layout propagation, the same narrow-row limit the ``arange`` seed hits.
+
+    TODO: serve ``float32`` and rank > 2, both untested rather than known bad.
+    """
+    if isinstance(diagonal, (torch.SymInt, torch.Tensor)):
+        return False
+    if int(diagonal) != 0:
+        return False
+    if self.dim() != 2:
+        return False
+    if self.dtype != torch.float16:
+        return False
+    rows, cols = self.shape[-2], self.shape[-1]
+    if any(isinstance(v, torch.SymInt) for v in (rows, cols)):
+        return False
+    rows, cols = int(rows), int(cols)
+    if rows % _ARANGE_SEED_LEN or cols % _ARANGE_SEED_LEN:
+        return False
+    # The mask emits one ``full`` per row of each square, so a large trailing
+    # extent trades a host copy for a very wide graph.
+    return max(rows, cols) <= _TRIANGULAR_MAX_EXTENT
+
+
+@register_spyre_decompositions([torch.ops.aten.tril.default])
+def tril_decomp(self: torch.Tensor, diagonal=0) -> torch.Tensor:
+    """``torch.tril`` as device compute, masking instead of copying to host.
+
+    Computes the cases ``_triangular_mask`` cannot serve on the host instead
+    (see ``_on_host``); the result is device-correct either way.
+    """
+    if not _triangular_is_supported(self, diagonal):
+        return _on_host(torch.tril, self, diagonal)
+    mask = _triangular_mask(
+        int(self.shape[-2]),
+        int(self.shape[-1]),
+        int(diagonal),
+        True,
+        self.dtype,
+        self.device,
+    )
+    return self * mask
+
+
+@register_spyre_decompositions([torch.ops.aten.triu.default])
+def triu_decomp(self: torch.Tensor, diagonal=0) -> torch.Tensor:
+    """``torch.triu`` as device compute -- ``tril``'s mask with the comparison
+    reversed. Declines the same cases, computing them on the host."""
+    if not _triangular_is_supported(self, diagonal):
+        return _on_host(torch.triu, self, diagonal)
+    mask = _triangular_mask(
+        int(self.shape[-2]),
+        int(self.shape[-1]),
+        int(diagonal),
+        False,
+        self.dtype,
+        self.device,
+    )
+    return self * mask
+
+
+def _cumsum_is_supported(self: torch.Tensor, dim: int) -> bool:
+    """Whether ``cumsum`` can be served by a triangular matmul on ``self``.
+
+    Restricted to a cumulative sum along the last dimension of a 2-D operand
+    whose extents are whole sticks, matching ``_triangular_mask``'s measured
+    coverage. Everything else keeps the eager CPU fallback.
+
+    TODO: serve a leading-dimension ``dim`` by transposing into the last one.
+    TODO: serve rank != 2 and dtypes other than ``float16``, both untested.
+    """
+    if self.dtype != torch.float16:
+        return False
+    if self.dim() != 2:
+        return False
+    if dim not in (-1, self.dim() - 1):
+        return False
+    extents = [int(v) for v in self.shape]
+    if any(isinstance(v, torch.SymInt) for v in self.shape):
+        return False
+    if any(v % _ARANGE_SEED_LEN for v in extents):
+        return False
+    return max(extents) <= _TRIANGULAR_MAX_EXTENT
+
+
+@register_spyre_decompositions([torch.ops.aten.cumsum.default])
+def cumsum_decomp(self: torch.Tensor, dim: int, *, dtype=None) -> torch.Tensor:
+    """``torch.cumsum`` as a matmul against a lower-triangular mask.
+
+    ``out[.., i] = sum(v[.., j] for j <= i)`` is exactly a contraction with
+    ``M[j][i] = 1 if j <= i``, so the prefix sum needs no scan primitive and no
+    coordinate iota -- only the mask ``tril`` already builds. The accumulation
+    happens in the matmul, which is what the hardware is fastest at.
+
+    Computes the cases ``_cumsum_is_supported`` declines on the host instead
+    (see ``_on_host``); the result is device-correct either way.
+    """
+    if (dtype is not None and dtype != self.dtype) or not _cumsum_is_supported(
+        self, dim
+    ):
+        return _on_host(torch.cumsum, self, dim, dtype=dtype)
+    cols = int(self.shape[-1])
+    # M[j][i] = 1 iff j <= i -- the transpose of tril's keep mask, so that a
+    # row of ``self`` contracts against column i's prefix.
+    prefix = _triangular_mask(cols, cols, 0, False, self.dtype, self.device)
+    return self @ prefix
+
+
 @register_spyre_decompositions([torch.ops.aten.arange.start])
 def arange_start_decomp(
     start,
