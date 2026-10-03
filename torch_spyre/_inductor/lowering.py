@@ -310,7 +310,9 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     """Give a lowering result a synthetic ``target`` origin FX node, so Spyre
     layout passes (which key off ``op.data.origins[].target``) recognize it even
     when the lowering was called directly, without an FX node of its own. No-op
-    if a ``target`` origin already exists.
+    if a ``target`` origin already exists. The node is registered in the graph
+    env, so split_multi_ops can resolve the buffer by name when a fused body
+    downstream loads it.
     """
 
     def _realized_buffer(node):
@@ -333,6 +335,15 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     # buf.data is a frozen Loops; override its origins via object.__setattr__.
     object.__setattr__(buf.data, "origins", OrderedSet([fx_node]))
     buf.origins = OrderedSet([fx_node])
+
+    # FakeTensor propagation has already run, so the synthetic node has no
+    # meta["val"]. Fill it with a meta-device tensor so downstream passes
+    # (e.g. split_multi_ops._make_intermediate_bufs) can read shape and dtype.
+    fx_node.meta["val"] = torch.empty(
+        result.get_size(), dtype=result.get_dtype(), device="meta"
+    )
+
+    V.graph.env[fx_node] = result
 
 
 @register_spyre_lowering(torch.ops.spyre.scaled_mm.default)
@@ -1811,6 +1822,11 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
             op = torch.ops.spyre.to_dtype_cpu.default
             return eager_fallback(op, x, dst_dtype)
 
+    # Leave the result lazy: do not realize it or stamp an origin here. A caller
+    # such as a broadcasting comparison converts an expanded view, and
+    # materializing that conversion sizes it at the broadcast extent, which its
+    # consumer can no longer reconcile with the other operand's stick dim. A
+    # caller that needs its own buffer realizes it (see with_int64_fallback).
     return lowering.to_dtype(
         x, dst_dtype, copy=True, use_compute_types=use_compute_types
     )
@@ -1838,13 +1854,23 @@ def with_int64_fallback(fn, *args, convert_output=True):
     if not has_int64:
         return fn(*args)
 
-    # Convert args, skipping constants
+    # Convert args, skipping constants. Each conversion is realized as its own
+    # buffer: fused into fn's body, two conversions of one buffer at different
+    # offsets (e.g. two select() rows) would be rebuilt by split_multi_ops as an
+    # op over the whole buffer, losing the offsets.
     converted_args = []
     for x in args:
         if isinstance(x, (int, float)):
             converted_args.append(x)
-        else:
-            converted_args.append(to_dtype(x, torch.float32))
+            continue
+        converted = to_dtype(x, torch.float32)
+        args_: tuple = ()
+        if isinstance(x, ir.IRNode) and (n := x.get_origin_node()) is not None:
+            args_ = (n,)
+        _ensure_synthetic_origin(
+            converted, torch.ops.prims.convert_element_type.default, args_
+        )
+        converted_args.append(converted)
 
     output = fn(*converted_args)
 

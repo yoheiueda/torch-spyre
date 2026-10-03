@@ -458,6 +458,9 @@ def _lower_fx_node(node, gl, ops, idx):
         The created buffer
     """
     tb = gl.run_node(node)
+    # run_node does not record its result in the env; only the interpreter loop
+    # does. Record it so a later intermediate can resolve this one by name.
+    gl.env[node] = tb
     buf = tb.data.data
     gl.operations.remove(buf)
     ops.insert(idx, buf)
@@ -541,6 +544,7 @@ def _make_intermediate_bufs(
             # For ExternKernel like SpyreConstantFallback, extract the raw buffer
             # only for positioning — don't replace it with raw buffer in operations.
             tb = gl.run_node(new_node)
+            gl.env[new_node] = tb
             # tb.data.data is the SpyreConstantFallback, but keep it wrapped as TensorBox
             # in operations to preserve proper attribute initialization.
             new_buf = tb.data.data

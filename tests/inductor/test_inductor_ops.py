@@ -2319,6 +2319,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # -----------------------------------------------------------------------
         # int32 tensor-vs-tensor comparisons: all 6 ops, multiple shapes.
         # -----------------------------------------------------------------------
+        # int64 arithmetic over rows of one tensor. The rows hold distinct values,
+        # so combining a row with the wrong one gives a wrong answer.
+        ("test_int64_select_rows", "test_int64_select_rows_cpu"): {
+            "ops_dict": {
+                "mul_2_rows": lambda x: x.select(0, 0) * x.select(0, 1),
+                "mul_3_rows": lambda x: x.select(0, 0)
+                * x.select(0, 1)
+                * x.select(0, 2),
+                "add_3_rows": lambda x: x.select(0, 0)
+                + x.select(0, 1)
+                + x.select(0, 2),
+            },
+            "param_sets": {
+                "3x32": (
+                    torch.tensor([[2] * 32, [3] * 32, [5] * 32], dtype=torch.int64),
+                ),
+            },
+        },
         ("test_cmp_int32_tensor", "test_cmp_int32_tensor_cpu"): {
             "ops_dict": {
                 "eq": torch.eq,
@@ -6529,6 +6547,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
+            # int64 prod over the stick dim decomposes to select+mul, and a
+            # stick-dim select reads one element per stick, a layout only a
+            # restickify can rearrange. ReStickifyOpHBM supports fp16 only.
+            "expect_fail": [
+                "int64_dim1",
+                "int64_dim1_keepdim",
+                "int64_dim1_2",
+                "int64_dim1_2_keepdim",
+            ],
         },
         ("test_unfold", "test_unfold_cpu"): {
             "param_sets": {
@@ -7346,6 +7373,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_cmp_int64_tensor_cpu(self, op, x, y):
         # int64 tensor-vs-tensor comparison.
         self.compare_with_cpu(op, x, y, run_eager=True)
+
+    def test_int64_select_rows_cpu(self, op, x):
+        # Small integers convert to fp32 exactly, so any difference is a wrong row.
+        self.compare_with_cpu(op, x, atol=0, rtol=0)
 
     def test_cmp_int32_scalar_cpu(self, op, x, scalar):
         # int32 scalar comparison (int32→fp32 cast in the lowering).
