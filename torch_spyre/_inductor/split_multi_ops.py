@@ -789,6 +789,67 @@ def validate_ops(graph: GraphLowering) -> None:
             )
 
 
+def _view_load_vids(trace, ranges) -> set[int]:
+    """Loads whose index is not their buffer's own index at the output shape.
+
+    An intermediate is materialized as an FX op over whole input buffers, which
+    reproduces a load only when it reads its buffer at the canonical position:
+    the buffer's strides applied to the trailing output index symbols, the way
+    broadcasting aligns them. A load at an offset or through a view (e.g. one
+    select() row) is not reproducible that way.
+    """
+    syms = [sympy.Symbol(f"_i{k}") for k in range(len(ranges))]
+    view_vids = set()
+    for name, vid, _, kwargs in trace:
+        if name != "load":
+            continue
+        layout = V.graph.get_buffer(kwargs["_name"]).get_layout()
+        size, stride = list(layout.size), list(layout.stride)
+        lead = len(syms) - len(size)
+        if lead < 0:
+            view_vids.add(vid)
+            continue
+        canonical = layout.offset + sum(
+            st * syms[lead + k]
+            for k, (sz, st) in enumerate(zip(size, stride))
+            if sz != 1
+        )
+        if sympy.simplify(kwargs["_index"] - canonical) != 0:
+            view_vids.add(vid)
+    return view_vids
+
+
+def _check_reproducible(trace, intermediate_ops, ranges, op_name) -> None:
+    """Refuse to split when an intermediate would combine view loads."""
+    view_vids = _view_load_vids(trace, ranges)
+    if not view_vids:
+        return
+    # Propagate two facts forward: whether a value is a tensor (derives from
+    # any load) and whether it derives from a view load.
+    tensors: set[int] = set()
+    from_view = set(view_vids)
+    for name, vid, inputs, _ in trace:
+        if name == "load" or any(v in tensors for v in inputs):
+            tensors.add(vid)
+        if any(v in from_view for v in inputs):
+            from_view.add(vid)
+    # A single tensor operand is reloaded at its own index on replay; two are
+    # combined element by element over whole buffers, which pairs the wrong ones.
+    for name, _, inputs, _ in intermediate_ops:
+        tensor_inputs = [v for v in inputs if v in tensors]
+        if len(tensor_inputs) > 1 and any(v in from_view for v in tensor_inputs):
+            # TODO: support view loads. Each would need its own materialized
+            # buffer, built by rebuilding the intermediate's inner_fn from the
+            # traced index expressions. The project convention forbids that
+            # (wrap, never reconstruct: the expressions go stale, issue #2797),
+            # so it needs another mechanism; until then refuse, not miscompile.
+            raise Unsupported(
+                f"split_multi_ops: {op_name}: intermediate '{name}' combines "
+                "loads at an offset or through a view, which an op over whole "
+                "buffers cannot reproduce"
+            )
+
+
 def split_multi_ops(graph: GraphLowering):
     """Split multi-ops in a single loop body into separate buffers.
 
@@ -860,6 +921,10 @@ def split_multi_ops(graph: GraphLowering):
 
         intermediate_ops = compute_ops[:-1]
         final_op_name = compute_ops[-1][0]
+        # A reduction's loads also index the reduction symbols, which the
+        # canonical position does not model, so only pointwise bodies are checked.
+        if isinstance(op.data, Pointwise):
+            _check_reproducible(trace, intermediate_ops, op.data.ranges, op.get_name())
 
         if _is_reduction_with_to_dtype(op, compute_ops):
             intermediate_ops = compute_ops
