@@ -1798,6 +1798,13 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
     if src_dtype == dst_dtype:
         return lowering.clone(x)
 
+    # No bool format has an op to an integer, but float32 has one, and a bool's
+    # 0/1 values convert exactly through it.
+    if src_dtype == torch.bool and dst_dtype in (torch.int32, torch.int64):
+        return to_dtype(
+            to_dtype(x, torch.float32, use_compute_types), dst_dtype, use_compute_types
+        )
+
     # Check if conversion is supported by backend
     if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
         # Unsupported conversion - fall back to CPU

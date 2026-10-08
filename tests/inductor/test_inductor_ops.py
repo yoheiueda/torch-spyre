@@ -43,7 +43,8 @@ import utils_inductor
 from unittest import mock
 from torch_spyre._inductor import config as inductor_config
 from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
-from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._C import DataFormats
+from torch_spyre._inductor.dtype_ops import DtypeOpTable, bool_equivalent_dtype
 from torch_spyre._inductor.constants import IDENTITY_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.split_multi_ops import (
@@ -9412,6 +9413,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"({src},{dst}) is identity but ({dst},{src}) returned {rev}"
             )
 
+    def test_dtype_op_table_bool_gate_matches_codegen(self):
+        """A bool conversion the lowering accepts has an op in every bool format.
+
+        The lowering decides from torch dtypes alone, before a bool has its
+        device format, and the codegen resolves the op from that format. Each
+        destination it accepts must therefore resolve under every format a bool
+        can take, or a conversion compiles to an Unsupported error.
+        """
+        bool_formats = [
+            fmt
+            for fmt in DataFormats.__members__.values()
+            if bool_equivalent_dtype(fmt) is not None
+        ]
+        assert bool_formats
+        dtypes = {dtype for pair in DtypeOpTable.get_dtype_pairs() for dtype in pair}
+        for dst in dtypes:
+            if not DtypeOpTable.is_supported(torch.bool, dst):
+                continue
+            for fmt in bool_formats:
+                assert DtypeOpTable.get_bool_src_operator(fmt, dst) is not None, (
+                    f"bool -> {dst} is accepted but has no op from {fmt}"
+                )
+
     def test_to_dtype_cpu(self, x, dst_dtype):
         def fn(x, dst_dtype):
             return x.to(dtype=dst_dtype)
@@ -9630,6 +9654,76 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def _assert_bool_to_int_on_device(self, fn, *args):
+        """Compare fn exactly with CPU for int32 and int64, asserting fp32toint32 ran."""
+        for dst in (torch.int32, torch.int64):
+            with self.subTest(dst=dst):
+                with self.assertLogs(
+                    "spyre.inductor.spyre_kernel", level="DEBUG"
+                ) as logs:
+                    self.compare_with_cpu(
+                        functools.partial(fn, dst=dst),
+                        *args,
+                        atol=0.0,
+                        rtol=0.0,
+                        cpu_compile=False,
+                        run_eager=False,
+                    )
+                self.assertTrue(
+                    any("op_spec: fp32toint32," in m for m in logs.output),
+                    f"Expected an fp32toint32 op_spec, got: {logs.output}",
+                )
+
+    def test_bool_fp32_src_to_int_cpu(self):
+        # A float32-format bool converts through float32 by an identity.
+        def fn(x, y, dst):
+            return (x > y).to(dtype=dst)
+
+        x = cached_randn((64,), dtype=torch.float32)
+        y = cached_randn((64,), dtype=torch.float32)
+        self._assert_bool_to_int_on_device(fn, x, y)
+
+    def test_bool_fp16_src_to_int_cpu(self):
+        # A float16-format bool converts through float32 by DL16TOFP32.
+        def fn(x, y, dst):
+            return (x > y).to(dtype=dst)
+
+        x = cached_randn((64,), dtype=torch.float16)
+        y = cached_randn((64,), dtype=torch.float16)
+        self._assert_bool_to_int_on_device(fn, x, y)
+
+    def test_bool_fp16_src_to_int_consumed_cpu(self):
+        # The DL16TOFP32 result is staggered, and so is the integer cast of it;
+        # converting back to float16 restores the order, so the comparison
+        # measures the values rather than the readback.
+        def fn(x, dst):
+            return (x > 2).to(dtype=dst).to(torch.float32).to(torch.float16)
+
+        x = (torch.arange(128) % 7).to(torch.float16)
+        self._assert_bool_to_int_on_device(fn, x)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="a staggered result is read back without restoring its order (#5187)",
+    )
+    def test_bool_fp16_src_to_int64_readback_known_xfail(self):
+        def fn(x):
+            return (x > 2).to(dtype=torch.int64)
+
+        x = (torch.arange(128) % 7).to(torch.float16)
+        self.compare_with_cpu(
+            fn, x, atol=0.0, rtol=0.0, cpu_compile=False, run_eager=False
+        )
+
+    def test_bool_host_to_int_cpu(self):
+        # A host bool converts to float32 on the host (see
+        # test_bool_host_to_fp32_cpu), then to the integer on device.
+        def fn(x, dst):
+            return x.to(dtype=dst)
+
+        x = torch.randint(0, 2, (64,), dtype=torch.bool)
+        self._assert_bool_to_int_on_device(fn, x)
 
     def test_bool_staggered_ea_src_to_fp16_cpu(self):
         # Both operands upcast in-graph, so the bool carries a DL16_TO_FP32 EA
