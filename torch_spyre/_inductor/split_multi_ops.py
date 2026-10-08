@@ -793,49 +793,63 @@ def validate_ops(graph: GraphLowering) -> None:
 
 
 def _validate_split_supported(op, trace, intermediate_ops) -> None:
-    """Refuse to split ``op`` when an intermediate would combine view loads.
+    """Refuse to split ``op`` when an intermediate combines a view or broadcast load.
 
     An intermediate is materialized as an FX op over the base buffers, which
     reproduces a load only at its buffer's canonical position: the buffer's
     strides on the trailing output index symbols, aligned as for broadcasting.
     A load at an offset or through a view (e.g. one select() row) is elsewhere.
-    A single such operand is still reloaded at its own index on replay, but two
-    tensor operands are combined over the base buffers and pair the wrong
-    elements.
+    The intermediate is then reloaded at the index of the last load before it,
+    so a single such operand is still read at its own index, but two tensor
+    operands are combined over the base buffers and pair the wrong elements.
+
+    A broadcast operand (a size-1 dim the output spans, or fewer dims than the
+    output) sits at its canonical position, yet it breaks the same replay: the
+    intermediate has the broadcast shape, and the broadcast operand's index
+    covers only some of its dims.
     """
     # A reduction's loads also index the reduction symbols, which the canonical
     # position does not model, so only pointwise bodies are checked.
     if not isinstance(op.data, Pointwise):
         return
-    syms = _index_syms(len(op.data.ranges))
+    ranges = op.data.ranges
+    syms = _index_syms(len(ranges))
     tensors: set[int] = set()  # values derived from any load
-    from_view: set[int] = set()  # values derived from a view load
+    partial: set[int] = set()  # values derived from a view or broadcast load
     for name, vid, inputs, kwargs in trace:
         if name == "load":
             tensors.add(vid)
             layout = V.graph.get_buffer(kwargs["_name"]).get_layout()
             lead = len(syms) - len(layout.size)
             # A buffer of higher rank than the output is read through a view.
-            is_view = lead < 0
-            if not is_view:
+            is_partial = lead < 0
+            if not is_partial:
                 canonical = layout.offset + sum(
                     st * syms[lead + k]
                     for k, (sz, st) in enumerate(zip(layout.size, layout.stride))
                     if sz != 1
                 )
-                is_view = sympy.expand(kwargs["_index"] - canonical) != 0
-            if is_view:
-                from_view.add(vid)
+                is_partial = (
+                    sympy.expand(kwargs["_index"] - canonical) != 0
+                    or lead > 0
+                    or any(
+                        sz == 1 and ranges[lead + k] != 1
+                        for k, sz in enumerate(layout.size)
+                    )
+                )
+            if is_partial:
+                partial.add(vid)
         elif any(v in tensors for v in inputs):
             tensors.add(vid)
-            if any(v in from_view for v in inputs):
-                from_view.add(vid)
+            if any(v in partial for v in inputs):
+                partial.add(vid)
     for name, _, inputs, _ in intermediate_ops:
         operands = [v for v in inputs if v in tensors]
-        if len(operands) > 1 and any(v in from_view for v in operands):
+        if len(operands) > 1 and any(v in partial for v in operands):
             raise Unsupported(
                 f"split_multi_ops: {op.get_name()}: intermediate '{name}' combines "
-                "loads through a view, which split_multi_ops does not support"
+                "loads through a view or a broadcast, which split_multi_ops does not "
+                "support"
             )
 
 
@@ -911,11 +925,11 @@ def split_multi_ops(graph: GraphLowering):
         intermediate_ops = compute_ops[:-1]
         final_op_name = compute_ops[-1][0]
 
-        # Views in a fused intermediate are not supported yet.
-        # TODO: support views. A view load needs its own buffer, and building one
+        # Views and broadcasts in a fused intermediate are not supported yet.
+        # TODO: support them. Such a load needs its own buffer, and building one
         # means reconstructing inner_fn from traced index expressions. That
         # contradicts the rule that a pass wraps inner_fn and never reconstructs
-        # it (#2797), so supporting views means revisiting that rule.
+        # it (#2797), so supporting them means revisiting that rule.
         _validate_split_supported(op, trace, intermediate_ops)
 
         if _is_reduction_with_to_dtype(op, compute_ops):

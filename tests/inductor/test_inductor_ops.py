@@ -8616,7 +8616,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(op, x, atol=0, rtol=0)
 
     def test_split_multi_ops_view_loads_guard(self):
-        """split_multi_ops refuses an intermediate only if it combines view loads."""
+        """split_multi_ops refuses an intermediate combining view or broadcast loads."""
 
         def load(vid, name, index):
             return ("load", vid, (), {"_name": name, "_index": index})
@@ -8668,6 +8668,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ("to_dtype", 3, (2,), {}),
                 ],
                 False,
+            ),
+            # The intermediate takes the broadcast shape but would be reloaded at
+            # the broadcast operand's index, which covers only some of its dims.
+            "broadcast_operand": (
+                {"a": [32], "b": [1]},
+                [
+                    load(0, "a", i0),
+                    load(1, "b", 0),
+                    ("mul", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                True,
             ),
             # Two buffers read at their own positions combine correctly.
             "whole_buffers": (
