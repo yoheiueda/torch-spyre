@@ -64,7 +64,7 @@ from torch_spyre._C import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorWorkDivision
 
-from . import config
+from . import config, valid_elements
 from .core_mapping import (
     core_to_slice_mapping,
     decompose_fused_split_view,
@@ -232,6 +232,7 @@ def rescale_stl_for_dtype(
     # sentinel -1 entries rather than a linear num-sticks stride) has no such
     # dim; there only the stick depth changes, so a no-match is expected and
     # left as-is.
+    rescaled = None
     for i, s in enumerate(stl.stride_map):
         if s == in_eps:
             total_elems = stl.device_size[i] * in_eps
@@ -244,14 +245,41 @@ def rescale_stl_for_dtype(
                 )
             out_device_size[i] = total_elems // out_eps
             out_stride_map[i] = out_eps
+            rescaled = i
             break
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,
         get_device_dtype(out_dtype),
-        forward_valid_elements(stl),
+        _rescaled_valid_elements(stl, rescaled, out_device_size),
         ea,
     )
+
+
+def _rescaled_valid_elements(
+    stl: SpyreTensorLayout, rescaled: "int | None", out_device_size: list[int]
+) -> dict[tuple[int, ...], int]:
+    """The input's map, when it still describes the rescaled layout, else none.
+
+    The groups and counts carry over when the rescaled dim is the num-sticks dim
+    of the stick's own host dim. When it is another dim of that stride (rows of
+    exactly one input stick, or the lanes of a stick whose host stride equals the
+    stick width), the output folds part of each stick into it, which no group per
+    host dim describes. And a stick dim narrowed without a num-sticks dim to grow
+    (one fp16 stick to fp32) keeps fewer slots than its count, the rest of the
+    pair being the staggered arrangement's.
+    """
+    lane = len(stl.device_size) - 1
+    stick_group = next((k for k in stl.valid_elements if lane in k), ())
+    if rescaled is not None and (rescaled == lane or rescaled not in stick_group):
+        return {}
+    groups = forward_valid_elements(stl)
+    if any(
+        count > math.prod(out_device_size[d] for d in members)
+        for members, count in groups.items()
+    ):
+        return {}
+    return groups
 
 
 def forward_valid_elements(
@@ -2405,12 +2433,12 @@ def compute_restickify_target_layout(
         device_size,
         stride_map,
         stl.device_dtype,
-        restickify_valid_elements(
-            stl,
-            old_sd_outer_dim,
-            host_size[old_sd],
-            new_sd_outer_dim,
-            host_size[new_sd],
+        # The restickified buffer is new and its tiles are full, so its groups are
+        # derived from the host layout. Moving the input's keys instead goes wrong
+        # when the stick dim held a single stick (its num-sticks dim is not the
+        # one that receives the new tile count) or the stick stays on its dim.
+        valid_elements.derived_from_host(
+            device_size, stride_map, host_size, host_stride
         ),
     )
 
