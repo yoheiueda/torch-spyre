@@ -51,6 +51,7 @@ from .constants import (
     TWO_INPUT_REDUCTION_OPS,
 )
 from . import config as _spyre_config
+from . import valid_elements
 from .core_mapping import (
     derive_operation_mapping,
     finalize_tensor_work_divisions,
@@ -871,7 +872,11 @@ class SpyreKernel(Kernel[CSEVariable]):
             work_division=work_division,
             kernel_local=kernel_local,
             replicated_scalar=replicated_scalar,
-            stride_map=list(tensor.layout.device_layout.stride_map),
+            num_sticks_dim=valid_elements.num_sticks_dim(
+                tensor.layout.device_layout,
+                [concretize_expr(s) for s in tensor.layout.size],
+                [concretize_expr(s) for s in tensor.layout.stride],
+            ),
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -1889,12 +1894,11 @@ def _has_staggered_ea(op_spec: OpSpec) -> bool:
 
 
 def _holds_stick_pair(arg: TensorArg, max_eps: int) -> bool:
-    """Whether ``arg`` keeps a stick pair on the gap dim ``_pad_num_sticks`` prepends."""
+    """Whether ``arg`` keeps a stick pair on its num-sticks dim, as padding grows it."""
     return (
         arg.device_size[-1] < max_eps
-        and arg.stride_map is not None
-        and arg.stride_map[0] == -1
-        and arg.device_size[0] > 1
+        and arg.num_sticks_dim is not None
+        and arg.device_size[arg.num_sticks_dim] > 1
     )
 
 
@@ -1902,10 +1906,10 @@ def _add_size1_stick_var(op_spec: OpSpec, max_eps: int) -> None:
     """Give a size-1 stick dim a stick var, so its stick pair can be bound.
 
     A size-1 stick dim has no loop var, so no operand's stick coordinate names
-    one and the pair's gap dim stays unbound.  SDSC codegen would then pad the
-    stick dim to a whole wide stick, spanning the pair, and treat the unbound gap
-    dim as a back gap besides: the pair counted twice, the access overruns the
-    buffer.  The new var spans one stick of the side with more elements per
+    one and the pair's num-sticks dim stays unbound.  SDSC codegen would then pad
+    the stick dim to a whole wide stick, spanning the pair, and treat the unbound
+    num-sticks dim as a back gap besides: the pair counted twice, the access
+    overruns the buffer.  The new var spans one stick of the side with more elements per
     stick; it is given to the operands holding the pair and, for a typecast, to
     both operands.  Other operands are broadcasts and keep their constant stick
     coordinate.
@@ -1987,32 +1991,16 @@ def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
         # Every supported typecast halves or doubles the elements per stick.
         assert max_eps == 2 * eps, (max_eps, arg)
 
-        # Find the dim holding the pair, to take the stick index.
-        stride_map, size = arg.stride_map, arg.device_size
-        assert stride_map is not None, arg
-        if stride_map[0] == -1 and size[0] > 1:
-            # The gap dim ``_pad_num_sticks`` prepends when the num-sticks dim holds
-            # a single stick.  A size-1 dim with ``stride_map`` -1 is an elided
-            # host dim instead.
-            stick_index_dim = 0
-        else:
-            # The num-sticks dim, which steps the host by one stick.  Of the padded
-            # operands, only a read of one stick of a wider buffer gets here, e.g.
-            # ``x32[..., 64:96]``; a read of more sticks already indexes this dim.
-            stick_stride = eps * stride_map[-1]
-            candidate_dims = [
-                d
-                for d in range(len(size) - 1)
-                if stride_map[d] == stick_stride and size[d] > 1
-            ]
-            if len(candidate_dims) != 1:
-                # TODO: bind an operand whose stick pair is on no single dim,
-                # e.g. one that padding left alone or with a folded num-sticks dim.
-                raise Unsupported(
-                    f"staggered read with no unique num-sticks dim {candidate_dims}: "
-                    f"{arg}"
-                )
-            (stick_index_dim,) = candidate_dims
+        # The pair is on the num-sticks dim, which padding grows to hold it; a read
+        # of more than one stick already indexes it (handled above).
+        size = arg.device_size
+        stick_index_dim = arg.num_sticks_dim
+        if stick_index_dim is None or size[stick_index_dim] < 2:
+            # TODO: bind an operand whose stick pair is on no single dim, e.g. one
+            # that padding left alone or with a folded num-sticks dim.
+            raise Unsupported(
+                f"staggered read with no num-sticks dim for its pair: {arg}"
+            )
         stick_index_offset = coords[stick_index_dim]
         if not stick_index_offset.is_Integer:
             # TODO: support a pair whose position varies over the iteration.

@@ -243,9 +243,9 @@ class TensorArg:
         device_size: The device size (as per SpyreTensorLayout) of the Tensor
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
-        stride_map: The ``stride_map`` of the SpyreTensorLayout the coordinates were
-                derived from: each device dim's host stride, -1 for a dim holding no
-                host elements.  ``None`` when the arg was not built from a layout.
+        num_sticks_dim: The device dim that steps the Tensor's sticks, the stick
+                group's member besides the lanes in its layout's valid_elements.
+                ``None`` when there is none or it is unknown.
         allocation: dict tagging where this Tensor's data lives. Mirrors
                 layout.allocation and carries exactly one of three
                 mutually-exclusive keys:
@@ -298,7 +298,7 @@ class TensorArg:
     work_division: TensorWorkDivision | None = None
     kernel_local: bool = False
     replicated_scalar: bool = False
-    stride_map: list[int] | None = None
+    num_sticks_dim: int | None = None
 
 
 def is_lx_relayout_identity(

@@ -68,6 +68,7 @@ from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP
+from . import valid_elements
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
@@ -1052,27 +1053,39 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 def _pad_num_sticks(
     layout: FixedTiledLayout, num_sticks_dim: int, new_num_sticks: int
 ) -> FixedTiledLayout:
-    """Grow ``layout``'s num-sticks dim to ``new_num_sticks`` sticks.
+    """Grow ``layout``'s num-sticks dim to ``new_num_sticks`` sticks, in place.
 
-    A dim holding several sticks is sized up in place.  A single stick has no dim
-    of its own to grow, as it may share a host step with the dim outside it, so an
-    outermost gap dim with ``stride_map`` -1 is prepended instead, as in
-    ``_pad_elided_dim``.  Codegen binds the stick index to that gap dim
-    (``_adjust_for_staggered_ea`` in spyre_kernel).
+    The groups and counts stay, so ``valid_elements`` records the growth as
+    padding, and codegen finds the dim through the groups. A dim holding a single
+    stick steps no host stride across its new sticks, which hold no host
+    elements, so it gets ``stride_map`` -1: host transfers then read only its
+    first stick, and coordinates give it 0 until codegen binds the stick pair to
+    it (``_adjust_for_staggered_ea`` in spyre_kernel).
+
+    Raises ``Unsupported`` when the layout has no map and none can be derived:
+    without one, the padded layout could only be addressed by stride matching,
+    which cannot place it.
     """
     stl = layout.device_layout
-    if stl.device_size[num_sticks_dim] != 1:
-        return _pad_device_dim(layout, num_sticks_dim, new_num_sticks)
+    host_size = [concretize_expr(s) for s in layout.size]
+    host_stride = [concretize_expr(s) for s in layout.stride]
+    try:
+        groups = valid_elements.valid_elements_of(stl, host_size, host_stride).groups
+    except valid_elements.Underivable as e:
+        # TODO: pad a layout whose groups are unknown (a coarse-tiled or folded one).
+        raise Unsupported(f"cannot pad {stl!r}: its groups are unknown ({e})") from e
+    device_size = list(stl.device_size)
+    stride_map = list(stl.stride_map)
+    if device_size[num_sticks_dim] == 1:
+        stride_map[num_sticks_dim] = -1
+    device_size[num_sticks_dim] = new_num_sticks
     return FixedTiledLayout(
         layout.device,
         layout.dtype,
-        [concretize_expr(s) for s in layout.size],
-        [concretize_expr(s) for s in layout.stride],
+        host_size,
+        host_stride,
         SpyreTensorLayout(
-            [new_num_sticks, *stl.device_size],
-            [-1, *stl.stride_map],
-            stl.device_dtype,
-            stl.element_arrangement,
+            device_size, stride_map, stl.device_dtype, groups, stl.element_arrangement
         ),
     )
 
@@ -1080,14 +1093,20 @@ def _pad_num_sticks(
 def _num_sticks_dim(layout: FixedTiledLayout, dep: MemoryDep) -> int | None:
     """The device dim of ``layout`` that steps the sticks ``dep`` accesses.
 
-    The outermost device dim whose coordinate carries the stick coordinate's
-    variable, as ``rescale_stl_for_dtype`` finds it. A stick dim no longer than
-    one stick never wraps into an outer dim, and every size-1 host dim has a zero
-    coordinate too, so the outermost zero-coordinate dim is taken instead, which
-    is where ``_pad_num_sticks`` prepends one. None when no device dim can hold
-    the count, or when the stick coordinate has a variable but no host dim
-    matches it.
+    The stick group's member besides the lanes, where the groups are known.
+    Otherwise the outermost device dim whose coordinate carries the stick
+    coordinate's variable, as ``rescale_stl_for_dtype`` finds it, or for a stick
+    dim no longer than one stick, which never wraps into an outer dim, the
+    outermost zero-coordinate dim. None when no device dim can hold the count, or
+    when the stick coordinate has a variable but no host dim matches it.
     """
+    from_groups = valid_elements.num_sticks_dim(
+        layout.device_layout,
+        [concretize_expr(s) for s in layout.size],
+        [concretize_expr(s) for s in layout.stride],
+    )
+    if from_groups is not None:
+        return from_groups
     device_coords = device_coordinates(layout.device_layout, dep, None)
     if not device_coords:
         return None

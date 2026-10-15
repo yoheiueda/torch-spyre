@@ -120,6 +120,24 @@ def _moving(groups: Groups, device_size: Sequence[int]) -> Groups:
     return moving
 
 
+def num_sticks_dim(
+    stl, host_size: Sequence[int], host_stride: Sequence[int]
+) -> int | None:
+    """The device dim that steps the sticks: the stick group's member besides the lanes.
+
+    None when the stick group has no other member (a stick-only layout), more
+    than one, or the groups cannot be determined.
+    """
+    lane = len(stl.device_size) - 1
+    try:
+        groups = valid_elements_of(stl, host_size, host_stride).groups
+    except Underivable:
+        return None
+    stick_group = next((k for k in groups if lane in k), ())
+    others = [d for d in stick_group if d != lane]
+    return others[0] if len(others) == 1 else None
+
+
 def derived_from_host(
     device_size: Sequence[int],
     stride_map: Sequence[int],

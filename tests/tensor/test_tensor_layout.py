@@ -1324,8 +1324,8 @@ class TestSpyreTensorLayout(TestCase):
         """A sub-stick DL16_TO_FP32 output still spans both FP32 sticks of its pair.
 
         ``rescale_stl_for_dtype`` reports the one stick the live elements occupy, so
-        the second half of the pair is capacity this pass adds, as an outermost gap
-        dim since a single stick has no count dim to grow.
+        the second half of the pair is capacity this pass adds: the num-sticks dim
+        grows in place, and ``valid_elements`` keeps the stick's 5 elements.
         """
         from torch_spyre._inductor.ir import FixedTiledLayout
         from torch_spyre._inductor.padding import _pad_upcast_output
@@ -1335,9 +1335,12 @@ class TestSpyreTensorLayout(TestCase):
 
         padded = op.layout
         self.assertIsInstance(padded, FixedTiledLayout)
-        self.assertEqual(list(padded.device_layout.device_size), [2, 1, 1, 32])
-        # The added stick holds no host element, so the gap dim steps nothing.
-        self.assertEqual(list(padded.device_layout.stride_map), [-1, 5, -1, 1])
+        self.assertEqual(list(padded.device_layout.device_size), [2, 1, 32])
+        # The added stick holds no host element, so the grown dim steps nothing.
+        self.assertEqual(list(padded.device_layout.stride_map), [-1, -1, 1])
+        self.assertEqual(
+            dict(padded.device_layout.valid_elements), {(0, 2): 5, (1,): 1}
+        )
 
     def test_pad_upcast_output_rounds_a_partial_pair_up(self):
         """A stick-stepped dim ending inside a stick pair grows to the whole pair."""

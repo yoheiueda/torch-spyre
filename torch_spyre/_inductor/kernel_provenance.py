@@ -86,7 +86,7 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "work_division": "TensorWorkDivision | None",
     "kernel_local": "bool",
     "replicated_scalar": "bool",
-    "stride_map": "list[int] | None",
+    "num_sticks_dim": "int | None",
 }
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
     "work_slices": "dict[Symbol, int]",
@@ -341,7 +341,7 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
     # emitter reads out of the buffer -- one lane or the whole stick.
     if arg.replicated_scalar:
         result["replicated_scalar"] = True
-    # stride_map is left out: it only guides binding the coordinates, so its
+    # num_sticks_dim is left out: it only guides binding the coordinates, so its
     # effect is already in device_coordinates.
     return result
 
