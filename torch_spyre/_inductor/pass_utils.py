@@ -135,6 +135,7 @@ class AlignmentAccess:
 
     device_layout: Any
     index: sympy.Expr
+    host_layout: Any = None
 
 
 def input_layout_for_operation(op: Operation, name: str, default: Any) -> Any:
@@ -1590,10 +1591,23 @@ def device_coordinates(
         the stick expression.
     """
     index = per_trip_index(op, dep.index) if op is not None else dep.index
-    coords = alignment_coordinates(stl, index, dep.ranges, indirect_sizes)
+    coords = alignment_coordinates(
+        stl, index, dep.ranges, indirect_sizes, host_layout=_dep_host_layout(dep)
+    )
     if check_stick_expr:
         _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
     return coords
+
+
+def _dep_host_layout(dep) -> "FixedLayout | None":
+    """The host layout of the buffer ``dep`` reads or writes, when known."""
+    if valid_elements.mode() == "off":
+        return None
+    try:
+        layout = V.graph.get_buffer(dep.name).get_layout()
+    except Exception:  # noqa: BLE001  (a graph input or a buffer not yet registered)
+        return None
+    return layout if isinstance(layout, FixedLayout) else None
 
 
 def alignment_coordinates(
@@ -1603,11 +1617,16 @@ def alignment_coordinates(
     indirect_sizes: "dict[sympy.Symbol, int] | None",
     *,
     repeat_info_out: "dict[sympy.Symbol, dict] | None" = None,
+    host_layout: "FixedLayout | None" = None,
 ) -> list[sympy.Expr]:
     """Build the coordinates consumed by tensor alignment.
 
     Placement checks and kernel preparation share index concretization and
     coordinate construction. Emission consumes the prepared kernel.
+
+    With ``host_layout``, the accessed buffer's host layout, the coordinates are
+    derived through the layout's ``valid_elements`` groups where that is possible,
+    and by stride matching otherwise (see ``valid_elements.py``).
     """
 
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
@@ -1621,7 +1640,58 @@ def alignment_coordinates(
         indirect_sizes,
         repeat_info_out=repeat_info_out,
     )
-    return coords
+    current = valid_elements.mode()
+    if current == "off" or host_layout is None:
+        return coords
+    grouped = _grouped_coordinates_or_none(stl, index, it_space, host_layout)
+    if current == "shadow":
+        _log_disagreement(stl, index, it_space, host_layout, coords, grouped)
+        return coords
+    return coords if grouped is None else grouped
+
+
+def _grouped_coordinates_or_none(stl, index, it_space, host_layout):
+    """``valid_elements.grouped_coordinates``, or None where stride matching applies.
+
+    Stride matching covers indirect accesses (an index symbol outside the
+    iteration space) and layouts or accesses the groups cannot describe.
+    """
+    if index.free_symbols - set(it_space):
+        return None
+    host_size = [concretize_expr(s) for s in host_layout.size]
+    host_stride = [concretize_expr(s) for s in host_layout.stride]
+    try:
+        return valid_elements.grouped_coordinates(
+            stl, host_size, host_stride, it_space, index
+        )
+    except valid_elements.Underivable as e:
+        valid_elements.logger.debug(
+            "stride matching for %s %s on host %s: %s",
+            list(stl.device_size),
+            list(stl.stride_map),
+            list(host_layout.size),
+            e,
+        )
+        return None
+
+
+def _log_disagreement(stl, index, it_space, host_layout, coords, grouped) -> None:
+    if grouped is None or valid_elements.coordinates_agree(coords, grouped, it_space):
+        return
+    valid_elements.logger.warning(
+        "grouped coordinates disagree: device_size=%s stride_map=%s "
+        "valid_elements=%s host=%s/%s index=%s it_space=%s stride_matching=%s "
+        "grouped=%s",
+        list(stl.device_size),
+        list(stl.stride_map),
+        dict(stl.valid_elements),
+        list(host_layout.size),
+        list(host_layout.stride),
+        index,
+        it_space,
+        coords,
+        grouped,
+    )
 
 
 def build_operation_alignment_inputs(
@@ -1670,6 +1740,7 @@ def build_operation_alignment_inputs(
                 raw_iteration_space,
                 resolved_indirect_sizes,
                 repeat_info_out=repeat_snapshot,
+                host_layout=access.host_layout,
             ),
         }
         for access in accesses
