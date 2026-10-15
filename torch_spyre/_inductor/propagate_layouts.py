@@ -183,11 +183,14 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
         changed = True
     if not changed:
         return stl
+    # TODO: decide what a collapsed broadcast dim counts. Its group keeps the
+    # logical extent in a dim of size 1, more than the dim holds, so for now the
+    # compacted layout carries no valid_elements.
     return SpyreTensorLayout(
         device_size,
         stride_map,
         stl.device_dtype,
-        forward_valid_elements(stl),
+        {},
         stl.element_arrangement,
     )
 
