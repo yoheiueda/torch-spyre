@@ -84,6 +84,7 @@ from .ir import (
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
+    dense_relocation_serves_read,
     expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
@@ -566,6 +567,13 @@ def _reduction_layout_from_stl(
 
     x_dev_coords = try_device_coordinates(stl, dep, None)
     if x_dev_coords is None:
+        # The stick moved to another real dim serves the read densely; derive the
+        # output from the read on that layout, as for any other input layout.
+        relocated = dense_relocation_serves_read(stl, in_layout, dep)
+        if relocated is not None:
+            stl = relocated
+            x_dev_coords = try_device_coordinates(stl, dep, None)
+    if x_dev_coords is None:
         if sparse_layout_serves_read(stl, in_layout, dep) is not None:
             # As for a pointwise op below.
             # TODO(#5872): return the sparse output as one candidate next to the
@@ -771,6 +779,13 @@ def _default_pointwise_layout(
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     in_device_coords = try_device_coordinates(stl, dep, None)
+    if in_device_coords is None:
+        # As in _reduction_layout: a dense relocation of the stick serves the
+        # read, so the normal candidates below are derived from it.
+        relocated = dense_relocation_serves_read(stl, in_layout, dep)
+        if relocated is not None:
+            stl = relocated
+            in_device_coords = try_device_coordinates(stl, dep, None)
     if in_device_coords is None:
         if sparse_layout_serves_read(stl, in_layout, dep) is not None:
             # A read the input's layout cannot serve (flattening [8, 65] into
