@@ -1654,6 +1654,70 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_log1p_fp32",
+            "test_log1p_op",
+        ): {
+            "ops_dict": {
+                "log1p": torch.log1p,
+            },
+            "param_sets": {
+                "2d_near_zero": (cached_randn((67, 256), dtype=torch.float32) * 0.01,),
+                "3d_pad_near_zero": (
+                    cached_randn((3, 7, 9), dtype=torch.float32) * 0.01,
+                ),
+                "tiny": (
+                    cached_randn(
+                        (64,), differentiation="log1p_tiny", dtype=torch.float32
+                    )
+                    * 1e-20,
+                ),
+                "wide": (
+                    cached_randn(
+                        (256,), differentiation="log1p_wide", dtype=torch.float32
+                    )
+                    * 4,
+                ),
+                "near_minus_one": (
+                    cached_randn(
+                        (64,),
+                        abs=True,
+                        differentiation="log1p_near_minus_one",
+                        dtype=torch.float32,
+                    )
+                    * 1e-3
+                    - 1,
+                ),
+                "large": (
+                    cached_randn(
+                        (64,),
+                        abs=True,
+                        differentiation="log1p_large",
+                        dtype=torch.float32,
+                    )
+                    * 1e30,
+                ),
+                "special": (
+                    torch.tensor(
+                        [0.0, -0.0, -1.0, -1.5, -math.inf, math.inf, math.nan, 3e38],
+                        dtype=torch.float32,
+                    ),
+                ),
+            },
+        },
+        (
+            "test_log1p_fp16",
+            "test_log1p_op",
+        ): {
+            "ops_dict": {
+                "log1p": torch.log1p,
+            },
+            "param_sets": {
+                "1d_fp16": (cached_randn((64,)) * 0.01,),
+            },
+            # TODO: log1p on fp16 needs an fp16 op function in DeepTools.
+            "expect_raise": {"1d_fp16": "log1p on"},
+        },
+        (
             "test_pointwise_unary_op",
             "test_unary_op",
         ): {
@@ -10135,6 +10199,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             self.compare_with_cpu(op, x, atol=1e-2, rtol=1e-2)
         else:
             self.compare_with_cpu(op, x, atol=1e-5, rtol=1e-5)
+
+    def test_log1p_op(self, op, x):
+        # Relative, with no absolute slack: near t = 0 the result is about t, so
+        # an absolute tolerance would accept log(1 + t), which is 0 there. The
+        # largest error measured is 5.9e-6, where log1p(t) reaches 1/64 and the
+        # log steps take over with their absolute error of about 1e-7.
+        self.compare_with_cpu(op, x, atol=0, rtol=1e-5)
 
     def test_bool(self):
         dtype = torch.bool

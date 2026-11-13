@@ -1867,7 +1867,7 @@ _SOFTPLUS_SERIES_TERMS = 6
 def _softplus_unit_beta(input: torch.Tensor, threshold: float) -> torch.Tensor:
     """``softplus(x, beta=1)``: the primitive above the cutoff, log1p(e^x) below.
 
-    There is no log1p on Spyre and log(1 + e^x) rounds to 0 just like the
+    There is no float16 log1p on Spyre and log(1 + e^x) rounds to 0 like the
     primitive, so the small-x branch is the log1p series in Horner form. PyTorch
     returns x only for x > threshold, so a threshold below the cutoff lowers it.
     """

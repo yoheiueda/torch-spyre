@@ -184,7 +184,12 @@ SPYRE_FP32_OPS = [
     "notequal",
     "prod",
     "log",
+    "log1p",
 ]
+
+# Ops whose DeepTools op function binds IEEE_FP32 only.
+# TODO: log1p on fp16 needs an fp16 op function in DeepTools.
+SPYRE_FP32_ONLY_OPS: frozenset[str] = frozenset({"log1p"})
 
 # Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when
 # their operands are IEEE_INT32 tensors.  Every check that needs to recognise a
