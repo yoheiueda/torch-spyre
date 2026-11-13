@@ -40,7 +40,6 @@ from torch._inductor.virtualized import V
 
 from .constants import (
     SPYRE_FP32_OPS,
-    SPYRE_FP32_ONLY_OPS,
     SPYRE_INT32_OPS,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
@@ -1225,10 +1224,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or (
                     op in SPYRE_INT32_OPS and arg.device_dtype == DataFormats.IEEE_INT32
                 )
-                or (
-                    arg.device_dtype == DataFormats.SEN169_FP16
-                    and op not in SPYRE_FP32_ONLY_OPS
-                )
+                or arg.device_dtype == DataFormats.SEN169_FP16
                 or (
                     op in SPYRE_FP8_OPS
                     and arg.device_dtype

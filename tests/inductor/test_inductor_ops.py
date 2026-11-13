@@ -1711,11 +1711,50 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {
                 "log1p": torch.log1p,
             },
+            # Rounded through bfloat16 so that the inputs are exact in DLFloat16 too.
             "param_sets": {
-                "1d_fp16": (cached_randn((64,)) * 0.01,),
+                "2d_near_zero_fp16": (
+                    (cached_randn((67, 256), differentiation="log1p_2d_fp16") * 0.01)
+                    .bfloat16()
+                    .half(),
+                ),
+                "3d_pad_fp16": (
+                    (cached_randn((3, 7, 9), differentiation="log1p_3d_fp16") * 0.1)
+                    .bfloat16()
+                    .half(),
+                ),
+                "tiny_fp16": (
+                    (cached_randn((64,), differentiation="log1p_tiny_fp16") * 1e-4)
+                    .bfloat16()
+                    .half(),
+                ),
+                "wide_fp16": (
+                    (cached_randn((256,), differentiation="log1p_wide_fp16") * 4)
+                    .bfloat16()
+                    .half(),
+                ),
+                "near_minus_one_fp16": (
+                    torch.arange(1, 65, dtype=torch.float16) / 256 - 1,
+                ),
+                "large_fp16": (
+                    (
+                        cached_randn(
+                            (64,), abs=True, differentiation="log1p_large_fp16"
+                        )
+                        * 1e4
+                    )
+                    .bfloat16()
+                    .half(),
+                ),
+                # No +inf: DLFloat16 holds it as its largest value, so log1p(+inf)
+                # is finite on device, as log(+inf) is.
+                "special_fp16": (
+                    torch.tensor(
+                        [0.0, -0.0, -1.0, -1.5, -math.inf, math.nan],
+                        dtype=torch.float16,
+                    ),
+                ),
             },
-            # TODO: log1p on fp16 needs an fp16 op function in DeepTools.
-            "expect_raise": {"1d_fp16": "log1p on"},
         },
         (
             "test_pointwise_unary_op",
@@ -10203,9 +10242,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_log1p_op(self, op, x):
         # Relative, with no absolute slack: near t = 0 the result is about t, so
         # an absolute tolerance would accept log(1 + t), which is 0 there. The
-        # largest error measured is 5.9e-6, where log1p(t) reaches 1/64 and the
-        # log steps take over with their absolute error of about 1e-7.
-        self.compare_with_cpu(op, x, atol=0, rtol=1e-5)
+        # largest errors measured: fp32 5.9e-6, where log1p(t) reaches 1/64 and
+        # the log steps take over with their absolute error of about 1e-7; fp16
+        # 2.9e-3, about 1.5 DLFloat16 steps, where |t| passes 1/4.
+        rtol = 5e-3 if x.dtype == torch.float16 else 1e-5
+        self.compare_with_cpu(op, x, atol=0, rtol=rtol)
 
     def test_bool(self):
         dtype = torch.bool
